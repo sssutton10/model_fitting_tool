@@ -1,0 +1,6 @@
+glum>=2.0
+scikit-learn>=1.0
+polars>=0.19
+numpy>=1.22
+matplotlib>=3.5
+panel>=1.0

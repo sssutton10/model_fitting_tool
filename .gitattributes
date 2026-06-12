@@ -1,0 +1,13 @@
+# Normalize line endings to LF in the repository, checkout as-is on all platforms
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ini text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.xlsx binary
+*.pkl binary
+*.png binary
+*.jpg binary
