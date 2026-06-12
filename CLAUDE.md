@@ -31,7 +31,7 @@ python -m pytest tests/test_variable.py::TestGetBinLabels::test_labels_have_lett
 - `test_tool.py::TestRelativitiesTable` — 15 tests fail due to numpy truth-value ambiguity on `_weights_array or np.ones()` at `tool.py:974` (fixed to use `if ... is not None else`).
 - `test_tool.py::TestExcelVersion` — 12 tests fail due to polars `SchemaError` (join key type `str` vs `null`). Exclude with `-k "not TestExcelVersion"`.
 
-**No git repository** — this project is not git-initialized. Do not run `git` commands.
+**Git repository** — remote: `https://github.com/sssutton10/model_fitting_tool.git`, branch `main`.
 
 ## Architecture
 
