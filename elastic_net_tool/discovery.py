@@ -658,17 +658,30 @@ def residual_gbm(
 
 def _normalize_shap_values(shap_values: Any) -> np.ndarray:
     """
-    Coerce a TreeExplainer ``shap_values`` result to a 2-D ``(n, n_features)``
-    array.
+    Coerce a TreeExplainer ``shap_values`` result to a dense 2-D
+    ``(n, n_features)`` ndarray.
 
-    Recent SHAP versions return a 3-D array ``(n, n_features, n_outputs)`` even
-    for single-output regression (trailing output axis), and a list of arrays
-    for multi-output models.  Both break the ``[:, indices].sum(axis=1)`` idiom
-    used here, leaving a 2-D ``var_shap`` matrix.  Collapse to a single output.
+    SHAP can return several layouts that all break the
+    ``[:, indices].sum(axis=1)`` idiom used here:
+
+    * a list of ``(n, n_features)`` arrays for multi-output models;
+    * a 3-D ``(n, n_features, n_outputs)`` array for single-output regression
+      (trailing output axis) in recent versions;
+    * a SciPy sparse matrix or ``np.matrix`` — for these, ``sum(axis=1)``
+      stays 2-D (the classic ``np.matrix`` gotcha), leaving ``var_shap`` a
+      matrix that polars refuses to build a column from.
+
+    Densify and collapse to a single output so the result is a plain 2-D
+    ``np.ndarray``.
     """
     if isinstance(shap_values, list):
         # Multi-output: list of (n, n_features) arrays — take the first output.
         shap_values = shap_values[0]
+    # SciPy sparse matrices expose .toarray(); densify before np.asarray so we
+    # don't end up with a 0-d object array wrapping the sparse matrix.
+    if hasattr(shap_values, "toarray"):
+        shap_values = shap_values.toarray()
+    # np.asarray downcasts np.matrix to a plain ndarray (so sum collapses dims).
     shap_values = np.asarray(shap_values)
     if shap_values.ndim == 3:
         # (n, n_features, n_outputs) — take the first output.
