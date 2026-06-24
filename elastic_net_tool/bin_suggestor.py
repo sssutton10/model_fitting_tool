@@ -151,22 +151,23 @@ def suggest_bins_optbin(
     **optbin_kwargs: Any,
 ) -> List[float]:
     """
-    Optimal breakpoints via ``optbinning.OptimalBinning``.
+    Optimal breakpoints via ``optbinning``.
 
     Uses a MILP / CP-SAT solver to find splits that maximise the statistical
     divergence between adjacent bins while enforcing monotonicity and minimum
-    bin-size constraints.
+    bin-size constraints.  A binary target (≤ 2 unique values) uses
+    ``OptimalBinning``; a continuous target (the usual case for loss ratios)
+    uses ``ContinuousOptimalBinning``.
 
-    Extra keyword arguments are forwarded directly to
-    ``OptimalBinning.__init__`` (e.g. ``max_n_bins``, ``min_bin_size``,
-    ``monotonic_trend``).
+    Extra keyword arguments are forwarded directly to the binning class
+    ``__init__`` (e.g. ``max_n_bins``, ``min_bin_size``, ``monotonic_trend``).
 
     Requires
     --------
     ``pip install optbinning``
     """
     try:
-        from optbinning import OptimalBinning
+        from optbinning import ContinuousOptimalBinning, OptimalBinning
     except ImportError as exc:
         raise ImportError(
             "The 'optbinning' package is required for this method.\n"
@@ -185,7 +186,8 @@ def suggest_bins_optbin(
     kwargs: Dict[str, Any] = {"name": col, "dtype": "numerical"}
     kwargs.update(optbin_kwargs)
 
-    ob = OptimalBinning(**kwargs)
+    binning_cls = OptimalBinning if np.unique(y_arr).size <= 2 else ContinuousOptimalBinning
+    ob = binning_cls(**kwargs)
     ob.fit(arr, y_arr, sample_weight=w)
 
     splits = sorted(

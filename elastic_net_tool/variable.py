@@ -55,11 +55,11 @@ class VariableConfig:
     Set ``col`` to the *output* name and ``input_cols`` to the list of source
     columns.  ``custom_transform`` is then called as::
 
-        custom_transform(arr_col1, arr_col2, ...) -> np.ndarray
+        custom_transform(df: pl.DataFrame, **transform_kwargs) -> array-like
 
-    where each positional argument is the numpy array for the corresponding
-    entry in ``input_cols``.  The result is treated as a new numeric (or
-    categorical, if ``is_categorical=True``) column named ``col``.
+    where *df* contains only the ``input_cols`` columns.  The result is
+    treated as a new numeric (or categorical, if ``is_categorical=True``)
+    column named ``col``.
 
     Parameters
     ----------
@@ -101,22 +101,21 @@ class VariableConfig:
     is_categorical : bool, optional
         Force categorical treatment.  ``None`` auto-detects from dtype.
     custom_transform : callable, optional
-        May be a **named function** or a lambda.  Any callable is accepted.
+        May be a **named function** or a lambda.  Unified DataFrame-based
+        signature for both single- and multi-column variables::
 
-        **Numeric** single-col: ``f(arr: np.ndarray, **kw) -> np.ndarray``,
-        applied before capping / log / binning.
+            f(df: pl.DataFrame, **transform_kwargs) -> array-like
 
-        **Categorical** single-col: ``f(val: Any, **kw) -> Any``, applied
-        element-wise before encoding (can remap/group categories).
-
-        **Multi-col** (``input_cols`` set): ``f(*arrays, **kw) -> np.ndarray``,
-        called once with each input column's numpy array as positional args.
+        *df* contains only the relevant columns (``input_cols`` when set,
+        otherwise ``[col]``).  Applied once in ``_resolve_raw_series``,
+        before any cap / log / binning.  For categorical remapping, return
+        a list/array of strings — those become the category labels.
     transform_kwargs : dict, optional
         Keyword arguments forwarded to ``custom_transform`` on every call.
         Useful for passing parameters to a named function without a closure::
 
-            def scale(arr, factor=1.0):
-                return arr / factor
+            def scale(df, factor=1.0):
+                return df["mileage"] / factor
 
             VariableConfig('mileage', custom_transform=scale,
                            transform_kwargs={'factor': 1000})
@@ -473,7 +472,9 @@ class Preprocessor:
         if "cap_upper_val" in p:
             out = np.where(is_sent, out, np.minimum(out, p["cap_upper_val"]))
         if cfg.log_transform:
-            out = np.where(is_sent, out, np.log1p(out))
+            # apply log1p only to non-sentinel entries; np.where would still
+            # evaluate log1p on the sentinel and emit a RuntimeWarning
+            out[~is_sent] = np.log1p(out[~is_sent])
         return out
 
     # ── Transformation ───────────────────────────────────────────────────

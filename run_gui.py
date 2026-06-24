@@ -17,7 +17,7 @@ app.servable()
 
 if __name__ == "__main__":
     pn.serve(
-        {"Modeling Tool": lambda: create_app()},
+        {"/": lambda: create_app()},
         port=5006,
         show=True,
         title="Elastic Net Modeling Tool",

@@ -16,11 +16,14 @@ Quick start
 >>> tool.add_variable('vehicle_age', cap_upper=0.99, log_transform=True)
 >>> tool.add_variable('driver_age', bin_edges=[16, 25, 35, 50, 65, 100])
 >>> tool.add_variable('state', encoding='onehot')
->>> # Categorical remapping
->>> tool.add_variable('state', custom_transform=lambda v: 'South' if v in ('TX','FL') else v)
+>>> # Categorical remapping (transform receives a pl.DataFrame of the input cols)
+>>> tool.add_variable('region', input_cols=['state'],
+...                   custom_transform=lambda df: ['South' if s in ('TX', 'FL') else s
+...                                                for s in df['state']])
 >>> # Multi-input derived variable
 >>> tool.add_variable('age_x_veh', input_cols=['driver_age','vehicle_age'],
-...                   custom_transform=lambda a, v: a * v, cap_upper=0.99)
+...                   custom_transform=lambda df: df['driver_age'] * df['vehicle_age'],
+...                   cap_upper=0.99)
 >>> tool.univariate_plot('driver_age')
 >>>
 >>> # Model fitting

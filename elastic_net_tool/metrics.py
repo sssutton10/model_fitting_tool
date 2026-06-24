@@ -7,6 +7,9 @@ from typing import Callable, Dict, Optional
 import numpy as np
 import polars as pl
 
+# np.trapz was renamed to np.trapezoid in numpy 2.0 and removed in 2.4
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 
 # ── Gini coefficient ──────────────────────────────────────────────────────────
 
@@ -40,7 +43,7 @@ def gini_coefficient(
         if total_loss == 0:
             return 0.0
         cum_loss = np.concatenate([[0.0], np.cumsum(ys * ws) / total_loss])
-        return float(2.0 * np.trapz(cum_loss, cum_w) - 1.0)
+        return float(2.0 * _trapezoid(cum_loss, cum_w) - 1.0)
 
     model_gini = _gini(y_pred)
     if normalize:

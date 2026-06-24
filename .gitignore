@@ -47,3 +47,7 @@ Thumbs.db
 
 # docs/superpowers plugin cache (not source)
 docs/superpowers/
+
+# other
+*.csv
+generate_dummy_data.py

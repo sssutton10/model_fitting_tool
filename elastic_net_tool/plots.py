@@ -547,8 +547,10 @@ def cv_stability_plot(
     data = [fold_rows[f].cast(pl.Float64).drop_nulls().to_numpy() for f in top_features]
 
     fig, ax = plt.subplots(figsize=figsize or (max(8, len(top_features) * 0.6), 5))
+    # tick labels are applied via set_xticklabels below (boxplot's labels=
+    # kwarg was removed in matplotlib 3.11)
     ax.boxplot(
-        data, labels=top_features, patch_artist=True,
+        data, patch_artist=True,
         boxprops=dict(facecolor="#9ecae1", alpha=0.8),
         medianprops=dict(color="#e6550d", linewidth=2),
         whiskerprops=dict(linewidth=1.5),
