@@ -656,6 +656,26 @@ def residual_gbm(
 
 # ── SHAP-based discovery ──────────────────────────────────────────────────────
 
+def _normalize_shap_values(shap_values: Any) -> np.ndarray:
+    """
+    Coerce a TreeExplainer ``shap_values`` result to a 2-D ``(n, n_features)``
+    array.
+
+    Recent SHAP versions return a 3-D array ``(n, n_features, n_outputs)`` even
+    for single-output regression (trailing output axis), and a list of arrays
+    for multi-output models.  Both break the ``[:, indices].sum(axis=1)`` idiom
+    used here, leaving a 2-D ``var_shap`` matrix.  Collapse to a single output.
+    """
+    if isinstance(shap_values, list):
+        # Multi-output: list of (n, n_features) arrays — take the first output.
+        shap_values = shap_values[0]
+    shap_values = np.asarray(shap_values)
+    if shap_values.ndim == 3:
+        # (n, n_features, n_outputs) — take the first output.
+        shap_values = shap_values[:, :, 0]
+    return shap_values
+
+
 def shap_importance(
     model: Any,
     df: pl.DataFrame,
@@ -689,7 +709,7 @@ def shap_importance(
     X_sample = _subsample_rows(X, sample_size, rng)
 
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_sample)   # (n, n_features)
+    shap_values = _normalize_shap_values(explainer.shap_values(X_sample))  # (n, n_features)
 
     rows = []
     for col_name in feature_cols:
@@ -752,7 +772,7 @@ def shap_dependence(
     X_sample = X[sample_idx]
 
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_sample)
+    shap_values = _normalize_shap_values(explainer.shap_values(X_sample))
 
     indices = col_index_map[var]
     var_shap = shap_values[:, indices].sum(axis=1)
