@@ -10,7 +10,8 @@ import polars as pl
 
 from .io_utils import load_version, save_version
 from .metrics import compare_metrics, compute_metrics, double_lift_score, double_lift_table, gini_coefficient
-from .model import FactorModelVersion, ModelVersion, fit_cv_stability, fit_model
+from .model import FactorModelVersion, ModelVersion, fit_cv_stability, fit_model, _build_preprocessor
+from tabulate import tabulate
 from .plots import (
     _resolve_level,
     _sort_labels,
@@ -18,20 +19,11 @@ from .plots import (
     coefficient_plot,
     cv_stability_plot,
     double_lift_chart,
-    lorenz_chart,
-    metrics_bar_chart,
     residual_chart,
     univariate_plot,
+    decile_lift_chart
 )
-from .variable import (
-    MISSING_SENTINEL,
-    Preprocessor,
-    VariableConfig,
-    _NUMERIC_DTYPES,
-    _is_str_or_cat,
-    default_config,
-    make_bin_labels,
-)
+from .variable import Preprocessor, VariableConfig, default_config, make_bin_labels
 
 
 # ── Module-level helpers for relativities_table ───────────────────────────────
@@ -104,39 +96,6 @@ class ModelingTool:
         GLM link function (default ``'log'``).
     tweedie_power : float
         Tweedie variance power when family is Tweedie (default ``1.5``).
-
-    Examples
-    --------
-    >>> tool = ModelingTool(df, target_col='loss_ratio', weight_col='earned_premium')
-
-    # --- Variable creation ---
-    >>> tool.add_variable('vehicle_age', cap_upper=0.99, log_transform=True)
-    >>> tool.add_variable('driver_age', n_bins=10)
-    >>> tool.add_variable('driver_age', bin_edges=[16, 25, 35, 50, 65, 100])
-    >>> tool.add_variable('state', encoding='onehot')
-    >>> tool.add_variable('state', custom_transform=lambda v: 'South' if v in ('TX','FL') else v)
-
-    # Multi-input derived variable
-    >>> tool.add_variable('veh_x_age', input_cols=['vehicle_age', 'driver_age'],
-    ...                   custom_transform=lambda veh, drv: veh * drv, cap_upper=0.99)
-
-    >>> tool.univariate_plot('driver_age')
-
-    # --- Model fitting ---
-    >>> tool.fit_model(['vehicle_age', 'state'], version='v1')
-
-    # CV stability using a user-defined fold column
-    >>> tool.fit_cv_stability(['vehicle_age', 'state'], version='v1', fold_col='cv_fold')
-
-    # --- Evaluation ---
-    >>> tool.ae_chart('driver_age', version='v1')
-
-    # --- Comparison ---
-    >>> tool.compare_models('v1', 'v2')
-
-    # --- Persistence ---
-    >>> tool.save('v1', 'models/v1.pkl')
-    >>> tool2 = ModelingTool.load('models/v1.pkl', data=df)
     """
 
     def __init__(
@@ -144,11 +103,12 @@ class ModelingTool:
         data: pl.DataFrame,
         target_col: str,
         weight_col: Optional[str] = None,
-        family: Any = None,
-        link: str = "log",
-        tweedie_power: float = 1.5,
+        offset_col: Optional[str] = None,
+        link: Any = None,
         drop_reference: str = "max_weight",
         cv_column: Optional[str] = None,
+        current_version: Optional[str] = None,
+        base_version: Optional[str] = None
     ):
         """
         Parameters
@@ -184,11 +144,10 @@ class ModelingTool:
         self.data = data
         self.target_col = target_col
         self.weight_col = weight_col
+        self.offset_col = offset_col
         self.drop_reference = drop_reference
         self.cv_column = cv_column
-        self.family = family
         self.link = link
-        self.tweedie_power = tweedie_power
         self.variable_configs: Dict[str, VariableConfig] = {}
         self.model_versions: Dict[str, ModelVersion] = {}
 
@@ -197,6 +156,11 @@ class ModelingTool:
     @property
     def _y(self) -> pl.Series:
         return self.data[self.target_col]
+    
+    @property
+    def _y_array(self) -> np.ndarray:
+        """Target values as a float64 numpy array."""
+        return self._y.to_numpy().astype(float)
 
     @property
     def _weights(self) -> Optional[pl.Series]:
@@ -206,6 +170,11 @@ class ModelingTool:
     def _weights_array(self) -> Optional[np.ndarray]:
         """Exposure weights as a float64 numpy array, or None if no weight column."""
         return self._weights.to_numpy().astype(float) if self._weights is not None else None
+    
+    @property
+    def _offset_array(self) -> Optional[np.ndarray]:
+        """Offset values as a float64 numpy array, or None if no offset column."""
+        return self.data[self.offset_col].to_numpy().astype(float) if self.offset_col is not None else None
 
     # ── Variable management ───────────────────────────────────────────────────
 
@@ -241,8 +210,7 @@ class ModelingTool:
                    cap_upper=0.99,
                )
 
-        For categorical variables, ``custom_transform`` is applied element-wise
-        for remapping before encoding::
+        For categorical variables, ``custom_transform`` is applied before encoding::
 
                tool.add_variable(
                    'state',
@@ -305,8 +273,8 @@ class ModelingTool:
         self,
         col: str,
         n_bins: int = 10,
+        breaks: Optional[List[float]] = None,
         figsize: Optional[Tuple[int, int]] = None,
-        show: bool = True,
         version: Optional[str] = None,
     ) -> plt.Figure:
         """
@@ -328,13 +296,16 @@ class ModelingTool:
         if version is not None:
             mv = self._get_version(version)
             preprocessor = getattr(mv, "preprocessor", None)
+        elif col in self.variable_configs:
+            preprocessor = Preprocessor([self.variable_configs[col]])
+            preprocessor.fit(self.data, weights=self._weights_array)
+        
         fig = univariate_plot(
             self.data, self._y, col=col,
-            weights=self._weights, n_bins=n_bins, figsize=figsize,
+            weights=self._weights, n_bins=n_bins, breaks=breaks, figsize=figsize,
             preprocessor=preprocessor,
         )
-        if show:
-            plt.show()
+
         return fig
 
     # ── Bin suggestion ────────────────────────────────────────────────────────
@@ -373,6 +344,20 @@ class ModelingTool:
         from .bin_suggestor import suggest_bins_gbm as _fn
         return _fn(col, self.data, self._y, weights=self._weights,
                    max_splits=max_splits, verbose=verbose, **kwargs)
+    
+    def suggest_bins_optbin(
+        self,
+        col: str,
+        max_n_bins: int = 10,
+        monotonic_trend: str = "auto",
+        verbose: bool = True,
+        **kwargs,
+    ) -> List[float]:
+        """Optimal binning breakpoints for *col*. Shortcut for ``suggest_bins(methods=['optbin'])[...]``."""
+        from .bin_suggestor import suggest_bins_optbin as _fn
+        return _fn(col, self.data, self._y, weights=self._weights,
+                   max_n_bins=max_n_bins, monotonic_trend=monotonic_trend,
+                   verbose=verbose, **kwargs)
 
     def suggest_bins(
         self,
@@ -380,7 +365,7 @@ class ModelingTool:
         methods: Sequence[str] = ("quantile", "equal_width", "optbin", "gbm"),
         n_bins: int = 10,
         max_splits: int = 20,
-        show_plot: bool = True,
+        show_plot: bool = False,
         figsize: Optional[Tuple[int, int]] = None,
         **method_kwargs: Any,
     ) -> Dict[str, List[float]]:
@@ -437,7 +422,6 @@ class ModelingTool:
             methods=methods,
             n_bins=n_bins,
             max_splits=max_splits,
-            show_plot=show_plot,
             figsize=figsize,
             **method_kwargs,
         )
@@ -452,14 +436,14 @@ class ModelingTool:
         l1_ratio: Union[float, List[float]] = 0.5,
         use_cv: bool = True,
         cv: Optional[int] = None,
-        alphas: Optional[np.ndarray] = None,
-        l1_ratios: Optional[List[float]] = None,
         family: Any = None,
         link: Optional[str] = None,
-        tweedie_power: Optional[float] = None,
+        tweedie_power: Optional[float] = 1.50,
+        preprocessor: Optional[Preprocessor] = None,
         max_iter: int = 1000,
+        gradient_tol: Optional[float] = None,
         fit_intercept: bool = True,
-        print_summary: bool = True,
+        print_summary: bool = True
     ) -> ModelVersion:
         """
         Fit an elastic net GLM and store it as a named version.
@@ -476,9 +460,8 @@ class ModelingTool:
         version : str
             Version label (e.g. ``'v1'``, ``'with_geo'``).
         alpha : float, optional
-            Fixed regularisation strength.  When provided, CV is skipped
-            and this value is used directly.  Pass ``0.0`` for an
-            unpenalised GLM.
+            Fixed regularisation strength.  Ignored when ``use_cv=True``.
+            Pass ``0.0`` for an unpenalised GLM.
         l1_ratio : float or list of float
             Elastic-net mixing (0=ridge, 1=lasso).  A list triggers a CV
             grid search.
@@ -492,56 +475,55 @@ class ModelingTool:
             ``cv_column`` exists, falls back to 5-fold CV.  Pass an explicit
             integer to override the ``cv_column`` for this specific fit.
         """
-        if cv is not None:
+        if alpha is not None: 
+            use_cv = False # No regularization, so no need for CV; ignore any cv argument passed
+            resolved_cv = None
+        elif cv is not None:
             resolved_cv: Any = cv
         elif self.cv_column is not None:
             from sklearn.model_selection import PredefinedSplit
 
-            fold_values = self.data[self.cv_column].to_numpy().tolist()
+            fold_values = self.data[self.cv_column]
             # Map arbitrary fold labels to contiguous integers (required by PredefinedSplit)
             unique_folds = sorted(set(fold_values))
             fold_map = {f: i for i, f in enumerate(unique_folds)}
-            test_fold = np.array([fold_map[f] for f in fold_values])
+            test_fold = [fold_map[f] for f in fold_values]
             resolved_cv = PredefinedSplit(test_fold)
-            print(
-                f"  [CV] Using PredefinedSplit from '{self.cv_column}' "
-                f"({len(unique_folds)} folds: {unique_folds})"
-            )
         else:
             resolved_cv = 5  # sklearn default
 
+
         mv = fit_model(
             X=self.data,
-            y=self._y,
+            y=self._y_array,
             variables=variables,
             version_name=version,
             configs=self.variable_configs,
-            weights=self._weights,
-            family=family or self.family,
+            weights=self._weights_array,
+            offset=self._offset_array,
+            family=family,
             link=link or self.link,
-            tweedie_power=tweedie_power or self.tweedie_power,
+            tweedie_power=tweedie_power,
+            preprocessor=preprocessor,
             alpha=alpha,
             l1_ratio=l1_ratio,
             use_cv=use_cv,
             cv=resolved_cv,
-            alphas=alphas,
-            l1_ratios=l1_ratios,
             max_iter=max_iter,
+            gradient_tol=gradient_tol,
             fit_intercept=fit_intercept,
             drop_reference=self.drop_reference,
         )
         self.model_versions[version] = mv
+        self.current_version = version
+
         if print_summary:
             self.model_summary(version)
-        return mv
+        return None
 
     def fit_cv_stability(
         self,
-        variables: List[str],
-        fold_col: str,
         version: Optional[str] = None,
-        alpha: Optional[float] = None,
-        l1_ratio: Optional[float] = None,
         family: Any = None,
         link: Optional[str] = None,
         tweedie_power: Optional[float] = None,
@@ -551,22 +533,15 @@ class ModelingTool:
         """
         Assess coefficient stability using user-defined CV folds.
 
-        For each unique value in ``fold_col``, the model is trained on all
+        For each unique value in ``self.cv_column``, the model is trained on all
         other rows and the coefficients are stored.  The geometric mean,
         standard deviation, and coefficient of variation (%) across folds
         are appended as summary rows.
 
         Parameters
         ----------
-        variables : list of str
-            Same predictors as the model to be evaluated.
-        fold_col : str
-            Column in ``data`` whose values define test folds.  Each unique
-            value becomes one fold.  Example: a column of integers 1–5.
         version : str, optional
             Borrow ``alpha`` and ``l1_ratio`` from a previously fitted version.
-        alpha, l1_ratio : float, optional
-            Override hyperparameters (take precedence over *version*).
         plot : bool
             Show coefficient stability box-plot.
 
@@ -576,28 +551,32 @@ class ModelingTool:
             Rows = one per fold + ``'geomean'``, ``'std'``, ``'cv_pct'``.
             Columns = ``'fold'`` + intercept + one per feature.
         """
-        resolved_alpha = alpha
-        resolved_l1 = l1_ratio
         if version is not None and version in self.model_versions:
             mv = self.model_versions[version]
-            if resolved_alpha is None:
-                resolved_alpha = mv.alpha
-            if resolved_l1 is None:
-                resolved_l1 = mv.l1_ratio
+        elif version is None:
+            print("Using current version since none was specified or specified version does not exist.")
+            mv = self.model_versions[self.current_version]
+        else:
+            raise AttributeError('No model has yet been fit, please fit a model first and then specify a version.')
+
+        resolved_alpha = mv.alpha
+        resolved_l1 = mv.l1_ratio
 
         stability = fit_cv_stability(
             X=self.data,
-            y=self._y,
-            variables=variables,
+            y=self._y_array,
+            variables=mv.variables,
             configs=self.variable_configs,
-            fold_col=fold_col,
-            weights=self._weights,
-            family=family or self.family,
+            fold_col=self.cv_column,
+            weights=self._weights_array,
+            offset=self._offset_array,
+            family=family or mv.family,
             link=link or self.link,
-            tweedie_power=tweedie_power or self.tweedie_power,
+            tweedie_power=tweedie_power or mv.tweedie_power,
             alpha=resolved_alpha if resolved_alpha is not None else 0.01,
             l1_ratio=resolved_l1 if resolved_l1 is not None else 0.5,
             drop_reference=self.drop_reference,
+            gradient_tol=mv.gradient_tol if hasattr(mv, "gradient_tol") else None
         )
 
         if plot:
@@ -605,8 +584,29 @@ class ModelingTool:
             if show:
                 plt.show()
 
+        self.model_versions[mv.name].cv_stability = stability
+
         return stability
 
+    def set_base_version(self, version: str) -> "ModelingTool":
+        if version not in self.model_versions and version not in self.data.columns:
+            raise ValueError(f"Version '{version}' not found and not in data columns. Available versions: {list(self.model_versions.keys())}")
+        
+        self.base_version = version
+        return self
+
+    def predict(self, data: pl.DataFrame, version: Optional[str] = None, missing_factor: float = 1.0, offset: Optional[np.ndarray] = None) -> np.ndarray:
+        """Generate predictions for *data* using the specified model version."""
+        mv = self._get_version(version or self.current_version)
+        if offset is None:
+            offset = self.__offset_array
+
+        if isinstance(mv, FactorModelVersion):
+            if mv.offset_col and mv.offset_col in data.columns and mv.offset_col != self.offset_col:
+                offset = data[mv.offset_col].to_numpy().astype(float)
+            return mv.predict(data, missing_factor=missing_factor, offset=offset)
+        else:
+            return mv.predict(data, offset=offset)
     # ── Excel factor version ──────────────────────────────────────────────────
 
     def add_excel_version(
@@ -616,6 +616,7 @@ class ModelingTool:
         version: str = "excel",
         missing_factor: float = 1.0,
         base_version: Optional[str] = None,
+        offset_col: Optional[str] = None
     ) -> "ModelingTool":
         """
         Load factors from an Excel sheet and register them as a new model version.
@@ -675,7 +676,7 @@ class ModelingTool:
         )
 
         variables = [
-            v for v in factor_table["Variable"].unique().to_list()
+            v for v in factor_table["Variable"].unique()
             if v != "intercept"
         ]
 
@@ -684,16 +685,8 @@ class ModelingTool:
             prep = getattr(mv_base, "preprocessor", None)
         else:
             # Pick the fitted GLM preprocessor that covers the most excel variables
-            prep = None
-            best_coverage = -1
-            for mv in self.model_versions.values():
-                if not isinstance(mv, FactorModelVersion):
-                    p = getattr(mv, "preprocessor", None)
-                    if p is not None:
-                        coverage = sum(1 for v in variables if v in p.configs)
-                        if coverage > best_coverage:
-                            best_coverage = coverage
-                            prep = p
+            prep = _build_preprocessor(variables, self.data, self.variable_configs)
+            prep.fit(self.data, self._y_array, weights=self._weights_array)
 
         preprocessor_vars = (
             [v for v in variables if v in prep.configs]
@@ -718,10 +711,16 @@ class ModelingTool:
             preprocessor=prep,
             preprocessor_vars=preprocessor_vars,
             train_predictions=np.array([]),
+            offset_col=offset_col
         )
 
         if len(self.data) > 0:
-            fmv.train_predictions = fmv.predict(self.data, missing_factor=missing_factor)
+            offset_array = None
+            if fmv.offset_col and fmv.offset_col in self.data.columns:
+                offset_array = self.data[fmv.offset_col].to_numpy().astype(float)
+            # elif self.offset_col is not None:
+            #     offset_array = self._offset_array
+            fmv.train_predictions = fmv.predict(self.data, missing_factor=missing_factor, offset=offset_array)
         else:
             fmv.train_predictions = np.array([])
 
@@ -738,37 +737,49 @@ class ModelingTool:
 
     # ── Model summary ─────────────────────────────────────────────────────────
 
-    def model_summary(self, version: str) -> pl.DataFrame:
+    def model_summary(self, version: Optional[str] = None) -> pl.DataFrame:
         """Print and return the coefficient table for *version*."""
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         if isinstance(mv, FactorModelVersion):
             raise TypeError(
                 f"Version '{version}' is an Excel factor model; "
                 "model_summary is not applicable."
             )
-        tbl = mv.coefficient_table()
-
-        print(f"\n{'-'*60}")
-        print(f"  Model version : {version}")
-        print(f"  Alpha         : {mv.alpha:.6g}")
-        print(f"  L1 ratio      : {mv.l1_ratio:.4g}")
-        print(f"  # features    : {len(mv.feature_names)}")
         nonzero = int((mv.coefficients["coefficient"] != 0).sum()) - 1  # exclude intercept
-        print(f"  # nonzero     : {nonzero}")
-        print(f"{'-'*60}")
-        print(tbl)
-        print(f"{'-'*60}\n")
-        return tbl
+
+        top_data = [
+            ("Model Version:", mv.name),
+            ("Dep. Variable:", self.target_col),
+            ("Model:", f"GLM, Penalty Weight = {np.round(mv.alpha, 3)}, L1 Ratio = {np.round(mv.l1_ratio, 3)}"),
+            ("Model Family:", mv.family.__class__.__name__),
+            ("Link Function:", mv.link.__class__.__name__),
+            ("Method:", "IRLS-CD"),
+            ("Fit Date:", mv.fit_info['Fit_Time']),
+            ("No. Iterations:", len(mv.glm.diagnostics_)),
+            ("No. Observations:", len(self.data)),
+            ('# Features:', len(mv.feature_names)),
+            ('# Nonzero Coefs:', nonzero)
+        ]
+        top_part = tabulate(top_data, tablefmt="plain")
+
+        coef_table = tabulate(mv.coefficients.to_dict())
+
+        print('='*80)
+        print(top_part)
+        print('='*80)
+        print(coef_table)
+
+        return None
 
     def coefficient_plot(
         self,
-        version: str,
+        version: Optional[str] = None,
         top_n: int = 30,
         figsize: Optional[Tuple[int, int]] = None,
         show: bool = True,
     ) -> plt.Figure:
         """Horizontal bar chart of coefficients for *version*."""
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         if isinstance(mv, FactorModelVersion):
             raise TypeError(
                 f"Version '{version}' is an Excel factor model; "
@@ -784,27 +795,31 @@ class ModelingTool:
 
     def _get_fold_info(
         self,
-        mv: "ModelVersion",
-        fold_col: str,
+        mv: "ModelVersion"
     ) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
         """Refit on each fold; return (fold_names, fold_label -> {feat: coef})."""
-        stability = fit_cv_stability(
-            X=self.data,
-            y=self._y,
-            variables=mv.variables,
-            configs=self.variable_configs,
-            fold_col=fold_col,
-            weights=self._weights,
-            family=mv.family,
-            link=mv.link,
-            alpha=mv.alpha,
-            l1_ratio=mv.l1_ratio,
-            drop_reference=self.drop_reference,
-        )
+        if mv.cv_stability is None:
+            stability = fit_cv_stability(
+                X=self.data,
+                y=self._y_array,
+                variables=mv.variables,
+                configs=self.variable_configs,
+                fold_col=self.cv_column,
+                weights=self._weights_array,
+                offset=self._offset_array,
+                family=mv.family,
+                link=mv.link,
+                alpha=mv.alpha,
+                l1_ratio=mv.l1_ratio,
+                drop_reference=self.drop_reference,
+            )
+            mv.cv_stability = stability
+        else:
+            stability = mv.cv_stability
         fold_rows = stability.filter(
             ~pl.col("fold").is_in(["geomean", "std", "cv_pct"])
         )
-        fold_names = [f"fold_{f}" for f in fold_rows["fold"].to_list()]
+        fold_names = fold_rows["fold"].to_list()
         fold_coef_map: Dict[str, Dict[str, float]] = {
             fn: {k: v for k, v in row_d.items() if k != "fold"}
             for fn, row_d in zip(fold_names, fold_rows.to_dicts())
@@ -860,7 +875,7 @@ class ModelingTool:
         rows: List[Dict[str, Any]] = []
         if dropped is not None:
             rows.append(_make_row(
-                var_col, f"{dropped} (base)", total_w - other_w, 0.0,
+                var_col, dropped, total_w - other_w, 0.0,
                 fold_names, fold_coef_map, None, calib_weight=base_cw,
             ))
         for cat, feat in zip(categories, feats):
@@ -890,7 +905,7 @@ class ModelingTool:
         """Row dicts for one binned numeric variable."""
         edges = p["bin_edges"]
         dropped_bin = p.get("dropped_bin", 0)
-        all_labels = p.get("bin_labels") or make_bin_labels(edges)
+        all_labels = p.get("bin_labels")
 
         missing_feat = f"{var_col}_missing"
         bin_feats = [
@@ -939,14 +954,13 @@ class ModelingTool:
             ))
         return rows
 
-    def relativities_table(
+    def summary_table(
         self,
-        version: str,
-        fold_col: Optional[str] = None,
+        version: Optional[str] = None,
         calib_df: Optional[pl.DataFrame] = None,
     ) -> pl.DataFrame:
         """
-        Relativity table for all categorical and binned variables in *version*.
+        Summary table for all categorical and binned variables in *version*.
 
         Each row is one level of one discrete variable.  The dropped base
         level is included with a coefficient of zero so the full picture is
@@ -954,13 +968,8 @@ class ModelingTool:
 
         Parameters
         ----------
-        version : str
-            Version key of the fitted model to inspect.
-        fold_col : str, optional
-            Column in the training data whose unique values define CV folds.
-            When supplied, the model is refit on every fold (using the
-            version's alpha / l1_ratio) and one ``fold_{k}`` coefficient
-            column is added for each fold.
+        version : str, optional
+            Version key of the fitted model to inspect. Uses current version if none specified.
         calib_df : pl.DataFrame, optional
             An independent DataFrame (e.g. a calibration or holdout set).
             When supplied, a ``calib_weight`` column is added showing the
@@ -974,11 +983,11 @@ class ModelingTool:
             Columns: ``variable``, ``level``, ``weight``
             [, ``calib_weight``], ``train_coef`` [, ``fold_{k}`` …].
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         if isinstance(mv, FactorModelVersion):
             raise TypeError(
                 f"Version '{version}' is an Excel factor model; "
-                "relativities_table is not applicable (the factor table IS the relativity table)."
+                "summary_table is not applicable (the factor table IS the relativity table)."
             )
         prep = mv.preprocessor
 
@@ -995,7 +1004,7 @@ class ModelingTool:
         }
 
         fold_names, fold_coef_map = (
-            self._get_fold_info(mv, fold_col) if fold_col is not None else ([], {})
+            self._get_fold_info(mv) if self.cv_column is not None else ([], {})
         )
         Xt_calib, w_calib, total_calib_w = self._get_calib_arrays(prep, calib_df)
 
@@ -1047,7 +1056,7 @@ class ModelingTool:
                 feats = [f"{var_col}_{cat}" for cat in p["categories"]]
             elif "bin_edges" in p:
                 dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels") or make_bin_labels(np.asarray(p["bin_edges"]))
+                all_labels = p.get("bin_labels")
                 feats = []
                 if f"{var_col}_missing" in Xt_df.columns:
                     feats.append(f"{var_col}_missing")
@@ -1079,8 +1088,8 @@ class ModelingTool:
 
         n = len(self.data)
         factor_by_var = {
-            keys[0]: sub.select(["Level", "Factor"])
-            for keys, sub in mv.factor_table.group_by("Variable")
+            grp: df.select(["Level", "Factor"])
+            for (grp, ), df in mv.factor_table.group_by("Variable")
         }
         result: Dict[str, np.ndarray] = {}
 
@@ -1116,7 +1125,7 @@ class ModelingTool:
                 return level_arr
             if "bin_edges" in p:
                 dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels") or make_bin_labels(p["bin_edges"])
+                all_labels = p.get("bin_labels")
                 level_arr = np.full(n, f"{all_labels[dropped_bin]} (base)", dtype=object)
                 missing_feat = f"{V}_missing"
                 if missing_feat in Xt.columns:
@@ -1132,10 +1141,44 @@ class ModelingTool:
         # Direct string match on raw column
         return np.array(self.data[V].cast(pl.String).to_list(), dtype=object)
 
+    def decile_lift_chart(
+        self,
+        version: Optional[str] = None,
+        n_bins: int = 10
+    ) -> plt.Figure:
+        """
+        Decile lift chart for *version*.
+
+        The data is sorted by predicted value and split into *n_bins* equal-sized
+        groups.  The mean actual and predicted values are plotted for each group
+        to show how well the model discriminates between high- and low-risk
+        segments.
+
+        Parameters
+        ----------
+        version : str
+            Model version name.
+        n_bins : int
+            Number of equal-sized groups to split the data into (default 10).
+
+        Returns
+        -------
+        plt.Figure
+            Line chart with one line each for actual and predicted.
+        """
+        mv = self._get_version(version or self.current_version)
+        y = self._y_array
+        w = self._weights_array
+        p = mv.train_predictions
+
+        fig = decile_lift_chart(y, p, w, n_bins, mv.name)
+
+        return fig
+
     def ave_table(
         self,
         variables: List[str],
-        version: str,
+        version: Optional[str] = None,
         n_bins: int = 10,
     ) -> pl.DataFrame:
         """
@@ -1158,8 +1201,8 @@ class ModelingTool:
         ----------
         variables : list of str
             Analysis variables to break down by.  Need not be model variables.
-        version : str
-            Model version name.
+        version : str, optional
+            Model version name. Uses current version if none specified.
         n_bins : int
             Quantile bins for continuous non-binned analysis variables.
 
@@ -1170,10 +1213,10 @@ class ModelingTool:
             ``prediction``, then ``{model_var}_factor`` for each model
             variable.
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         prep = getattr(mv, "preprocessor", None)
         w_arr = self._weights_array if self._weights_array is not None else np.ones(len(self.data))
-        y_arr = self._y.to_numpy().astype(float)
+        y_arr = self._y_array
         pred_arr = mv.train_predictions
 
         if isinstance(mv, FactorModelVersion):
@@ -1232,10 +1275,10 @@ class ModelingTool:
     def ae_chart(
         self,
         col: str,
-        version: str,
+        version: Optional[str] = None,
         n_bins: int = 10,
+        breaks: Optional[List[float]] = None,
         figsize: Optional[Tuple[int, int]] = None,
-        show: bool = True,
     ) -> plt.Figure:
         """
         Actual vs Expected chart for *col* using model *version*.
@@ -1244,7 +1287,7 @@ class ModelingTool:
         are binned into ``n_bins`` quantile groups.  The sentinel value
         ``-999999999`` is labelled ``'Missing'``.
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         fig = ae_chart(
             X=self.data,
             y=self._y,
@@ -1252,21 +1295,21 @@ class ModelingTool:
             predictions=mv.train_predictions,
             weights=self._weights,
             n_bins=n_bins,
+            breaks=breaks,
             figsize=figsize,
             version_name=version,
             preprocessor=getattr(mv, "preprocessor", None),
         )
-        if show:
-            plt.show()
+
         return fig
 
     def residual_chart(
         self,
         col: str,
-        version: str,
+        version: Optional[str] = None,
         n_bins: int = 10,
+        breaks: Optional[List[float]] = None,
         figsize: Optional[Tuple[int, int]] = None,
-        show: bool = True,
     ) -> plt.Figure:
         """
         Residual signal chart: ``mean_actual / mean_predicted`` per level of *col*.
@@ -1286,12 +1329,12 @@ class ModelingTool:
         ----------
         col : str
             Variable to slice by.  Does not need to be a model predictor.
-        version : str
-            Version key of the model whose predictions are used.
+        version : str, optional
+            Version key of the model whose predictions are used. Uses current version if none specified.
         n_bins : int
             Number of quantile bins for continuous variables.
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         fig = residual_chart(
             X=self.data,
             y=self._y,
@@ -1299,29 +1342,28 @@ class ModelingTool:
             predictions=mv.train_predictions,
             weights=self._weights,
             n_bins=n_bins,
+            breaks=breaks,
             figsize=figsize,
             version_name=version,
             preprocessor=getattr(mv, "preprocessor", None),
         )
-        if show:
-            plt.show()
+
         return fig
 
     def plot_all_variables(
         self,
-        version: str,
+        version: Optional[str] = None,
         chart: str = "residual",
         n_bins: int = 10,
-        figsize: Optional[Tuple[int, int]] = None,
-        show: bool = True,
+        figsize: Optional[Tuple[int, int]] = None
     ) -> List[plt.Figure]:
         """
         Plot a residual or A/E chart for every variable in *version*.
 
         Parameters
         ----------
-        version : str
-            Version key whose variable list drives the loop.
+        version : str, optional
+            Version key whose variable list drives the loop. Uses current version if none specified.
         chart : {'residual', 'ae'}
             ``'residual'`` (default) — ``mean_actual / mean_predicted`` per
             level, with a horizontal reference line at 1.0.
@@ -1338,28 +1380,33 @@ class ModelingTool:
         """
         if chart not in ("residual", "ae"):
             raise ValueError(f"chart must be 'residual' or 'ae', got {chart!r}")
+        version = version or self.current_version
         mv = self._get_version(version)
         figs: List[plt.Figure] = []
         for col in mv.variables:
             if chart == "ae":
                 fig = self.ae_chart(col, version=version, n_bins=n_bins,
-                                    figsize=figsize, show=show)
+                                    figsize=figsize)
             else:
                 fig = self.residual_chart(col, version=version, n_bins=n_bins,
-                                          figsize=figsize, show=show)
+                                          figsize=figsize)
             figs.append(fig)
         return figs
 
     # ── Model comparison ──────────────────────────────────────────────────────
 
+    def _get_dl_score(self, y, p1, p2, weights, n_buckets, deviation='absolute'):
+        dl_data = double_lift_table(y, p1, p2, weights=weights, n_buckets=n_buckets)
+        return dl_data, double_lift_score(dl_data, deviation=deviation)
+
     def compare_models(
         self,
-        version1: str,
-        version2: str,
+        version1: Optional[str] = None,
+        version2: Optional[str] = None,
         n_buckets: int = 10,
-        deviation: str = "absolute",
         figsize: Optional[Tuple[int, int]] = None,
-        show: bool = True,
+        dl_deviation: Optional[str] = 'absolute',
+        show: bool = True
     ) -> Dict[str, Any]:
         """
         Compare two model versions: metrics table and double-lift chart.
@@ -1370,15 +1417,16 @@ class ModelingTool:
           :meth:`add_excel_version` (the original behaviour), **or**
         * A **column name** in the tool's dataset whose values are pre-computed
           predictions (e.g. an incumbent / external model stored in the data).
+        * A preset version using the set_base_version method, which also registers the version name.
 
         Registered model versions take priority: if a name matches both a
         version and a column, the version is used.
 
         Parameters
         ----------
-        version1 : str
-            First model version (must be a registered version name).
-        version2 : str
+        version1 : str, optional
+            First model version (must be a registered version name). Uses base version if none specified.
+        version2 : str, optional
             Second model — either a registered version name or a dataframe
             column containing predictions.
         n_buckets : int
@@ -1389,13 +1437,17 @@ class ModelingTool:
         dict
             ``{'metrics': pl.DataFrame, 'double_lift': pl.DataFrame}``
         """
-        mv1 = self._get_version(version1)
+        mv1 = self._get_version(version1 or self.current_version)
 
-        y = self._y.to_numpy().astype(float)
+        y = self._y_array
         w = self._weights_array
         p1 = mv1.train_predictions
 
         # Resolve version2: registered model version takes priority over column.
+        if version2 is None and self.base_version is None:
+            raise ValueError("version2 must be specified if no base version is set.")
+        version2 = version2 or self.base_version
+
         if version2 in self.model_versions:
             p2 = self._get_version(version2).train_predictions
         elif version2 in self.data.columns:
@@ -1411,8 +1463,7 @@ class ModelingTool:
             self._get_version(version2)
             p2 = np.array([])  # unreachable; satisfies type checkers
 
-        dl_data = double_lift_table(y, p1, p2, weights=w, n_buckets=n_buckets)
-        dl_sc = double_lift_score(dl_data, deviation=deviation)
+        dl_data, dl_sc = self._get_dl_score(y, p1, p2, weights=w, n_buckets=n_buckets, deviation=dl_deviation)
 
         metrics = compare_metrics(
             y, p1, p2,
@@ -1420,22 +1471,21 @@ class ModelingTool:
             name1=version1,
             name2=version2,
             dl_score=dl_sc,
-            deviation=deviation,
         )
 
         print("\n" + "=" * 60)
         print(f"  Comparison: {version1}  vs  {version2}")
         print("=" * 60)
         print(metrics)
-        print("=" * 60)
-        if dl_sc < 0:
-            dl_interp = f"negative -> {version1} wins"
-        elif dl_sc > 0:
-            dl_interp = f"positive -> {version2} wins"
-        else:
-            dl_interp = "tie"
-        print(f"  double_lift_score interpretation: {dl_interp}")
-        print("=" * 60 + "\n")
+        # print("=" * 60)
+        # if dl_sc < 0:
+        #     dl_interp = f"negative -> {version1} wins"
+        # elif dl_sc > 0:
+        #     dl_interp = f"positive -> {version2} wins"
+        # else:
+        #     dl_interp = "tie"
+        # print(f"  double_lift_score interpretation: {dl_interp}")
+        # print("=" * 60 + "\n")
 
         double_lift_chart(y, p1, p2, weights=w, n_buckets=n_buckets,
                           name1=version1, name2=version2, figsize=figsize)
@@ -1448,7 +1498,7 @@ class ModelingTool:
     def list_versions(self) -> pl.DataFrame:
         """Summary table of all stored model versions."""
         rows = []
-        y = self._y.to_numpy().astype(float)
+        y = self._y_array
         w = self._weights_array
         for name, mv in self.model_versions.items():
             m = compute_metrics(y, mv.train_predictions, w, name)
@@ -1467,7 +1517,7 @@ class ModelingTool:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def save(self, version: str, filepath: str) -> None:
+    def save(self, version: Optional[str] = None, filepath: Optional[str] = 'models/model.pkl') -> None:
         """
         Save a model version to *filepath* (pickle).
 
@@ -1478,7 +1528,7 @@ class ModelingTool:
         filepath : str
             Destination path (e.g. ``'models/v1.pkl'``).
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         save_version(mv, self, filepath)
 
     @classmethod
@@ -1515,8 +1565,8 @@ class ModelingTool:
             data=data,
             target_col=target_col or ts["target_col"],
             weight_col=weight_col or ts["weight_col"],
+            offset_col=ts.get("offset_col", None),
             link=ts["link"],
-            tweedie_power=ts["tweedie_power"],
             drop_reference=ts.get("drop_reference", "max_weight"),
         )
         for col, cfg in ts["variable_configs"].items():
@@ -1529,6 +1579,7 @@ class ModelingTool:
             l1_ratio=vs["l1_ratio"],
             use_cv=False,
             family=vs["family"],
+            tweedie_power=vs["tweedie_power"],
             link=vs["link"],
             print_summary=True,
         )
@@ -1536,7 +1587,7 @@ class ModelingTool:
         return tool
 
     @classmethod
-    def load_frozen(cls, filepath: str) -> "ModelingTool":
+    def load_frozen(cls, filepath: str, data: pl.DataFrame) -> "ModelingTool":
         """
         Restore a saved version without refitting (prediction-only mode).
 
@@ -1549,14 +1600,12 @@ class ModelingTool:
         ts = snap["tool_settings"]
 
         tool = cls.__new__(cls)
-        tool.data = pl.DataFrame()
+        tool.data = data.clone()
         tool.target_col = ts["target_col"]
         tool.weight_col = ts["weight_col"]
+        tool.offset_col = ts.get("offset_col", None)
         tool.family = vs["family"]
         tool.link = ts["link"]
-        tool.tweedie_power = ts["tweedie_power"]
-        tool.drop_reference = ts.get("drop_reference", "max_weight")
-        tool.cv_column = None
         tool.variable_configs = ts["variable_configs"]
         tool.model_versions = {}
 
@@ -1572,9 +1621,16 @@ class ModelingTool:
             l1_ratio=vs["l1_ratio"],
             family=vs["family"],
             link=vs["link"],
-            train_predictions=np.array([]),
+            train_predictions=None,
             fit_info=vs["fit_info"],
+            tweedie_power=vs["tweedie_power"],
         )
+
+        offset_arr = None
+        if tool.offset_col is not None and tool.offset_col in data.columns:
+            offset_arr = data[tool.offset_col].cast(pl.Float64).to_numpy()
+
+        mv.train_predictions = mv.predict(data, offset=offset_arr)
         tool.model_versions["v1"] = mv
         print(f"Loaded frozen '{vs['name']}' from {filepath!r} as 'v1'.")
         return tool
@@ -1590,6 +1646,7 @@ class ModelingTool:
         pkl_path: Optional[str] = None,
         version: str = "excel",
         missing_factor: float = 1.0,
+        offset_col: Optional[str] = None
     ) -> "ModelingTool":
         """
         Build a :class:`ModelingTool` from an Excel factor table.
@@ -1630,11 +1687,11 @@ class ModelingTool:
 
         if pkl_path is not None:
             # Load the saved model frozen to get preprocessor + variable configs
-            frozen = cls.load_frozen(pkl_path)
+            frozen = cls.load_frozen(pkl_path, data)
             tool = cls(
                 data=data,
                 target_col=target_col or frozen.target_col,
-                weight_col=weight_col or frozen.weight_col,
+                weight_col=weight_col or frozen.weight_col
             )
             tool.variable_configs = frozen.variable_configs
             tool.model_versions = frozen.model_versions  # 'v1' has the preprocessor
@@ -1646,6 +1703,7 @@ class ModelingTool:
             sheet_name,
             version=version,
             missing_factor=missing_factor,
+            offset_col=offset_col
         )
         return tool
 
@@ -1654,6 +1712,7 @@ class ModelingTool:
     def fit_shadow_gbm(
         self,
         feature_cols: Optional[List[str]] = None,
+        tweedie_power: Optional[float] = 1.50,
         **kwargs: Any,
     ) -> Any:
         """
@@ -1664,27 +1723,14 @@ class ModelingTool:
         """
         from .discovery import fit_shadow_gbm
 
-        if feature_cols is None:
-            exclude = {self.target_col}
-            if self.weight_col:
-                exclude.add(self.weight_col)
-            if self.cv_column:
-                exclude.add(self.cv_column)
-            feature_cols = [
-                c for c in self.data.columns
-                if c not in exclude
-                and (
-                    self.data[c].dtype in _NUMERIC_DTYPES
-                    or _is_str_or_cat(self.data[c].dtype)
-                )
-            ]
-
         model = fit_shadow_gbm(
             self.data,
             self.target_col,
             weight_col=self.weight_col,
+            offset_col=self.offset_col,
             feature_cols=feature_cols,
-            tweedie_power=self.tweedie_power,
+            tweedie_power=tweedie_power,
+            variable_configs=self.variable_configs,
             **kwargs,
         )
         self._shadow_model = model
@@ -1699,7 +1745,7 @@ class ModelingTool:
             raise RuntimeError("Call fit_shadow_gbm() first.")
         return interaction_ranking(
             self._shadow_model, self.data,
-            weight_col=self.weight_col, top_n=top_n, **kwargs,
+            top_n=top_n, **kwargs,
         )
 
     def partial_dependence_2d(self, var1: str, var2: str, **kwargs: Any) -> pl.DataFrame:
@@ -1903,6 +1949,7 @@ class ModelingTool:
             feature_cols=feature_cols,
             n_estimators=n_estimators,
             random_state=random_state,
+            variable_configs=self.variable_configs,
             verbose=verbose,
             **kwargs,
         )
@@ -1938,12 +1985,13 @@ class ModelingTool:
             n_iterations=n_iterations,
             threshold=threshold,
             random_state=random_state,
+            variable_configs=self.variable_configs,
             **kwargs,
         )
 
     def residual_gbm(
         self,
-        version: str,
+        version: Optional[str] = None,
         feature_cols: Optional[List[str]] = None,
         top_n: int = 10,
         **kwargs: Any,
@@ -1960,8 +2008,8 @@ class ModelingTool:
         """
         from .discovery import residual_gbm as _residual_gbm
 
-        mv = self._get_version(version)
-        actual = self._y.to_numpy().astype(float)
+        mv = self._get_version(version or self.current_version)
+        actual = self._y_array
         predicted = mv.train_predictions
         safe_pred = np.where(np.abs(predicted) < 1e-12, 1e-12, predicted)
         residuals = actual / safe_pred
@@ -1970,31 +2018,25 @@ class ModelingTool:
             exclude = {self.target_col}
             if self.weight_col:
                 exclude.add(self.weight_col)
-            if self.cv_column:
-                exclude.add(self.cv_column)
             feature_cols = [
                 c for c in self.data.columns
                 if c not in exclude
-                and (
-                    self.data[c].dtype in _NUMERIC_DTYPES
-                    or _is_str_or_cat(self.data[c].dtype)
-                )
+                and self.data[c].dtype.is_numeric()
             ]
 
         return _residual_gbm(
             self.data, residuals, feature_cols,
-            weight_col=self.weight_col, top_n=top_n, **kwargs,
+            weight_col=self.weight_col, offset_col=self.offset_col, top_n=top_n, variable_configs=self.variable_configs, **kwargs,
         )
 
     # ── Enhanced residual analysis ───────────────────────────────────────────
 
     def residual_heatmap(
         self,
-        version: str,
         col1: str,
         col2: str,
+        version: Optional[str] = None,
         n_bins: int = 8,
-        show: bool = True,
         **kwargs: Any,
     ) -> Tuple[plt.Figure, pl.DataFrame]:
         """
@@ -2004,7 +2046,7 @@ class ModelingTool:
         """
         from .plots import residual_heatmap as _residual_heatmap
 
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         fig, data = _residual_heatmap(
             self.data, self._y, col1, col2,
             predictions=mv.train_predictions,
@@ -2013,8 +2055,7 @@ class ModelingTool:
             n_bins=n_bins,
             **kwargs,
         )
-        if show:
-            plt.show()
+        
         return fig, data
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
@@ -2023,6 +2064,7 @@ class ModelingTool:
         self,
         variables: Optional[List[str]] = None,
         version: Optional[str] = None,
+        tweedie_power: Optional[float] = 1.50,
         l1_ratio: float = 0.5,
         n_alphas: int = 50,
         alpha_min: float = 1e-5,
@@ -2041,6 +2083,7 @@ class ModelingTool:
         """
         from .plots import regularization_path_plot
 
+        mv = None
         if variables is None:
             if version is not None:
                 mv = self._get_version(version)
@@ -2049,6 +2092,9 @@ class ModelingTool:
                 raise ValueError("Provide variables or version.")
 
         alphas = np.logspace(np.log10(alpha_min), np.log10(alpha_max), n_alphas)[::-1]
+        tweedie_power = mv.tweedie_power if mv is not None else tweedie_power
+        family = mv.family if mv is not None else 'tweedie'
+        prep = mv.preprocessor if mv is not None else None
 
         rows = []
         for alpha_val in alphas:
@@ -2058,16 +2104,18 @@ class ModelingTool:
                 variables=variables,
                 version_name="_regpath",
                 configs=self.variable_configs,
-                weights=self._weights,
-                family=self.family,
+                preprocessor=prep,
+                weights=self._weights_array,
+                offset=self._offset_array,
+                family=family,
                 link=self.link,
-                tweedie_power=self.tweedie_power,
+                tweedie_power=tweedie_power,
                 alpha=float(alpha_val),
                 l1_ratio=l1_ratio,
                 use_cv=False,
                 drop_reference=self.drop_reference,
             )
-            coefs = mv.coefficient_table()
+            coefs = mv.coefficients
             for feat_row in coefs.iter_rows(named=True):
                 if feat_row["feature"] != "intercept":
                     rows.append({
@@ -2084,63 +2132,126 @@ class ModelingTool:
 
         return path_df
 
+    def _apply_cv_fold(self, mask: pl.Series):
+        '''
+        Shortcut for filtering the data, target, and weights to the train/test fold in cross-validation methods.
+        '''
+        x, y = self.data.filter(mask), self._y_array[mask]
+        w = self._weights_array[mask] if self._weights_array is not None else None
+        o = self._offset_array[mask] if self._offset_array is not None else None
+        return x, y, w, o
+
+    def _get_cv_metrics_gini(self, train_mask, test_mask, model_version):
+        '''
+        Fit model on the given train fold and return the gini coefficient of the test fold.  Used for cross-validation metrics in gini mode.
+        '''
+        X_train, y_train, w_train, o_train = self._apply_cv_fold(train_mask)
+        X_test, y_test, w_test, o_test = self._apply_cv_fold(test_mask)
+
+        fold_mv = fit_model(X=X_train, y=y_train, variables=model_version.variables,
+            version_name=f"_cv_fold", weights=w_train, offset=o_train, family=model_version.family, link=self.link, preprocessor=model_version.preprocessor,
+            alpha=model_version.alpha, l1_ratio=model_version.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+        )
+
+        pred_test = fold_mv.predict(X_test, offset=o_test)
+
+        return gini_coefficient(y_test, pred_test, w_test), w_test.sum()
+    
+    def _get_cv_metrics_dls(self, train_mask, test_mask, dl_base_preds, dl_refit_base, dl_base_version, model_version, dl_deviation='absolute'):
+        '''
+        Fit model on the given train fold and return the double lift score of the test fold.  Used for cross-validation metrics in double lift mode.
+        '''
+        X_train, y_train, w_train, o_train = self._apply_cv_fold(train_mask)
+        X_test, y_test, w_test, o_test = self._apply_cv_fold(test_mask)
+
+        fold_mv = fit_model(X=X_train, y=y_train, variables=model_version.variables,
+            version_name=f"_cv_fold", weights=w_train, offset=o_train, family=model_version.family, link=self.link, preprocessor=model_version.preprocessor,
+            alpha=model_version.alpha,l1_ratio=model_version.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+        )
+        pred_test = fold_mv.predict(X_test, offset=o_test)
+
+        if dl_refit_base:
+            bv = self._get_version(dl_base_version)
+            base_mv = fit_model(X=X_train, y=y_train, variables=bv.variables,
+                version_name=f"_cv_base_fold", weights=w_train, offset=o_train, family=bv.family, link=self.link, preprocessor=bv.preprocessor,
+                alpha=bv.alpha, l1_ratio=bv.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+            )
+            base_preds_test = base_mv.predict(X_test, offset=o_test)
+        else:
+            base_preds_test = dl_base_preds[test_mask]
+
+        _, fold_dl_score = self._get_dl_score(y_test, base_preds_test, pred_test, weights=w_test, n_buckets=10, deviation=dl_deviation)
+
+        return fold_dl_score, w_test.sum()
+
     def overfitting_monitor(
         self,
         version_names: List[str],
-        metric_fn: Optional[Any] = None,
+        metric_fn: Optional[Any] = 'double_lift_score',
+        dl_base_version: Optional[str] = None,
+        dl_deviation: str = 'absolute',
         show: bool = True,
     ) -> pl.DataFrame:
         """
         Track train vs CV metric across existing model versions.
 
         Uses the stored train predictions and CV scores from each version.
+
+        metric_fn should be one of `gini` or `double_lift_score`. If `double_lift_score` is chosen, a model version or column name containing predictions must be provided
         """
         from .plots import overfitting_plot
 
-        if metric_fn is None:
-            metric_fn = lambda yt, yp, w: gini_coefficient(yt, yp, w, normalize=True)
+        assert metric_fn in ('gini', 'double_lift_score', None), "metric_fn must be 'gini' or 'double_lift_score'"
+
+        dl_refit_base = False
+        if metric_fn == 'double_lift_score':
+            assert dl_base_version is not None or self.base_version is not None, "dl_base_version must be provided when metric_fn is 'double_lift_score' and no base version is set."
+            dl_base_version = dl_base_version or self.base_version
+
+            if dl_base_version in self.model_versions:
+                dl_base_preds = None
+                dl_refit_base = True
+                version_names = [x for x in version_names if x != dl_base_version]
+            elif dl_base_version in self.data.columns:
+                col_s = self.data[dl_base_version]
+                if not col_s.dtype.is_numeric():
+                    raise ValueError(
+                        f"Column '{dl_base_version}' has dtype {col_s.dtype}; "
+                        "predictions must be numeric."
+                    )
+                dl_base_preds = col_s.cast(pl.Float64).to_numpy()
+            else:
+                # Delegate to _get_version to raise the standard helpful KeyError.
+                self._get_version(dl_base_version)
+                dl_base_preds = np.array([])  # unreachable; satisfies type checkers
 
         rows = []
         cumulative_vars: List[str] = []
-        y_true = self._y.to_numpy().astype(float)
+        y_true = self._y_array
         w = self._weights_array
+
         for i, vname in enumerate(version_names):
             mv = self._get_version(vname)
 
-            train_metric = metric_fn(y_true, mv.train_predictions, w)
-            if hasattr(mv, "cv_score") and mv.cv_score is not None:
-                cv_metric = mv.cv_score
-            elif self.cv_column is not None:
+            if metric_fn == 'gini':
+                train_metric = gini_coefficient(y_true, mv.train_predictions, w)
+            else:
+                _, train_metric = self._get_dl_score(y_true, dl_base_preds, mv.train_predictions, weights=w, n_buckets=10, deviation=dl_deviation)
+
+            if self.cv_column is not None:
                 fold_arr = self.data[self.cv_column].to_numpy()
                 unique_folds = np.unique(fold_arr)
-                fold_metrics = []
-                fold_weights = []
+                fold_metrics, fold_weights = [], []
+
                 for fold in unique_folds:
                     train_mask = pl.Series(fold_arr != fold)
                     test_mask = fold_arr == fold
-                    X_train = self.data.filter(train_mask)
-                    y_train = self._y.filter(train_mask)
-                    w_train = self._weights.filter(train_mask) if self._weights is not None else None
-                    fold_mv = fit_model(
-                        X=X_train,
-                        y=y_train,
-                        variables=mv.variables,
-                        version_name=f"_cv_fold_{fold}",
-                        configs=self.variable_configs,
-                        weights=w_train,
-                        family=mv.family,
-                        link=mv.link,
-                        alpha=mv.alpha,
-                        l1_ratio=mv.l1_ratio,
-                        use_cv=False,
-                        drop_reference=self.drop_reference,
-                    )
-                    X_test = self.data.filter(pl.Series(test_mask))
-                    y_test = y_true[test_mask]
-                    w_test = w[test_mask] if w is not None else np.ones(int(test_mask.sum()))
-                    pred_test = fold_mv.predict(X_test)
-                    fold_metrics.append(metric_fn(y_test, pred_test, w_test))
-                    fold_weights.append(float(w_test.sum()))
+                    if metric_fn == 'gini':
+                        fold_metric, fold_weight = self._get_cv_metrics_gini(train_mask, test_mask, mv)
+                    else:
+                        fold_metric, fold_weight = self._get_cv_metrics_dls(train_mask, test_mask, dl_base_preds, dl_refit_base, dl_base_version, mv, dl_deviation)
+                    fold_metrics.append(fold_metric)
+                    fold_weights.append(float(fold_weight))
                 cv_metric = float(np.average(fold_metrics, weights=fold_weights))
             else:
                 cv_metric = train_metric
@@ -2165,7 +2276,7 @@ class ModelingTool:
 
     # ── Statistical ──────────────────────────────────────────────────────────
 
-    def vif_table(self, version: str) -> pl.DataFrame:
+    def vif_table(self, version: Optional[str] = None) -> pl.DataFrame:
         """
         Compute VIF for each feature in a fitted model's design matrix.
 
@@ -2176,7 +2287,7 @@ class ModelingTool:
         """
         from .metrics import vif_table as _vif_table
 
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         # Reconstruct design matrix
         preprocessor = mv.preprocessor
         Xt = preprocessor.transform(self.data)
@@ -2186,7 +2297,7 @@ class ModelingTool:
 
     def bootstrap_metrics(
         self,
-        version: str,
+        version: Optional[str] = None,
         metric_fns: Optional[Any] = None,
         n_bootstrap: int = 500,
         ci: float = 0.95,
@@ -2200,9 +2311,9 @@ class ModelingTool:
         from .metrics import bootstrap_metrics as _bootstrap_metrics
         from .plots import bootstrap_ci_plot
 
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         result = _bootstrap_metrics(
-            self._y.to_numpy().astype(float),
+            self._y_array,
             mv.train_predictions,
             weights=self._weights_array,
             metric_fns=metric_fns,
@@ -2210,13 +2321,13 @@ class ModelingTool:
             ci=ci,
         )
         if show:
-            fig = bootstrap_ci_plot(result, title=f"Bootstrap CIs — {version}")
+            fig = bootstrap_ci_plot(result, title=f"Bootstrap CIs — {version or self.current_version}")
             plt.show()
         return result
 
     def bootstrap_relativities(
         self,
-        version: str,
+        version: Optional[str] = None,
         n_bootstrap: int = 200,
         ci: float = 0.95,
         random_state: int = 42,
@@ -2240,14 +2351,14 @@ class ModelingTool:
             Columns: ``variable``, ``level``, ``relativity``,
             ``ci_lower``, ``ci_upper``, ``std_error``.
         """
-        mv = self._get_version(version)
+        mv = self._get_version(version or self.current_version)
         variables = mv.variables
         n = len(self.data)
         rng = np.random.RandomState(random_state)
         alpha = (1 - ci) / 2
 
         # Get baseline relativities
-        base_rel = self.relativities_table(version)
+        base_rel = self.summary_table(version or self.current_version)
         # Collect (variable, level) pairs and their bootstrap coefficient samples
         base_coefs = {
             (r["variable"], r["level"]): r["train_coef"]
@@ -2270,16 +2381,17 @@ class ModelingTool:
                     variables=variables,
                     version_name="_bootstrap",
                     configs=self.variable_configs,
-                    weights=boot_data[self.weight_col] if self.weight_col else None,
-                    family=self.family,
+                    weights=boot_data[self.weight_col].to_numpy().astype(float) if self.weight_col else None,
+                    offset=boot_data[self.offset_col].to_numpy().astype(float) if self.offset_col else None,
+                    family=mv.family,
                     link=self.link,
-                    tweedie_power=self.tweedie_power,
+                    tweedie_power=mv.tweedie_power,
                     alpha=boot_alpha,
                     l1_ratio=boot_l1_ratio,
                     use_cv=False,
                     drop_reference=self.drop_reference,
                 )
-                boot_coef_table = boot_mv.coefficient_table()
+                boot_coef_table = boot_mv.coefficients
                 coef_dict = {
                     r["feature"]: r["coefficient"]
                     for r in boot_coef_table.iter_rows(named=True)
@@ -2293,23 +2405,24 @@ class ModelingTool:
                     else:
                         boot_coefs[key].append(base_coefs[key])
             except Exception:
+                # If a bootstrap sample fails to fit, skip it
                 for key in keys:
-                    boot_coefs[key].append(float("nan"))
+                    boot_coefs[key].append(base_coefs[key])
 
         rows = []
         for key in keys:
             var, level = key
             coef = base_coefs[key]
-            samples = np.array(boot_coefs[key], dtype=float)
+            samples = np.array(boot_coefs[key])
             rel = np.exp(coef)
             boot_rels = np.exp(samples)
             rows.append({
                 "variable": var,
                 "level": level,
                 "relativity": float(rel),
-                "ci_lower": float(np.nanquantile(boot_rels, alpha)),
-                "ci_upper": float(np.nanquantile(boot_rels, 1 - alpha)),
-                "std_error": float(np.nanstd(boot_rels)),
+                "ci_lower": float(np.quantile(boot_rels, alpha)),
+                "ci_upper": float(np.quantile(boot_rels, 1 - alpha)),
+                "std_error": float(np.std(boot_rels)),
             })
 
         result = pl.DataFrame(rows)
