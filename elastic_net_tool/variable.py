@@ -55,11 +55,11 @@ class VariableConfig:
     Set ``col`` to the *output* name and ``input_cols`` to the list of source
     columns.  ``custom_transform`` is then called as::
 
-        custom_transform(df: pl.DataFrame, **transform_kwargs) -> array-like
+        custom_transform(arr_col1, arr_col2, ...) -> np.ndarray
 
-    where *df* contains only the ``input_cols`` columns.  The result is
-    treated as a new numeric (or categorical, if ``is_categorical=True``)
-    column named ``col``.
+    where each positional argument is the numpy array for the corresponding
+    entry in ``input_cols``.  The result is treated as a new numeric (or
+    categorical, if ``is_categorical=True``) column named ``col``.
 
     Parameters
     ----------
@@ -72,7 +72,7 @@ class VariableConfig:
     cap_lower : float, optional
         Lower cap
     cap_upper : float, optional
-        Upper cap 
+        Upper cap
     log_transform : bool
         Apply log1p after capping.
     impute_strategy : str, optional
@@ -100,22 +100,25 @@ class VariableConfig:
         Encoding for categorical variables.  ``'auto'`` detects from dtype.
     is_categorical : bool, optional
         Force categorical treatment.  ``None`` auto-detects from dtype.
+    right_closed: bool
+        When binning, whether bins include the right edge (``(lo, hi]``) or left
     custom_transform : callable, optional
-        May be a **named function** or a lambda.  Unified DataFrame-based
-        signature for both single- and multi-column variables::
+        May be a **named function** or a lambda.  Any callable is accepted.
 
-            f(df: pl.DataFrame, **transform_kwargs) -> array-like
+        **Numeric** single-col: ``f(arr: np.ndarray, **kw) -> np.ndarray``,
+        applied before capping / log / binning.
 
-        *df* contains only the relevant columns (``input_cols`` when set,
-        otherwise ``[col]``).  Applied once in ``_resolve_raw_series``,
-        before any cap / log / binning.  For categorical remapping, return
-        a list/array of strings — those become the category labels.
+        **Categorical** single-col: ``f(val: Any, **kw) -> Any``, applied
+        element-wise before encoding (can remap/group categories).
+
+        **Multi-col** (``input_cols`` set): ``f(*arrays, **kw) -> np.ndarray``,
+        called once with each input column's numpy array as positional args.
     transform_kwargs : dict, optional
         Keyword arguments forwarded to ``custom_transform`` on every call.
         Useful for passing parameters to a named function without a closure::
 
-            def scale(df, factor=1.0):
-                return df["mileage"] / factor
+            def scale(arr, factor=1.0):
+                return arr / factor
 
             VariableConfig('mileage', custom_transform=scale,
                            transform_kwargs={'factor': 1000})
@@ -126,7 +129,7 @@ class VariableConfig:
     cap_lower: Optional[float] = None
     cap_upper: Optional[float] = None
     log_transform: bool = False
-    impute_strategy: Optional[str] = "median"
+    impute_strategy: Optional[str] = None
     impute_value: Optional[Any] = None
     n_bins: Optional[int] = None
     bin_edges: Optional[List[float]] = None
@@ -134,6 +137,7 @@ class VariableConfig:
     degree: int = 1
     encoding: Optional[str] = "auto"
     is_categorical: Optional[bool] = None
+    right_closed: Optional[bool] = False
     custom_transform: Optional[Callable[..., Any]] = None
     transform_kwargs: Optional[Dict[str, Any]] = None
 
@@ -152,8 +156,6 @@ def default_config(col: str, s: pl.Series) -> VariableConfig:
         )
     return VariableConfig(
         col=col,
-        cap_upper=0.99,
-        impute_strategy="median",
         is_categorical=False,
     )
 
@@ -185,48 +187,120 @@ def compute_quantile_bin_edges(
     return edges
 
 
-def _fmt_edge(v: float) -> str:
-    """Format a bin edge: no decimal point for whole numbers, else ≤3 decimal places."""
-    if v == int(v):
-        return str(int(v))
-    return f"{v:.3f}".rstrip("0").rstrip(".")
+# def _fmt_edge(v: float) -> str:
+#     """Format a bin edge: no decimal point for whole numbers, else ≤3 decimal places."""
+#     if v == int(v):
+#         return str(int(v))
+#     return f"{v:.3f}".rstrip("0").rstrip(".")
 
 
-def _bin_letter(i: int) -> str:
-    """0→'A', 1→'B', …, 25→'Z', 26→'AA', 27→'AB', …"""
-    letters = string.ascii_uppercase
-    if i < 26:
-        return letters[i]
-    return letters[i // 26 - 1] + letters[i % 26]
+# def _bin_letter(i: int) -> str:
+#     """0→'A', 1→'B', …, 25→'Z', 26→'AA', 27→'AB', …"""
+#     letters = string.ascii_uppercase
+#     if i < 26:
+#         return letters[i]
+#     return letters[i // 26 - 1] + letters[i % 26]
 
 
-def make_bin_labels(breaks: np.ndarray) -> List[str]:
+# def make_bin_labels(breaks: np.ndarray, right: bool = False, min_val: Optional[float] = None, max_val: Optional[float] = None) -> List[str]:
+#     """
+#     Return human-readable label strings for the n+1 bins defined by *n* break points.
+
+#     Labels:
+#       bin 0 (all below first break): ``'{letter}_<hi'``
+#       bins 1 … n-1 (interior):       ``'{letter}_[lo, hi)'`` or ``'{letter}_(lo, hi]'`` if right-closed
+#       bin n (all above last break):   ``'{letter}_lo+'``
+#     """
+#     n = len(breaks)
+#     if n == 0:
+#         return ["A_all"]
+#     labels: List[str] = []
+#     for i in range(n + 1):
+#         letter = _bin_letter(i)
+#         if i == 0:
+#             hi = _fmt_edge(float(breaks[0]))
+#             if min_val is not None and abs(min_val - breaks[0]) <= 1e-5:
+#                 labels.append(f"{letter}_{hi}")
+#             else:
+#                 symb = '<' if not right else '≤'
+#                 labels.append(f"{letter}_{symb}{hi}")
+#         elif i == n:
+#             lo = _fmt_edge(float(breaks[-1]))
+#             if max_val is not None and abs(max_val - breaks[i - 1]) <= 1e-5:
+#                 labels.append(f"{letter}_{lo}")
+#             else:
+#                 labels.append(f"{letter}_{lo}+")
+#         else:
+#             lo = _fmt_edge(float(breaks[i - 1]))
+#             l_sym = "[" if not right else '('
+#             hi = _fmt_edge(float(breaks[i]))
+#             h_sym = ")" if not right else ']'
+#             labels.append(f"{letter}_{l_sym}{lo}, {hi}{h_sym}")
+#     return labels
+
+def _fmt(x, dec=3):
+    if x == int(x):
+        return str(int(x))
+    return format(round(x, dec), f",.{dec}f")
+    
+def make_bin_labels(breaks, min_val, max_val, right=False, dec=3):
     """
-    Return human-readable label strings for the n+1 bins defined by *n* break points.
+    Generate labeled interval strings from internal break points,
+    producing open-ended first and last buckets.
 
-    Labels:
-      bin 0 (all below first break): ``'{letter}_<hi'``
-      bins 1 … n-1 (interior):       ``'{letter}_[lo, hi)'``
-      bin n (all above last break):   ``'{letter}_lo+'``
+    Parameters
+    ----------
+    breaks : array-like of float
+        Internal break points only (sorted).
+    right : bool, default False
+        Whether intervals are right-closed.
+    decimals : int or None
+        Decimal places for formatting.
+
+    Returns
+    -------
+    list[str]
     """
+
+    breaks = np.asarray(breaks, dtype=float)
+
+    out = []
+    ascii_val = 65  # 'A'
     n = len(breaks)
-    if n == 0:
-        return ["A_all"]
-    labels: List[str] = []
-    for i in range(n + 1):
-        letter = _bin_letter(i)
-        if i == 0:
-            hi = _fmt_edge(float(breaks[0]))
-            labels.append(f"{letter}_<{hi}")
-        elif i == n:
-            lo = _fmt_edge(float(breaks[-1]))
-            labels.append(f"{letter}_{lo}+")
-        else:
-            lo = _fmt_edge(float(breaks[i - 1]))
-            hi = _fmt_edge(float(breaks[i]))
-            labels.append(f"{letter}_[{lo}, {hi})")
-    return labels
 
+    # ---- FIRST bucket ----
+    label = chr(ascii_val)
+    out.append(f"{label}_[{_fmt(min_val, dec)}, {_fmt(breaks[0], dec)}{']' if right else ')'}")
+    ascii_val += 1
+
+    # ---- MIDDLE buckets (only if n > 1) ----
+    for i in range(1, n):
+        label = chr(ascii_val)
+
+        left_bracket = "(" if right else "["
+        right_bracket = "]" if right else ")"
+
+        # duplicate break adjustment
+        if i > 1 and breaks[i - 2] == breaks[i - 1]:
+            left_bracket = "("
+        if (i + 1) < n and breaks[i + 1] == breaks[i]:
+            right_bracket = ")"
+
+        if breaks[i - 1] == breaks[i]:
+            out.append(f"{label}_{_fmt(breaks[i], dec)}")
+        else:
+            out.append(
+                f"{label}_"
+                f"{left_bracket}{_fmt(breaks[i - 1], dec)}, {_fmt(breaks[i], dec)}"
+                f"{right_bracket}"
+            )
+        ascii_val += 1
+
+    # ---- LAST bucket ----
+    label = chr(ascii_val)
+    out.append(f"{label}_({_fmt(breaks[-1], dec)}, {_fmt(max_val, dec)}]")
+
+    return out
 
 # ── Preprocessor ─────────────────────────────────────────────────────────────
 
@@ -251,15 +325,15 @@ class Preprocessor:
     def fit(
         self,
         X: pl.DataFrame,
-        y=None,
-        weights: Optional[pl.Series] = None,
+        y: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
     ) -> "Preprocessor":
         """
         Learn transformation parameters from the training DataFrame.
 
         Parameters
         ----------
-        weights : pl.Series, optional
+        weights : np.ndarray, optional
             Exposure weights used to select the reference (dropped) level when
             one-hot encoding categorical variables.  The level with the highest
             total weight is dropped.  When ``None``, the first level
@@ -283,7 +357,7 @@ class Preprocessor:
             self._transform_col(raw, cfg, self._params[col], out)
         return pl.DataFrame(out)
 
-    def fit_transform(self, X: pl.DataFrame, y=None) -> pl.DataFrame:
+    def fit_transform(self, X: pl.DataFrame, y: Optional[np.ndarray] = None) -> pl.DataFrame:
         return self.fit(X, y).transform(X)
 
     def get_feature_names(self) -> List[str]:
@@ -320,13 +394,13 @@ class Preprocessor:
         self,
         s: pl.Series,
         cfg: VariableConfig,
-        weights: Optional[pl.Series] = None,
+        weights: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         p: Dict[str, Any] = {}
-        is_cat = self._detect_categorical(s, cfg)
-        p["is_categorical"] = is_cat
+        p["is_categorical"] = _is_str_or_cat(s.dtype) if cfg.is_categorical is None else cfg.is_categorical
+        p['right_closed'] = cfg.right_closed
 
-        if is_cat:
+        if p["is_categorical"]:
             p["impute_val"] = self._fit_cat_impute(s, cfg)
 
             enc = "onehot" if cfg.encoding in ("auto", "onehot") else None
@@ -346,27 +420,19 @@ class Preprocessor:
             p["impute_val"] = self._fit_num_impute(arr, cfg)
 
             imputed = arr.copy()
-            nan_mask = ~np.isfinite(imputed) | _is_sentinel(imputed)
             if p["impute_val"] is not None:
+                nan_mask = ~np.isfinite(imputed) | _is_sentinel(imputed)
                 imputed[nan_mask] = p["impute_val"]
 
-            # Cap bounds — values in (0, 1) are treated as quantile fractions;
-            # values outside that range are used as absolute thresholds.
-            valid_for_cap = imputed[np.isfinite(imputed) & ~_is_sentinel(imputed)]
+            # Cap bounds (on imputed values, ignoring sentinel)
             if cfg.cap_lower is not None:
-                if 0.0 < cfg.cap_lower < 1.0:
-                    p["cap_lower_val"] = float(np.percentile(valid_for_cap, cfg.cap_lower * 100)) if len(valid_for_cap) else 0.0
-                else:
-                    p["cap_lower_val"] = float(cfg.cap_lower)
+                p["cap_lower_val"] = float(cfg.cap_lower)
             if cfg.cap_upper is not None:
-                if 0.0 < cfg.cap_upper < 1.0:
-                    p["cap_upper_val"] = float(np.percentile(valid_for_cap, cfg.cap_upper * 100)) if len(valid_for_cap) else 0.0
-                else:
-                    p["cap_upper_val"] = float(cfg.cap_upper)
+                p["cap_upper_val"] = float(cfg.cap_upper)
 
             transformed = self._apply_num_transforms(imputed, cfg, p)
 
-            w_arr = weights.to_numpy() if weights is not None else None
+            w_arr = weights if weights is not None else None
             breaks: Optional[np.ndarray] = None
             if cfg.bin_edges is not None:
                 breaks = np.asarray(cfg.bin_edges, dtype=float)
@@ -375,11 +441,12 @@ class Preprocessor:
                 breaks = full_edges[1:-1]
 
             if breaks is not None:
-                all_labels = make_bin_labels(breaks)
+                min_val, max_val = transformed.min(), transformed.max()
+                all_labels = make_bin_labels(breaks, min_val, max_val, p['right_closed'])
                 is_sent_tr = _is_sentinel(transformed)
                 ts = pl.Series("_v", transformed).set(pl.Series(is_sent_tr), None)
                 binned_labels = ts.cut(
-                    list(breaks), labels=all_labels, left_closed=True
+                    list(breaks), labels=all_labels, left_closed=not p['right_closed']
                 ).cast(pl.Utf8)
                 eff_w = w_arr if w_arr is not None else np.ones(len(transformed))
                 bin_weights = np.array([
@@ -402,6 +469,9 @@ class Preprocessor:
     def _detect_categorical(s: pl.Series, cfg: VariableConfig) -> bool:
         if cfg.is_categorical is not None:
             return cfg.is_categorical
+        # Multi-input result: rely on is_categorical flag
+        if cfg.input_cols is not None:
+            return False
         return _is_str_or_cat(s.dtype)
 
     @staticmethod
@@ -412,10 +482,12 @@ class Preprocessor:
     @staticmethod
     def _fit_num_impute(arr: np.ndarray, cfg: VariableConfig) -> Optional[float]:
         # Exclude sentinel when computing impute value
-        valid = arr[np.isfinite(arr) & ~_is_sentinel(arr)]
         strat = cfg.impute_strategy
-        if strat is None:
-            return None
+        if strat is None and cfg.impute_value is None:
+                return None
+        strat = strat or "constant"
+        
+        valid = arr[np.isfinite(arr) & ~_is_sentinel(arr)]
         if strat == "median":
             return float(np.median(valid)) if len(valid) else 0.0
         if strat == "mean":
@@ -450,15 +522,12 @@ class Preprocessor:
         if weights is None or len(cats) == 0:
             return cats[0] if len(cats) > 0 else ""
         s_str = s.cast(pl.Utf8).fill_null(_CAT_MISSING).to_list()
-        cat_set = set(cats.to_list())
 
         temp = pl.DataFrame({'vals': s_str, 'weights': weights})
-        temp_agg = (
-            temp.group_by(pl.col('vals')).sum()
-            .filter(pl.col('vals').is_in(list(cat_set)))
-            .sort('weights', descending=True)
-        )
-        return temp_agg['vals'][0] if len(temp_agg) > 0 else (cats[0] if len(cats) > 0 else "")
+        temp_agg = temp.group_by(pl.col('vals')).sum()
+        temp_agg = temp_agg.sort('weights', descending=True)
+
+        return temp_agg['vals'][0]
 
     @staticmethod
     def _apply_num_transforms(
@@ -472,9 +541,8 @@ class Preprocessor:
         if "cap_upper_val" in p:
             out = np.where(is_sent, out, np.minimum(out, p["cap_upper_val"]))
         if cfg.log_transform:
-            # apply log1p only to non-sentinel entries; np.where would still
-            # evaluate log1p on the sentinel and emit a RuntimeWarning
-            out[~is_sent] = np.log1p(out[~is_sent])
+            assert np.min(out) > 0, "Cannot log values when any are 0 or negative"
+            out = np.where(is_sent, out, np.log(out))
         return out
 
     # ── Transformation ───────────────────────────────────────────────────
@@ -529,16 +597,14 @@ class Preprocessor:
     ) -> None:
         arr = self._to_float_array(s)
 
-        # Identify sentinel values BEFORE imputation (sentinel == original null)
+        # Identify sentinel values BEFORE imputation
         is_sent = _is_sentinel(arr)
 
+        # Impute nulls/NaN (but NOT sentinel)
         iv = p.get("impute_val")
-        nan_mask = ~np.isfinite(arr) & ~is_sent
         if iv is not None:
-            arr = arr.copy()
+            nan_mask = ~np.isfinite(arr) & ~is_sent
             arr[nan_mask] = iv
-            arr[is_sent] = iv        # original nulls imputed like NaNs
-            is_sent = np.zeros(len(arr), dtype=bool)  # no sentinels remain
 
         # Apply cap/log transforms (skips sentinel positions)
         arr_t = self._apply_num_transforms(arr, cfg, p)
@@ -546,15 +612,16 @@ class Preprocessor:
         if "bin_edges" in p:
             breaks = np.asarray(p["bin_edges"])
             dropped_bin = p.get("dropped_bin", 0)
-            all_labels = p.get("bin_labels") or make_bin_labels(breaks)
+            all_labels = p.get("bin_labels")
             is_sent_b = _is_sentinel(arr_t)
             s_cut = pl.Series(cfg.col, arr_t).set(pl.Series(is_sent_b), None)
             labeled = s_cut.cut(
-                list(breaks), labels=all_labels, left_closed=True
+                list(breaks), labels=all_labels, left_closed=not p['right_closed']
             ).cast(pl.Utf8)
 
             # Missing dummy (always present when binning to ensure consistent schema)
-            out[f"{cfg.col}_missing"] = is_sent_b.astype(float)
+            if p["has_sentinel_bin"]:
+                out[f"{cfg.col}_missing"] = is_sent_b.astype(float)
 
             dummies = labeled.to_dummies()
             for i, label in enumerate(all_labels):
@@ -585,8 +652,9 @@ class Preprocessor:
                     names.append(col)
             elif "bin_edges" in p:
                 dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels") or make_bin_labels(np.array(p["bin_edges"]))
-                names.append(f"{col}_missing")
+                all_labels = p.get("bin_labels")
+                if p.get("has_sentinel_bin"):
+                    names.append(f"{col}_missing")
                 for i, label in enumerate(all_labels):
                     if i != dropped_bin:
                         names.append(f"{col}_{label}")
@@ -606,36 +674,36 @@ class Preprocessor:
         is_sent = _is_sentinel(arr)
         arr_t = self._apply_num_transforms(arr, cfg, p)
         breaks = np.asarray(p["bin_edges"])
-        all_labels = p.get("bin_labels") or make_bin_labels(breaks)
+        all_labels = p.get("bin_labels")
         s_cut = pl.Series(col, arr_t).set(pl.Series(is_sent), None)
         labeled = s_cut.cut(
-            list(breaks), labels=all_labels, left_closed=True
+            list(breaks), labels=all_labels, left_closed=not p['right_closed']
         ).cast(pl.Utf8).fill_null("Missing")
         return labeled.rename(col + "_label")
 
     def get_level_labels(self, col: str, X: pl.DataFrame) -> pl.Series:
-        """
-        Return display label strings for *col* using fitted preprocessing params.
+            """
+            Return display label strings for *col* using fitted preprocessing params.
 
-        Handles binned numeric, categorical (with optional custom remap), and
-        multi-input derived variables.  Call this from plotting code instead of
-        ``get_bin_labels`` when the variable type is not known in advance.
+            Handles binned numeric, categorical (with optional custom remap), and
+            multi-input derived variables.  Call this from plotting code instead of
+            ``get_bin_labels`` when the variable type is not known in advance.
 
-        Returns a pl.Series of strings aligned with *X*.
-        """
-        cfg = self.configs.get(col)
-        if cfg is None:
-            raise ValueError(f"'{col}' is not in preprocessor configs.")
-        p = self._params.get(col, {})
-        raw = self._resolve_raw_series(X, cfg)   # handles multi-input
+            Returns a pl.Series of strings aligned with *X*.
+            """
+            cfg = self.configs.get(col)
+            if cfg is None:
+                raise ValueError(f"'{col}' is not in preprocessor configs.")
+            p = self._params.get(col, {})
+            raw = self._resolve_raw_series(X, cfg)   # handles multi-input
 
-        if "bin_edges" in p:
-            return self.get_bin_labels(col, raw)
+            if "bin_edges" in p:
+                return self.get_bin_labels(col, raw)
 
-        if p.get("is_categorical"):
-            vals = self._normalize_cat_vals(raw, p.get("impute_val"))
-            vals = ["Missing" if v == _CAT_MISSING else v for v in vals]
-            return pl.Series(col + "_label", vals)
+            if p.get("is_categorical"):
+                vals = self._normalize_cat_vals(raw, p.get("impute_val"))
+                vals = ["Missing" if v == _CAT_MISSING else v for v in vals]
+                return pl.Series(col + "_label", vals)
 
-        # Continuous non-binned — return raw values as strings
-        return raw.cast(pl.Utf8).fill_null("Missing").rename(col + "_label")
+            # Continuous non-binned — return raw values as strings
+            return raw.cast(pl.Utf8).fill_null("Missing").rename(col + "_label")
