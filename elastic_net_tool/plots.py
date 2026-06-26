@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 import seaborn as sns
 
-from .metrics import double_lift_table, gini_coefficient, lift_table
+from .metrics import double_lift_table, gini_coefficient, lift_table, _weighted_relativity
 from .variable import MISSING_SENTINEL, Preprocessor, _is_str_or_cat, compute_quantile_bin_edges, make_bin_labels
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ sns.set_theme(style="whitegrid", palette="muted", font_scale=0.95)
 
 # ── Binning helper for plots ──────────────────────────────────────────────────
 
-def _bin_for_plot(s: pl.Series, n_bins: int = 10) -> pl.Series:
+def _bin_for_plot(s: pl.Series, n_bins: Optional[int] = 10, breaks: Optional[List[float]] = None) -> pl.Series:
     """
     Bin a continuous pl.Series into quantile-based string labels.
 
@@ -33,15 +33,17 @@ def _bin_for_plot(s: pl.Series, n_bins: int = 10) -> pl.Series:
     that unregistered variables are displayed consistently.
     """
     arr = s.cast(pl.Float64, strict=False).fill_null(float("nan")).to_numpy(allow_copy=True)
-    is_missing = np.isnan(arr) | np.isclose(arr, MISSING_SENTINEL, rtol=0, atol=1.0)
-    valid = arr[~is_missing]
 
-    if len(valid) == 0:
-        return pl.Series(["Missing"] * len(arr))
+    if breaks is None:
+        is_missing = np.isnan(arr) | np.isclose(arr, MISSING_SENTINEL, rtol=0, atol=1.0)
+        valid = arr[~is_missing]
 
-    full_edges = compute_quantile_bin_edges(valid, n_bins)
-    breaks = full_edges[1:-1]
-    all_labels = make_bin_labels(breaks)
+        if len(valid) == 0:
+            return pl.Series(["Missing"] * len(arr))
+
+        full_edges = compute_quantile_bin_edges(valid, n_bins)
+        breaks = full_edges[1:-1]
+    all_labels = make_bin_labels(breaks, arr.min(), arr.max())
     s_float = pl.Series(s.name, arr).set(pl.Series(is_missing), None)
     labeled = s_float.cut(
         list(breaks), labels=all_labels, left_closed=True
@@ -53,7 +55,8 @@ def _resolve_level(
     col: str,
     X: pl.DataFrame,
     preprocessor: Optional[Preprocessor],
-    n_bins: int,
+    n_bins: Optional[int] = 10,
+    breaks: Optional[List[float]] = None,
 ) -> pl.Series:
     """
     Determine the level series for *col* in *X*.
@@ -66,38 +69,28 @@ def _resolve_level(
     Otherwise falls back to direct cast for categorical / low-cardinality
     columns and ``_bin_for_plot`` for continuous variables.
     """
-    if preprocessor is not None and col in preprocessor.configs:
+    if preprocessor is not None and col in preprocessor.configs and breaks is None:
         p = preprocessor._params.get(col, {})
         if "bin_edges" in p or p.get("is_categorical"):
             return preprocessor.get_level_labels(col, X)
-        # Continuous non-binned (including polynomial) — bin on the fly
-    s = X[col]
-    if _is_str_or_cat(s.dtype) or s.n_unique() <= 20:
+        elif preprocessor.configs[col].custom_transform:
+            s = preprocessor.transform(X)[col]
+        else:
+            s = X[col]
+    else:
+        s = X[col]
+        
+    # Continuous non-binned (including polynomial) — bin on the fly
+    if _is_str_or_cat(s.dtype) or s.n_unique() <= 10:
         return s.cast(pl.Utf8).fill_null("Missing")
-    return _bin_for_plot(s, n_bins)
+    
+    return _bin_for_plot(s, n_bins, breaks=breaks)
 
 
 def _sort_labels(labels: list) -> list:
-    """
-    Sort bin/category labels numerically by their lower bound.
-
-    Handles the ``{LETTER(S)}_{range}`` format produced by ``make_bin_labels``
-    (including multi-letter prefixes like ``AA_``) and puts ``'Missing'`` last.
-    Falls back to lexicographic sort if no numeric value can be extracted.
-    """
-    import re as _re
-
-    def _key(x: str) -> float:
-        if x in ("Missing", "__MISSING__"):
-            return float("inf")
-        # Strip leading letter prefix produced by _bin_letter (A_, AA_, etc.)
-        body = _re.sub(r"^[A-Z]+_", "", x)
-        # Extract first numeric value from the lower bound
-        m = _re.search(r"-?[\d.]+", body.split(",")[0])
-        return float(m.group()) if m else float("inf")
-
+    """Try numeric sort, fall back to lexicographic."""
     try:
-        return sorted(labels, key=_key)
+        return sorted(labels, key=lambda x: float(x.split(",")[0].lstrip("[(")))
     except Exception:
         return sorted(labels)
 
@@ -152,11 +145,11 @@ def _weighted_agg(
     Compute weighted mean of *y* (and optionally other series) by *level*.
 
     Returns a sorted DataFrame with columns:
-    ``_level``, ``mean_y``, ``exposure``, plus one ``mean_<k>`` per extra.
+    ``_level``, ``prod_y``, ``exposure``, plus one ``prod_<k>`` per extra.
     """
     df = pl.DataFrame({"_level": level, "_y": y, "_w": weight})
     agg_exprs = [
-        ((pl.col("_y") * pl.col("_w")).sum() / pl.col("_w").sum()).alias("mean_y"),
+        ((pl.col("_y") * pl.col("_w")).sum()).alias("prod_y"),
         pl.col("_w").sum().alias("exposure"),
     ]
 
@@ -164,8 +157,7 @@ def _weighted_agg(
         for k, s in extra_series.items():
             df = df.with_columns(s.alias(f"_extra_{k}"))
             agg_exprs.append(
-                ((pl.col(f"_extra_{k}") * pl.col("_w")).sum() / pl.col("_w").sum()
-                 ).alias(f"mean_{k}")
+                ((pl.col(f"_extra_{k}") * pl.col("_w")).sum()).alias(f"prod_{k}")
             )
 
     summary = df.group_by("_level").agg(agg_exprs)
@@ -174,6 +166,7 @@ def _weighted_agg(
     labels = _sort_labels(summary["_level"].to_list())
     label_order = pl.DataFrame({"_level": labels, "_order": list(range(len(labels)))})
     summary = summary.join(label_order, on="_level").sort("_order").drop("_order")
+
     return summary
 
 
@@ -184,7 +177,8 @@ def univariate_plot(
     y: pl.Series,
     col: str,
     weights: Optional[pl.Series] = None,
-    n_bins: int = 10,
+    n_bins: Optional[int] = 10,
+    breaks: Optional[List[float]] = None,
     figsize: Optional[Tuple[int, int]] = None,
     title: Optional[str] = None,
     preprocessor: Optional[Preprocessor] = None,
@@ -201,15 +195,15 @@ def univariate_plot(
     ``relativities_table``) instead of re-binning the raw column.
     """
     w = weights if weights is not None else pl.Series("w", np.ones(len(X)))
-    level = _resolve_level(col, X, preprocessor, n_bins)
+    level = _resolve_level(col, X, preprocessor, n_bins, breaks)
 
     summary = _weighted_agg(level, y, w)
 
     # Convert to relativities: each level mean / overall weighted mean.
-    overall_mean = float((y.cast(pl.Float64) * w).sum() / w.sum())
-    rel_vals = summary["mean_y"].to_numpy() / overall_mean
+    rel_vals, _ = _weighted_relativity(summary['prod_y'], summary['exposure'])
 
     fig, ax = plt.subplots(figsize=figsize or _DEFAULT_FIG)
+    sns.set_palette("Set1")
     ax.set_title(title or f"Univariate: {col}", fontsize=12, fontweight="bold")
     _bar_with_line(
         ax,
@@ -217,8 +211,8 @@ def univariate_plot(
         bar_vals=summary["exposure"].to_numpy(),
         line_vals=rel_vals,
         bar_label="Exposure",
-        line_label="Relativity to Mean",
-        ref_line=1.0,
+        line_label="Relativity",
+        ref_line=1.0
     )
     fig.tight_layout()
     return fig
@@ -233,6 +227,7 @@ def ae_chart(
     predictions: np.ndarray,
     weights: Optional[pl.Series] = None,
     n_bins: int = 10,
+    breaks: Optional[List[float]] = None,
     figsize: Optional[Tuple[int, int]] = None,
     title: Optional[str] = None,
     version_name: str = "Model",
@@ -250,17 +245,13 @@ def ae_chart(
     Pass *preprocessor* to use fitted bin edges/labels instead of re-binning.
     """
     w = weights if weights is not None else pl.Series("w", np.ones(len(X)))
-    w_np = w.to_numpy().astype(float)
     pred_s = pl.Series("_pred", predictions)
-    level = _resolve_level(col, X, preprocessor, n_bins)
+    level = _resolve_level(col, X, preprocessor, n_bins, breaks)
 
     summary = _weighted_agg(level, y, w, extra_series={"pred": pred_s})
 
     # Convert both series to relativities vs their respective portfolio means.
-    overall_actual = float((y.cast(pl.Float64) * w).sum() / w.sum())
-    overall_pred = float((predictions * w_np).sum() / w_np.sum())
-    actual_rel = summary["mean_y"].to_numpy() / overall_actual
-    pred_rel = summary["mean_pred"].to_numpy() / overall_pred
+    actual_rel, pred_rel = _weighted_relativity(summary["prod_y"], summary["exposure"], summary["prod_pred"])
 
     x_labels = summary["_level"].to_list()
     x = np.arange(len(x_labels))
@@ -268,6 +259,7 @@ def ae_chart(
     fig, ax = plt.subplots(figsize=figsize or _DEFAULT_FIG)
     ax.set_title(title or f"Actual vs Expected: {col}", fontsize=12, fontweight="bold")
 
+    sns.set_palette("Set1")
     sns.barplot(x=x_labels, y=summary["exposure"].to_numpy(), ax=ax,
                 color="#9ecae1", alpha=0.7, label="Exposure", zorder=2, errorbar=None)
     ax.set_ylabel("Exposure", fontsize=9)
@@ -275,13 +267,13 @@ def ae_chart(
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
 
     ax2 = ax.twinx()
-    ax2.plot(x, actual_rel, color="#e6550d", marker="o",
-             linewidth=2, markersize=6, label="Actual", zorder=3)
-    ax2.plot(x, pred_rel, color="#31a354", marker="s",
-             linewidth=2, markersize=6, linestyle="--",
+    ax2.plot(x, actual_rel, marker="o",
+             linewidth=2.5, markersize=7, label="Actual", zorder=3)
+    ax2.plot(x, pred_rel, marker="s",
+             linewidth=2.5, markersize=7,
              label=f"Expected ({version_name})", zorder=3)
-    ax2.axhline(1.0, color="black", linewidth=1.0, linestyle="--", alpha=0.55, zorder=2)
-    ax2.set_ylabel("Relativity to Mean", fontsize=9)
+    ax2.axhline(1.0, color="black", linewidth=2, linestyle="--", alpha=0.55, zorder=2)
+    ax2.set_ylabel("Relativity", fontsize=9)
 
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
@@ -299,16 +291,17 @@ def residual_chart(
     predictions: np.ndarray,
     weights: Optional[pl.Series] = None,
     n_bins: int = 10,
+    breaks: Optional[List[float]] = None,
     figsize: Optional[Tuple[int, int]] = None,
     title: Optional[str] = None,
     version_name: str = "Model",
     preprocessor: Optional[Preprocessor] = None,
 ) -> plt.Figure:
     """
-    Residual signal chart: ``mean_actual / mean_predicted`` per variable level.
+    Residual signal chart: ``mean_actual_rel / mean_predicted`` per variable level.
 
     For each level (or quantile bin) of ``col`` the chart shows the ratio of
-    the weighted-mean actual loss ratio to the weighted-mean model prediction.
+    the weighted-mean actual loss ratio relativity to the weighted-mean model prediction.
     A value above 1.0 means the model is under-predicting for that group;
     below 1.0 means over-predicting.  Exposure is shown as bars on a
     secondary y-axis.
@@ -333,19 +326,26 @@ def residual_chart(
     """
     w = weights if weights is not None else pl.Series("w", np.ones(len(X)))
     pred_s = pl.Series("_pred", predictions)
-    level = _resolve_level(col, X, preprocessor, n_bins)
+    level = _resolve_level(col, X, preprocessor, n_bins, breaks=breaks)
 
     summary = _weighted_agg(level, y, w, extra_series={"pred": pred_s})
 
     # Residual = mean_actual / mean_predicted; guard against zero predicted.
     # This ratio is already a relativity-style metric — bases cancel, no
     # further normalisation needed.
-    mean_y = summary["mean_y"].to_numpy()
-    mean_pred = summary["mean_pred"].to_numpy()
-    residual = np.where(np.abs(mean_pred) > 1e-12, mean_y / mean_pred, np.nan)
     exposure = summary["exposure"].to_numpy()
     x_labels = summary["_level"].to_list()
     x = np.arange(len(x_labels))
+
+    # Convert both series to relativities vs their respective portfolio means.
+    # overall_actual = np.average(summary["mean_y"].to_numpy(), weights=exposure)
+    # overall_pred = np.average(summary["mean_pred"].to_numpy(), weights=exposure)
+    # actual_rel = summary["mean_y"].to_numpy() / overall_actual
+    # pred_rel = summary["mean_pred"].to_numpy() / overall_pred
+
+    actual_rel, pred_rel = _weighted_relativity(summary["prod_y"], summary["exposure"], summary["prod_pred"])
+
+    residual = np.where(np.abs(pred_rel) > 1e-12, actual_rel / pred_rel, np.nan)
 
     fig, ax_bar = plt.subplots(figsize=figsize or _DEFAULT_FIG)
     ax_bar.set_title(
@@ -354,6 +354,7 @@ def residual_chart(
     )
 
     # Exposure bars (primary axis)
+    sns.set_palette("Set1")
     sns.barplot(x=x_labels, y=exposure, ax=ax_bar,
                 color="#9ecae1", alpha=0.7, label="Exposure", zorder=2, errorbar=None)
     ax_bar.set_ylabel("Exposure", fontsize=9)
@@ -362,12 +363,12 @@ def residual_chart(
 
     # Residual ratio line (secondary axis)
     ax2 = ax_bar.twinx()
-    ax2.plot(x, residual, color="#e6550d", marker="o", linewidth=2,
-             markersize=6, label="Actual / Predicted", zorder=3)
-    ax2.axhline(1.0, color="black", linewidth=1.0, linestyle="--",
+    ax2.plot(x, residual, marker="o", linewidth=2.5,
+             markersize=7, label="Relativity", zorder=3)
+    ax2.axhline(1.0, color="black", linewidth=2.5, linestyle="--",
                 alpha=0.55, label="1.0 reference", zorder=2)
-    ax2.set_ylabel("Actual / Predicted", fontsize=9, color="#e6550d")
-    ax2.tick_params(axis="y", labelcolor="#e6550d")
+    ax2.set_ylabel("Relativity", fontsize=9)
+    ax2.tick_params(axis="y")
 
     h1, l1 = ax_bar.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
@@ -387,7 +388,7 @@ def double_lift_chart(
     n_buckets: int = 10,
     name1: str = "Model 1",
     name2: str = "Model 2",
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: Optional[Tuple[int, int]] = None
 ) -> plt.Figure:
     """
     Double lift chart comparing two models using equal-weight buckets.
@@ -400,26 +401,28 @@ def double_lift_chart(
 
     fig, axes = plt.subplots(1, 2, figsize=figsize or (14, 5))
 
+    sns.set_palette("Set1")
+
     ax = axes[0]
-    ax.plot(x, tbl["actual"].to_numpy(), color="#e6550d", marker="o",
-            linewidth=2, markersize=6, label="Actual")
-    ax.plot(x, tbl["model1"].to_numpy(), color="#3182bd", marker="s",
-            linewidth=2, markersize=5, linestyle="--", label=name1)
-    ax.plot(x, tbl["model2"].to_numpy(), color="#31a354", marker="^",
-            linewidth=2, markersize=5, linestyle=":", label=name2)
+    ax.plot(x, tbl["actual"].to_numpy(), marker="o",
+            linewidth=2.5, markersize=7, label="Actual")
+    ax.plot(x, tbl["model1"].to_numpy(), marker="o",
+            linewidth=2.5, markersize=7, label=name1)
+    ax.plot(x, tbl["model2"].to_numpy(), marker="o",
+            linewidth=2.5, markersize=7, label=name2)
     ax.set_title("Actual vs Both Models", fontsize=11, fontweight="bold")
     ax.set_xlabel(f"Bucket (sorted by {name1}/{name2} ratio, equal weight)")
-    ax.set_ylabel("Weighted Mean Loss Ratio")
+    ax.set_ylabel("Relativity")
     ax.legend(fontsize=9)
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=8)
     ax.grid(axis="y", alpha=0.3)
 
     ax2 = axes[1]
-    ax2.bar(x, tbl["exposure"].to_numpy(), color="#9ecae1", alpha=0.8)
-    ax2.set_title("Bucket Exposure", fontsize=11, fontweight="bold")
+    ax2.bar(x, tbl["weight"].to_numpy(), color="#9ecae1", alpha=0.8)
+    ax2.set_title("Bucket Weight", fontsize=11, fontweight="bold")
     ax2.set_xlabel(f"Bucket (sorted by {name1}/{name2} ratio)")
-    ax2.set_ylabel("Exposure")
+    ax2.set_ylabel("Weight")
     ax2.set_xticks(x)
     ax2.set_xticklabels(xlabels, fontsize=8)
     ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
@@ -429,6 +432,28 @@ def double_lift_chart(
                  fontweight="bold", y=1.01)
     fig.tight_layout()
     return fig
+
+
+def decile_lift_chart(y_true: np.ndarray,
+    pred: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    n_buckets: int = 10,
+    title: str = "Model",
+    ) -> plt.Figure:
+
+    tbl = lift_table(y_true, pred, weights=weights, n_buckets=n_buckets)
+    plot_data = tbl.select(['bucket', 'actual', 'predicted']).unpivot(index='bucket').to_pandas()
+
+    lc = sns.lineplot(plot_data, x = "bucket", y="value", style="variable", hue="variable", palette="Set1", linewidth=2.5,
+                    markers=["o","o"], dashes=False, markersize=7)
+
+    lc.set_title(f'Lift Chart {title}', fontdict={'fontsize': 15})
+    lc.set_xlabel("Decile", fontdict={'fontsize': 12})
+    lc.set_ylabel("Relativity", fontdict={'fontsize': 12})
+    lc.get_legend().set_title(None)
+    lc.set_xticks(tbl["bucket"].to_list())
+
+    return lc.get_figure()
 
 
 # ── Lorenz / Gini chart ───────────────────────────────────────────────────────
@@ -547,10 +572,8 @@ def cv_stability_plot(
     data = [fold_rows[f].cast(pl.Float64).drop_nulls().to_numpy() for f in top_features]
 
     fig, ax = plt.subplots(figsize=figsize or (max(8, len(top_features) * 0.6), 5))
-    # tick labels are applied via set_xticklabels below (boxplot's labels=
-    # kwarg was removed in matplotlib 3.11)
     ax.boxplot(
-        data, patch_artist=True,
+        data, labels=top_features, patch_artist=True,
         boxprops=dict(facecolor="#9ecae1", alpha=0.8),
         medianprops=dict(color="#e6550d", linewidth=2),
         whiskerprops=dict(linewidth=1.5),
@@ -1030,8 +1053,7 @@ def relativities_ci_plot(
     ax.set_xticks(x)
     ax.set_xticklabels(levels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Relativity (exp(coefficient))", fontsize=10)
-    ax.set_title(f"Bootstrap Relativity CIs — {variable}",
-                 fontsize=11, fontweight="bold")
+    ax.set_title(f"Bootstrap Relativity CIs — {variable}", fontsize=11, fontweight="bold")
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
