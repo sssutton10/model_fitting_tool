@@ -6,40 +6,51 @@ Shadow GBM-based feature discovery for GLM variable selection.
 Uses LightGBM as a *diagnostic lens* — never as the final model. Provides:
 
 * Interaction ranking via Friedman's H-statistic
-* Tree co-occurrence interaction ranking (fast, covers categoricals)
-* SHAP importance, dependence, and interaction ranking
 * Permutation importance (model-agnostic)
 * Residual-based GBM to find signal the GLM is missing
 * 2D partial dependence for interaction visualisation
-* Categorical level grouping suggestions
-* Monotonicity cost test
-* Boruta-style feature selection
 """
 
 from __future__ import annotations
 
-import re as _re
 from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import polars as pl
+import lightgbm as lgb
 
-from .variable import MISSING_SENTINEL, _NUMERIC_DTYPES, _is_str_or_cat
+from .variable import _NUMERIC_DTYPES, _is_str_or_cat, MISSING_SENTINEL
+from .model import _build_preprocessor
+from .plots import _resolve_level
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _predict(model: Any, X: np.ndarray) -> np.ndarray:
+# Modified LGBMRegressor that can be used with polars dataframes, to be consistent with the rest of the codebase
+class LGBRegressorPolars(lgb.LGBMRegressor):
+
+    @property
+    def feature_names_in_(self):
+        return self._feature_name
+
+    @feature_names_in_.setter
+    def feature_names_in_(self, x):
+        self._feature_name = x
+
+def _predict(model: Any, X: pl.DataFrame) -> np.ndarray:
     """
     Call model.predict(X), suppressing the sklearn 'X does not have valid
     feature names' warning that fires when a model was fitted with named
     features but predict receives a plain numpy array.
+
+    Passes ``validate_features=False`` for sklearn-compatible models that
+    accept that keyword; falls back to a plain call for others.
     """
     try:
-        return model.predict(X, validate_features=False)
+        return model.predict(X.to_arrow(), validate_features=False)
     except TypeError:
-        return model.predict(X)
+        return model.predict(X.to_arrow())
 
 
 def _to_numpy(s: Union[pl.Series, np.ndarray]) -> np.ndarray:
@@ -49,10 +60,10 @@ def _to_numpy(s: Union[pl.Series, np.ndarray]) -> np.ndarray:
 
 
 def _subsample_rows(
-    X: np.ndarray,
+    X: pl.DataFrame,
     sample_size: int,
     rng: np.random.RandomState,
-) -> np.ndarray:
+) -> pl.DataFrame:
     """Return a row-subsample of *X* (no copy when already small enough)."""
     if len(X) > sample_size:
         return X[rng.choice(len(X), sample_size, replace=False)]
@@ -64,90 +75,70 @@ def _subsample_rows(
 def _encode_features(
     df: pl.DataFrame,
     feature_cols: List[str],
-) -> Tuple[np.ndarray, List[str], Dict[str, List[int]]]:
-    """
-    Build a numeric matrix from *feature_cols*, one-hot encoding categoricals.
+    variable_configs: Optional[Dict[str, Any]] = {},
+    weights: Optional[np.ndarray] = None,
+) -> Tuple[pl.DataFrame, List[str], Dict[str, List[int]]]:
+    df_enc = df.clone()
 
-    Returns
-    -------
-    X : np.ndarray
-        2-D float matrix, rows = observations.
-    encoded_names : list of str
-        Column name for each column in *X*.  Numeric columns keep their
-        original name; categorical dummies are ``"col_level"``.
-    col_index_map : dict
-        Maps each *original* column name to the list of column indices in
-        *X* that belong to it.  For a numeric column, this is a single-
-        element list; for a categorical, it lists all its dummy columns.
-    """
-    arrays: List[np.ndarray] = []
-    encoded_names: List[str] = []
-    col_index_map: Dict[str, List[int]] = {}
-    pos = 0
-
+    calculated_columns = []
     for col in feature_cols:
-        s = df[col]
-        if _is_str_or_cat(s.dtype):
-            filled = s.cast(pl.Utf8, strict=False).fill_null("__MISSING__")
-            levels = sorted(filled.unique().to_list())
-            indices = []
-            for lvl in levels:
-                dummy = (filled == lvl).cast(pl.Float64).to_numpy()
-                arrays.append(dummy)
-                encoded_names.append(f"{col}_{lvl}")
-                indices.append(pos)
-                pos += 1
-            col_index_map[col] = indices
-        else:
-            arr = s.cast(pl.Float64, strict=False).fill_null(float("nan")).to_numpy(allow_copy=True)
-            arrays.append(arr)
-            encoded_names.append(col)
-            col_index_map[col] = [pos]
-            pos += 1
+        assert col in df_enc.columns or col in variable_configs, f"Feature column '{col}' not found in DataFrame or variable_configs."
 
-    X = np.column_stack(arrays) if arrays else np.empty((len(df), 0))
-    return X, encoded_names, col_index_map
+        if col in variable_configs and col not in df_enc.columns:
+            calculated_columns.append(col)
+    
+    if calculated_columns:
+        preprocessor = _build_preprocessor(calculated_columns, df_enc, variable_configs)
+        preprocessor.fit(df_enc, weights=weights)
+        
+        for col in calculated_columns:
+            vals = _resolve_level(col, df_enc, preprocessor, 10)
+            df_enc = df_enc.with_columns(pl.Series(col, vals))
+        
+    # Separate numeric and categorical columns
+    numeric_cols = [col for col in feature_cols if not _is_str_or_cat(df_enc[col].dtype)]
+    cat_cols = [col for col in feature_cols if _is_str_or_cat(df_enc[col].dtype)]
 
+    # Process numeric columns
+    numeric_data = {}
+    for col in numeric_cols:
+        arr = df_enc[col].cast(pl.Float32, strict=False).fill_null(0.0).shrink_dtype()
+        numeric_data[col] = arr
 
-def _encode_features_native(
-    df: pl.DataFrame,
-    feature_cols: List[str],
-) -> Tuple[np.ndarray, List[str], Dict[str, List[int]], List[str]]:
-    """
-    Build a numeric matrix for LightGBM's native categorical support.
+    # Process categorical columns using get_dummies
+    if cat_cols:
+        cat_df = df_enc.select(cat_cols).with_columns([
+            pl.col(c).cast(pl.Utf8, strict=False).fill_null("__MISSING__").alias(c) for c in cat_cols
+        ])
+        dummies = cat_df.to_dummies()
+        dummy_names = dummies.columns
+        dummy_data = {name: dummies[name] for name in dummy_names}
+    else:
+        dummy_data = {}
+        dummy_names = []
 
-    Categoricals are encoded as integer codes (0-based); LightGBM splits on
-    optimal level partitions rather than individual dummies, which captures
-    grouping interactions one-hot cannot.  Numeric nulls become NaN
-    (LightGBM treats NaN as a separate missing branch).
+    # Combine all columns (numeric already shrunk per-series; dummies are UInt8 from to_dummies)
+    all_data = {**numeric_data, **dummy_data}
+    X = pl.DataFrame(all_data) if all_data else pl.DataFrame()
 
-    Returns
-    -------
-    X : np.ndarray
-    encoded_names : list of str  (one name per original feature col)
-    col_index_map : dict  (each col maps to its single index)
-    cat_feature_names : list of str  (names of categorical columns to pass to LightGBM)
-    """
-    arrays: List[np.ndarray] = []
-    cat_feature_names: List[str] = []
+    # Sanitize column names: LightGBM rejects special JSON characters
+    _json_special = str.maketrans({c: "_" for c in r'[]{}":,\/'})
+    raw_cols = list(X.columns)
+    clean_cols = [c.translate(_json_special) for c in raw_cols]
+    if clean_cols != raw_cols:
+        X = X.rename(dict(zip(raw_cols, clean_cols)))
+    encoded_names = list(X.columns)
+
+    # Build col_index_map
     col_index_map: Dict[str, List[int]] = {}
+    col_pos = {name: i for i, name in enumerate(encoded_names)}
+    for col in numeric_cols:
+        col_index_map[col] = [col_pos[col]]
+    for col in cat_cols:
+        indices = [col_pos[name] for name in encoded_names if name.startswith(f"{col}_")]
+        col_index_map[col] = indices
 
-    for i, col in enumerate(feature_cols):
-        s = df[col]
-        if _is_str_or_cat(s.dtype):
-            filled = s.cast(pl.Utf8, strict=False).fill_null("__MISSING__")
-            levels = sorted(filled.unique().to_list())
-            level_map = {lvl: j for j, lvl in enumerate(levels)}
-            codes = np.array([level_map[v] for v in filled.to_list()], dtype=float)
-            arrays.append(codes)
-            cat_feature_names.append(col)
-        else:
-            arr = s.cast(pl.Float64, strict=False).to_numpy(allow_copy=True).astype(float)
-            arrays.append(arr)
-        col_index_map[col] = [i]
-
-    X = np.column_stack(arrays) if arrays else np.empty((len(df), 0))
-    return X, list(feature_cols), col_index_map, cat_feature_names
+    return X, encoded_names, col_index_map
 
 
 # ── Shadow GBM fitting ────────────────────────────────────────────────────────
@@ -156,53 +147,46 @@ def fit_shadow_gbm(
     df: pl.DataFrame,
     target_col: str,
     weight_col: Optional[str] = None,
+    offset_col: Optional[str] = None,
     feature_cols: Optional[List[str]] = None,
     family: str = "tweedie",
     tweedie_power: float = 1.5,
-    n_estimators: int = 200,
+    variable_configs: Optional[Dict[str, Any]] = None,
+    n_estimators: int = 500,
     max_depth: int = 5,
-    learning_rate: float = 0.05,
-    use_categorical: bool = False,
+    learning_rate: float = 0.01,
     **lgb_params: Any,
 ) -> Any:
     """
     Fit a LightGBM regressor on raw features for diagnostic purposes.
 
+    Categorical columns are one-hot encoded automatically.
+
     Parameters
     ----------
     df : pl.DataFrame
+        Source data.
     target_col : str
+        Target column (e.g. loss_ratio).
     weight_col : str, optional
+        Exposure weight column.
     feature_cols : list of str, optional
-        Defaults to all numeric and string/categorical columns except target
-        and weight.
+        Columns to use as features.  Defaults to all numeric *and*
+        string/categorical columns except target and weight.
     family : str
         ``'tweedie'`` (default) or ``'regression'``.
     tweedie_power : float
-    use_categorical : bool
-        When ``True``, categoricals are passed as integer codes with LightGBM's
-        native categorical handling (optimal partition splits).  When ``False``
-        (default), categoricals are one-hot encoded.  Native mode finds level-
-        grouping interactions one-hot cannot; one-hot mode is compatible with
-        all downstream functions including SHAP dependence.
+        Tweedie variance power (default 1.5, typical for insurance).
 
     Returns
     -------
-    lgb.LGBMRegressor with attached attributes:
+    lgb.LGBMRegressor
+        Fitted LightGBM model.  Also carries:
 
         - ``_shadow_feature_cols`` — original column names (pre-encoding)
-        - ``_shadow_encoded_names`` — column names after encoding
+        - ``_shadow_encoded_names`` — column names after one-hot encoding
         - ``_shadow_col_index_map`` — maps original col → indices in encoded matrix
-        - ``_shadow_use_categorical`` — bool, whether native categorical was used
     """
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
-        raise ImportError(
-            "LightGBM is required for shadow GBM discovery.\n"
-            "Install it with:  pip install lightgbm"
-        ) from exc
-
     if feature_cols is None:
         exclude = {target_col}
         if weight_col:
@@ -213,8 +197,15 @@ def fit_shadow_gbm(
             and (df[c].dtype in _NUMERIC_DTYPES or _is_str_or_cat(df[c].dtype))
         ]
 
+    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
+
+    X = X.with_columns(pl.col(pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64).cast(pl.Float64))
+    X = X.with_columns(pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan")))
+
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
+    if offset_col is not None and w is not None:
+        w = w * np.exp(df[offset_col].to_numpy().astype(float))
 
     params: Dict[str, Any] = {
         "n_estimators": n_estimators,
@@ -229,22 +220,16 @@ def fit_shadow_gbm(
         params["tweedie_variance_power"] = tweedie_power
     params.update(lgb_params)
 
-    model = lgb.LGBMRegressor(**params)
+    model = LGBRegressorPolars(**params)
+    model.fit(X.to_arrow(), y, sample_weight=w, feature_name=encoded_names)
 
-    if use_categorical:
-        X, encoded_names, col_index_map, cat_names = _encode_features_native(df, feature_cols)
-        model.fit(X, y, sample_weight=w, feature_name=encoded_names,
-                  categorical_feature=cat_names)
-        model._shadow_use_categorical = True
-        model._shadow_cat_feature_names = cat_names
-    else:
-        X, encoded_names, col_index_map = _encode_features(df, feature_cols)
-        model.fit(X, y, sample_weight=w, feature_name=encoded_names)
-        model._shadow_use_categorical = False
-
+    # Stash encoding info for downstream functions
     model._shadow_feature_cols = feature_cols
     model._shadow_encoded_names = encoded_names
     model._shadow_col_index_map = col_index_map
+    model._variable_configs = variable_configs or {}
+    model._weight_col = weight_col
+
     return model
 
 
@@ -254,13 +239,9 @@ def _prepare_X(
     model: Any,
     df: pl.DataFrame,
     feature_cols: Optional[List[str]] = None,
-) -> Tuple[np.ndarray, List[str], Dict[str, List[int]], List[str]]:
+) -> Tuple[pl.DataFrame, List[str], Dict[str, List[int]], List[str]]:
     """
     Build the encoded matrix for *df* using the encoding stored on *model*.
-
-    Aligns column layout to the training encoding so that scoring on a
-    subset of the training data (or a holdout) never shifts column indices.
-    Absent levels produce zero columns; extra levels in df are dropped.
 
     Returns (X, encoded_names, col_index_map, feature_cols).
     """
@@ -271,24 +252,19 @@ def _prepare_X(
 
     col_index_map = getattr(model, "_shadow_col_index_map", None)
     encoded_names = getattr(model, "_shadow_encoded_names", None)
-    use_categorical = getattr(model, "_shadow_use_categorical", False)
+    variable_configs = getattr(model, "_variable_configs", None)
+    weight_col = getattr(model, "_weight_col", None)
+
+    if weight_col is not None:
+        weights = df[weight_col].to_numpy().astype(float)
+    else:
+        weights = None
 
     if col_index_map is not None and encoded_names is not None:
-        if use_categorical:
-            X, _, _, _ = _encode_features_native(df, feature_cols)
-        else:
-            # Re-encode df, then align columns to the training layout by name.
-            X_raw, new_names, _ = _encode_features(df, feature_cols)
-            new_name_to_idx = {n: i for i, n in enumerate(new_names)}
-            n = len(df)
-            X = np.zeros((n, len(encoded_names)), dtype=float)
-            for i, name in enumerate(encoded_names):
-                if name in new_name_to_idx:
-                    X[:, i] = X_raw[:, new_name_to_idx[name]]
-                # else: absent level (unseen in df) stays 0
+        X, _, _ = _encode_features(df, feature_cols, variable_configs, weights)
     else:
-        # Legacy path: all numeric, no encoding
-        X = df.select(feature_cols).to_numpy().astype(float)
+        # Legacy path: all numeric, no encoding needed
+        X = df.select(feature_cols)
         encoded_names = list(feature_cols)
         col_index_map = {c: [i] for i, c in enumerate(feature_cols)}
 
@@ -331,7 +307,7 @@ def permutation_importance(
         Columns: ``variable``, ``importance_mean``, ``importance_std``.
         One row per *original* column (not per dummy).
     """
-    X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
+    X, _, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
 
     if metric_fn is None:
         def metric_fn(y_true, y_pred, w):
@@ -349,16 +325,18 @@ def permutation_importance(
     results = []
     for col_name in feature_cols:
         indices = col_index_map[col_name]
-        orig_cols = {idx: X[:, idx].copy() for idx in indices}
+        orig_cols = {idx: X[:, idx].clone() for idx in indices}
         scores = []
         for _ in range(n_repeats):
-            perm = rng.permutation(len(X))
+            # Use the same permutation for all dummy columns of this variable
+            # to preserve one-hot validity (each row maps to exactly one level).
+            perm = X.clone().sample(fraction=1.0, seed=random_state, shuffle=True)
             for idx in indices:
-                X[:, idx] = X[perm, idx]
+                X = X.with_columns(perm.to_series(idx).alias(X.columns[idx]))
             score = metric_fn(y, _predict(model, X), w)
             scores.append(baseline - score)
             for idx, orig in orig_cols.items():
-                X[:, idx] = orig
+                X = X.with_columns(orig.alias(X.columns[idx]))
         results.append({
             "variable": col_name,
             "importance_mean": float(np.mean(scores)),
@@ -372,19 +350,17 @@ def permutation_importance(
 
 def _partial_dependence_1d(
     model: Any,
-    X: np.ndarray,
+    X: pl.DataFrame,
     feature_idx: int,
     grid: np.ndarray,
-    weights: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compute 1D partial dependence at grid points for a single feature."""
     pd_values = np.zeros(len(grid))
-    orig = X[:, feature_idx].copy()
+    orig = X[:, feature_idx].clone()
     for i, val in enumerate(grid):
-        X[:, feature_idx] = val
-        preds = _predict(model, X)
-        pd_values[i] = np.average(preds, weights=weights) if weights is not None else preds.mean()
-    X[:, feature_idx] = orig
+        X = X.with_columns(pl.lit(val).alias(X.columns[feature_idx])) 
+        pd_values[i] = _predict(model, X).mean()
+    X = X.with_columns(orig.alias(X.columns[feature_idx]))
     return pd_values
 
 
@@ -396,7 +372,6 @@ def partial_dependence_2d(
     var1: str,
     var2: str,
     feature_cols: Optional[List[str]] = None,
-    weight_col: Optional[str] = None,
     grid_resolution: int = 20,
     sample_size: int = 500,
     random_state: int = 42,
@@ -414,8 +389,6 @@ def partial_dependence_2d(
         Fitted model with ``.predict(X)``.
     var1, var2 : str
         Original column names (must be numeric).
-    weight_col : str, optional
-        Exposure weight column for weighted PDP means.
     grid_resolution : int
         Number of grid points per variable (default 20).
     sample_size : int
@@ -428,6 +401,7 @@ def partial_dependence_2d(
     """
     X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
 
+    # PDP only makes sense for single-index (numeric) columns
     if len(col_index_map[var1]) != 1:
         raise ValueError(f"'{var1}' is categorical — PDP requires numeric variables.")
     if len(col_index_map[var2]) != 1:
@@ -436,29 +410,28 @@ def partial_dependence_2d(
     idx1 = col_index_map[var1][0]
     idx2 = col_index_map[var2][0]
 
+    # Subsample for speed
     rng = np.random.RandomState(random_state)
     X_sample = _subsample_rows(X, sample_size, rng)
-    w = df[weight_col].to_numpy().astype(float) if weight_col else None
-    if w is not None and len(X) > sample_size:
-        # Subsample weights with the same random indices
-        idx_sample = rng.choice(len(X), sample_size, replace=False) if len(X) > sample_size else np.arange(len(X))
-        w = w[idx_sample]
 
+    # Grid at quantiles for better coverage
     grid1 = np.unique(np.quantile(X_sample[:, idx1], np.linspace(0, 1, grid_resolution)))
     grid2 = np.unique(np.quantile(X_sample[:, idx2], np.linspace(0, 1, grid_resolution)))
 
-    orig1 = X_sample[:, idx1].copy()
-    orig2 = X_sample[:, idx2].copy()
+    orig1 = X_sample[:, idx1].clone()
+    orig2 = X_sample[:, idx2].clone()
     rows = []
     for v1 in grid1:
-        X_sample[:, idx1] = v1
+        X_sample = X_sample.with_columns(pl.lit(v1).alias(X_sample.columns[idx1]))
         for v2 in grid2:
-            X_sample[:, idx2] = v2
-            preds = _predict(model, X_sample)
-            pd_val = float(np.average(preds, weights=w) if w is not None else preds.mean())
-            rows.append({"var1_value": float(v1), "var2_value": float(v2), "pd_value": pd_val})
-    X_sample[:, idx1] = orig1
-    X_sample[:, idx2] = orig2
+            X_sample = X_sample.with_columns(pl.lit(v2).alias(X_sample.columns[idx2]))
+            rows.append({
+                "var1_value": float(v1),
+                "var2_value": float(v2),
+                "pd_value": float(_predict(model, X_sample).mean()),
+            })
+    X_sample = X_sample.with_columns(orig1.alias(X_sample.columns[idx1]))
+    X_sample = X_sample.with_columns(orig2.alias(X_sample.columns[idx2]))
 
     return pl.DataFrame(rows)
 
@@ -469,7 +442,6 @@ def interaction_ranking(
     model: Any,
     df: pl.DataFrame,
     feature_cols: Optional[List[str]] = None,
-    weight_col: Optional[str] = None,
     top_n: int = 20,
     grid_resolution: int = 15,
     sample_size: int = 300,
@@ -483,15 +455,18 @@ def interaction_ranking(
 
     Pre-screens to top ``top_n`` variables by aggregated feature importance
     before computing pairwise H-statistics.  Only *numeric* variables are
-    included in the H-statistic computation.
+    included in the H-statistic computation (the PDP grid doesn't apply
+    to one-hot dummies), but categorical variables contribute to the model
+    and improve the GBM's ability to detect interactions.
 
     Parameters
     ----------
-    weight_col : str, optional
-        Exposure weight column.  When provided, PDP means are exposure-weighted.
     top_n : int
+        Number of top *numeric* variables (by importance) to consider.
     grid_resolution : int
+        Grid points per variable for PDP computation.
     sample_size : int
+        Subsample size for speed.
 
     Returns
     -------
@@ -500,14 +475,11 @@ def interaction_ranking(
     """
     X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
 
+    # Subsample for speed
     rng = np.random.RandomState(random_state)
-    sample_idx = (
-        rng.choice(len(X), sample_size, replace=False) if len(X) > sample_size
-        else np.arange(len(X))
-    )
-    X_sample = X[sample_idx]
-    w = df[weight_col].to_numpy().astype(float)[sample_idx] if weight_col else None
+    X_sample = _subsample_rows(X, sample_size, rng)
 
+    # Aggregate importance per original variable (sum over dummies)
     try:
         raw_importances = model.feature_importances_
     except AttributeError:
@@ -518,18 +490,21 @@ def interaction_ranking(
         indices = col_index_map[col_name]
         var_importance[col_name] = sum(float(raw_importances[i]) for i in indices)
 
+    # Only keep numeric variables for H-statistic (single-index in col_index_map)
     numeric_vars = [c for c in feature_cols if len(col_index_map[c]) == 1]
     numeric_vars_sorted = sorted(numeric_vars, key=lambda c: var_importance.get(c, 0), reverse=True)
     top_vars = numeric_vars_sorted[:top_n]
 
+    # Compute 1D PDPs for each top variable
     pdp_1d: Dict[str, np.ndarray] = {}
     grids: Dict[str, np.ndarray] = {}
     for var in top_vars:
         idx = col_index_map[var][0]
         grid = np.unique(np.quantile(X_sample[:, idx], np.linspace(0, 1, grid_resolution)))
         grids[var] = grid
-        pdp_1d[var] = _partial_dependence_1d(model, X_sample, idx, grid, weights=w)
+        pdp_1d[var] = _partial_dependence_1d(model, X_sample, idx, grid)
 
+    # Compute H-statistic for each pair
     rows = []
     for i_pos, var_i in enumerate(top_vars):
         idx_i = col_index_map[var_i][0]
@@ -539,31 +514,32 @@ def interaction_ranking(
 
             grid_i = grids[var_i]
             grid_j = grids[var_j]
-            orig_i = X_sample[:, idx_i].copy()
-            orig_j = X_sample[:, idx_j].copy()
+            orig_i = X_sample[:, idx_i].clone()
+            orig_j = X_sample[:, idx_j].clone()
             joint_pd = np.zeros((len(grid_i), len(grid_j)))
             for gi, vi in enumerate(grid_i):
-                X_sample[:, idx_i] = vi
+                X_sample = X_sample.with_columns(pl.lit(vi).alias(X_sample.columns[idx_i]))
                 for gj, vj in enumerate(grid_j):
-                    X_sample[:, idx_j] = vj
-                    preds = _predict(model, X_sample)
-                    joint_pd[gi, gj] = np.average(preds, weights=w) if w is not None else preds.mean()
-            X_sample[:, idx_i] = orig_i
-            X_sample[:, idx_j] = orig_j
+                    X_sample = X_sample.with_columns(pl.lit(vj).alias(X_sample.columns[idx_j]))
+                    joint_pd[gi, gj] = _predict(model, X_sample).mean()
+            X_sample = X_sample.with_columns(orig_i.alias(X_sample.columns[idx_i]))
+            X_sample = X_sample.with_columns(orig_j.alias(X_sample.columns[idx_j]))
 
             mean_joint = joint_pd.mean()
-            interaction = (
-                joint_pd
-                - pdp_1d[var_i][:, np.newaxis]
-                - pdp_1d[var_j][np.newaxis, :]
-                + mean_joint
-            )
+            pd_i_expanded = pdp_1d[var_i][:, np.newaxis]
+            pd_j_expanded = pdp_1d[var_j][np.newaxis, :]
+            interaction = joint_pd - pd_i_expanded - pd_j_expanded + mean_joint
 
             var_interaction = float(np.var(interaction))
             var_joint = float(np.var(joint_pd))
+
             h_stat = var_interaction / var_joint if var_joint > 1e-12 else 0.0
 
-            rows.append({"var1": var_i, "var2": var_j, "h_statistic": h_stat})
+            rows.append({
+                "var1": var_i,
+                "var2": var_j,
+                "h_statistic": h_stat,
+            })
 
     return pl.DataFrame(rows).sort("h_statistic", descending=True)
 
@@ -575,7 +551,9 @@ def residual_gbm(
     residuals: Union[np.ndarray, pl.Series],
     feature_cols: List[str],
     weight_col: Optional[str] = None,
+    offset_col: Optional[str] = None,
     top_n: int = 10,
+    variable_configs: Optional[Dict[str, Any]] = None,
     n_estimators: int = 100,
     max_depth: int = 3,
     **lgb_params: Any,
@@ -610,8 +588,14 @@ def residual_gbm(
         ) from exc
 
     residuals = _to_numpy(residuals)
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols)
+    
+    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
+    X = X.with_columns(pl.col(pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64).cast(pl.Float64))
+    X = X.with_columns(pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan")))
+
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
+    if offset_col is not None and w is not None:
+        w = w * np.exp(df[offset_col].to_numpy().astype(float))
 
     params: Dict[str, Any] = {
         "n_estimators": n_estimators,
@@ -620,11 +604,13 @@ def residual_gbm(
         "verbose": -1,
         "n_jobs": -1,
     }
+
     params.update(lgb_params)
 
-    model = lgb.LGBMRegressor(**params)
-    model.fit(X, residuals, sample_weight=w, feature_name=encoded_names)
+    model = LGBRegressorPolars(**params)
+    model.fit(X.to_arrow(), residuals, sample_weight=w, feature_name=encoded_names)
 
+    # Aggregate importance per original variable
     raw_importances = model.feature_importances_
     trees_df = model.booster_.trees_to_dataframe()
     split_groups = (
@@ -639,20 +625,22 @@ def residual_gbm(
         indices = col_index_map[col_name]
         total_importance = sum(float(raw_importances[i]) for i in indices)
 
+        # Find top split: only meaningful for numeric (single-index) columns
         top_split = float("nan")
         if len(indices) == 1:
-            thresholds = split_groups.get(encoded_names[indices[0]], [])
+            use_name = col_name if col_name in model.feature_name_ else f"Column_{indices[0]}"
+            thresholds = split_groups.get(use_name, [])
             if thresholds:
                 top_split = float(Counter(thresholds).most_common(1)[0][0])
 
         rows.append({
             "variable": col_name,
             "importance": total_importance,
-            "top_split_value": top_split,
+            "top_split_value": round(top_split, 3),
         })
 
-    return pl.DataFrame(rows).sort("importance", descending=True).head(top_n)
-
+    result = pl.DataFrame(rows).sort("importance", descending=True).head(top_n)
+    return result
 
 # ── SHAP-based discovery ──────────────────────────────────────────────────────
 
@@ -688,7 +676,6 @@ def _normalize_shap_values(shap_values: Any) -> np.ndarray:
         shap_values = shap_values[:, :, 0]
     return shap_values
 
-
 def shap_importance(
     model: Any,
     df: pl.DataFrame,
@@ -722,7 +709,7 @@ def shap_importance(
     X_sample = _subsample_rows(X, sample_size, rng)
 
     explainer = shap.TreeExplainer(model)
-    shap_values = _normalize_shap_values(explainer.shap_values(X_sample))  # (n, n_features)
+    shap_values = _normalize_shap_values(explainer.shap_values(X_sample.to_numpy()))  # (n, n_features)
 
     rows = []
     for col_name in feature_cols:
@@ -785,13 +772,13 @@ def shap_dependence(
     X_sample = X[sample_idx]
 
     explainer = shap.TreeExplainer(model)
-    shap_values = _normalize_shap_values(explainer.shap_values(X_sample))
+    shap_values = _normalize_shap_values(explainer.shap_values(X_sample.to_numpy()))
 
     indices = col_index_map[var]
     var_shap = shap_values[:, indices].sum(axis=1)
 
     if len(indices) == 1:
-        var_vals = X_sample[:, indices[0]]
+        var_vals = X_sample[:, indices[0]].to_numpy()
     else:
         # Categorical: encode as level index (which dummy is active)
         var_vals = np.argmax(X_sample[:, indices], axis=1).astype(float)
@@ -841,7 +828,7 @@ def shap_interaction_ranking(
 
     explainer = shap.TreeExplainer(model)
     # shap_interaction_values: (n, n_features, n_features)
-    interaction_values = explainer.shap_interaction_values(X_sample)
+    interaction_values = explainer.shap_interaction_values(X_sample.to_numpy())
 
     rows = []
     for i_pos, var_i in enumerate(feature_cols):
@@ -979,31 +966,21 @@ def suggest_category_groups(
     """
     s = df[col].cast(pl.Utf8, strict=False).fill_null("__MISSING__")
     y_arr = _to_numpy(y)
-    w_arr = (
-        _to_numpy(weights)
-        if weights is not None
-        else np.ones(len(df))
-    )
-    total_w = float(w_arr.sum())
-    if total_w == 0:
-        total_w = 1.0
+    w_arr = _to_numpy(weights) if weights is not None else np.ones(len(df))
+    total_w = max(float(w_arr.sum()), 1.0)
 
-    # Compute per-level stats
-    level_stats = []
+    # Build initial groups sorted by weighted mean target
+    groups = []
     for lvl in s.unique().to_list():
         mask = (s == lvl).to_numpy()
-        lw = w_arr[mask]
-        ly = y_arr[mask]
+        lw, ly = w_arr[mask], y_arr[mask]
         w_sum = float(lw.sum())
-        mean_y = float(np.average(ly, weights=lw)) if w_sum > 0 else 0.0
-        level_stats.append({"level": lvl, "mean_target": mean_y, "exposure": w_sum})
-
-    # Start with sorted groups
-    groups = sorted(
-        [{"levels": [r["level"]], "mean": r["mean_target"], "exposure": r["exposure"]}
-         for r in level_stats],
-        key=lambda g: g["mean"],
-    )
+        groups.append({
+            "levels": [lvl],
+            "mean": float(np.average(ly, weights=lw)) if w_sum > 0 else 0.0,
+            "exposure": w_sum,
+        })
+    groups.sort(key=lambda g: g["mean"])
 
     def _merge(i: int, j: int) -> None:
         gi, gj = groups[i], groups[j]
@@ -1012,15 +989,10 @@ def suggest_category_groups(
             (gi["mean"] * gi["exposure"] + gj["mean"] * gj["exposure"]) / merged_exp
             if merged_exp > 0 else 0.0
         )
-        merged = {
-            "levels": gi["levels"] + gj["levels"],
-            "mean": merged_mean,
-            "exposure": merged_exp,
-        }
         lo, hi = min(i, j), max(i, j)
         groups.pop(hi)
         groups.pop(lo)
-        groups.insert(lo, merged)
+        groups.insert(lo, {"levels": gi["levels"] + gj["levels"], "mean": merged_mean, "exposure": merged_exp})
 
     # Phase 1: merge tiny levels
     changed = True
@@ -1028,31 +1000,17 @@ def suggest_category_groups(
         changed = False
         for i, g in enumerate(groups):
             if g["exposure"] / total_w < min_exposure_pct:
-                if i == 0:
-                    neighbor = 1
-                elif i == len(groups) - 1:
-                    neighbor = len(groups) - 2
-                else:
-                    neighbor = (
-                        i - 1
-                        if abs(groups[i - 1]["mean"] - g["mean"])
-                        <= abs(groups[i + 1]["mean"] - g["mean"])
-                        else i + 1
-                    )
+                neighbors = [j for j in (i - 1, i + 1) if 0 <= j < len(groups)]
+                neighbor = min(neighbors, key=lambda j: abs(groups[j]["mean"] - g["mean"]))
                 _merge(i, neighbor)
-                # Re-sort after merge to keep groups ordered by mean
                 groups.sort(key=lambda g2: g2["mean"])
                 changed = True
                 break
 
     # Phase 2: merge to max_groups
     while len(groups) > max_groups:
-        diffs = [
-            abs(groups[k + 1]["mean"] - groups[k]["mean"])
-            for k in range(len(groups) - 1)
-        ]
-        idx = int(np.argmin(diffs))
-        _merge(idx, idx + 1)
+        diffs = [abs(groups[k + 1]["mean"] - groups[k]["mean"]) for k in range(len(groups) - 1)]
+        _merge(int(np.argmin(diffs)), int(np.argmin(diffs)) + 1)
 
     # Build output
     level_to_group: Dict[str, str] = {}
@@ -1061,22 +1019,14 @@ def suggest_category_groups(
         label = f"G{gi:02d}"
         for lvl in g["levels"]:
             level_to_group[lvl] = label
-        summary_rows.append({
-            "group": label,
-            "levels": str(g["levels"]),
-            "exposure": g["exposure"],
-            "mean_target": g["mean"],
-        })
+        summary_rows.append({"group": label, "levels": str(g["levels"]), "exposure": g["exposure"], "mean_target": g["mean"]})
 
     summary = pl.DataFrame(summary_rows).sort("mean_target")
 
     if verbose:
         print(f"\n  Category groups for '{col}' ({len(groups)} groups):")
         for row in summary.iter_rows(named=True):
-            print(
-                f"    {row['group']}: mean={row['mean_target']:.4f}  "
-                f"exp={row['exposure']:,.0f}  levels={row['levels']}"
-            )
+            print(f"    {row['group']}: mean={row['mean_target']:.4f}  exp={row['exposure']:,.0f}  levels={row['levels']}")
 
     return level_to_group, summary
 
@@ -1092,6 +1042,7 @@ def monotonicity_test(
     n_estimators: int = 100,
     random_state: int = 42,
     verbose: bool = True,
+    variable_configs: Optional[Dict[str, Any]] = {},
     **lgb_params: Any,
 ) -> Dict[str, Any]:
     """
@@ -1116,15 +1067,8 @@ def monotonicity_test(
         ``cost_pos``, ``cost_neg``, ``recommended`` ('increasing', 'decreasing',
         or 'no_constraint').
     """
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
-        raise ImportError("LightGBM is required: pip install lightgbm") from exc
-
     if feature_cols is None:
-        exclude = {target_col}
-        if weight_col:
-            exclude.add(weight_col)
+        exclude = {target_col, weight_col} if weight_col else {target_col}
         feature_cols = [
             c for c in df.columns
             if c not in exclude
@@ -1134,38 +1078,33 @@ def monotonicity_test(
     if var not in feature_cols:
         raise ValueError(f"'{var}' not in feature_cols.")
 
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols)
+    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
-    n_features = X.shape[1]
 
     base_params: Dict[str, Any] = {
-        "n_estimators": n_estimators,
-        "verbose": -1,
-        "n_jobs": -1,
-        "random_state": random_state,
+        "n_estimators": n_estimators, "verbose": -1, "n_jobs": -1,
+        "random_state": random_state, **lgb_params,
     }
-    base_params.update(lgb_params)
 
-    def _rmse(mdl: Any) -> float:
-        pred = mdl.predict(X)
-        r = y - pred
+    def _fit_and_rmse(constraints=None) -> float:
+        params = dict(base_params)
+        if constraints is not None:
+            params["monotone_constraints"] = constraints
+        mdl = LGBRegressorPolars(**params)
+        mdl.fit(X, y, sample_weight=w, feature_name=encoded_names)
+        r = y - mdl.predict(X)
         return float(np.sqrt(np.average(r ** 2, weights=w) if w is not None else np.mean(r ** 2)))
 
-    mdl_free = lgb.LGBMRegressor(**base_params)
-    mdl_free.fit(X, y, sample_weight=w, feature_name=encoded_names)
-    rmse_free = _rmse(mdl_free)
+    rmse_free = _fit_and_rmse()
 
-    var_indices = col_index_map[var]
+    n_features, var_indices = X.shape[1], col_index_map[var]
     constrained_rmses: Dict[str, float] = {}
     for direction, label in [(1, "pos"), (-1, "neg")]:
         constraints = [0] * n_features
         for idx in var_indices:
             constraints[idx] = direction
-        params_c = dict(base_params, monotone_constraints=constraints)
-        mdl_c = lgb.LGBMRegressor(**params_c)
-        mdl_c.fit(X, y, sample_weight=w, feature_name=encoded_names)
-        constrained_rmses[label] = _rmse(mdl_c)
+        constrained_rmses[label] = _fit_and_rmse(constraints)
 
     cost_pos = constrained_rmses["pos"] - rmse_free
     cost_neg = constrained_rmses["neg"] - rmse_free
@@ -1206,6 +1145,7 @@ def boruta_select(
     n_iterations: int = 20,
     threshold: float = 0.05,
     random_state: int = 42,
+    variable_configs: Optional[Dict[str, Any]] = {},
     **lgb_params: Any,
 ) -> pl.DataFrame:
     """
@@ -1252,29 +1192,40 @@ def boruta_select(
             and (df[c].dtype in _NUMERIC_DTYPES or _is_str_or_cat(df[c].dtype))
         ]
 
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols)
+    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
     n_real = X.shape[1]
 
+    # Convert to numpy once and release the Polars frame to save memory.
+    X_np = X.to_numpy()
+    del X
+
     rng = np.random.RandomState(random_state)
     hit_counts: Dict[str, int] = {c: 0 for c in feature_cols}
 
-    params: Dict[str, Any] = {"n_estimators": n_estimators, "verbose": -1, "n_jobs": -1}
+    params: Dict[str, Any] = {"n_estimators": n_estimators, "verbose": -1, "n_jobs": -1, "importance_type": "gain"}
     params.update(lgb_params)
 
-    for _ in range(n_iterations):
-        shadow = np.column_stack([rng.permutation(X[:, j]) for j in range(n_real)])
-        X_aug = np.column_stack([X, shadow])
-        shadow_names = [f"__shadow_{n}" for n in encoded_names]
-        aug_names = encoded_names + shadow_names
+    # Pre-allocate reusable buffers: shadow columns and the augmented matrix.
+    shadow = np.empty_like(X_np)
+    X_aug = np.empty((X_np.shape[0], n_real * 2), dtype=X_np.dtype)
+    X_aug[:, :n_real] = X_np  # left half is constant across iterations
 
-        mdl = lgb.LGBMRegressor(**params)
+    shadow_names = [f"_shadow_{n}" for n in encoded_names]
+    aug_names = encoded_names + shadow_names
+
+    for _ in range(n_iterations):
+        for j in range(n_real):
+            shadow[:, j] = rng.permutation(X_np[:, j])
+        X_aug[:, n_real:] = shadow
+
+        mdl = LGBRegressorPolars(**params)
         mdl.fit(X_aug, y, sample_weight=w, feature_name=aug_names)
 
         imp = mdl.feature_importances_
         real_imp = imp[:n_real]
-        max_shadow = imp[n_real:].max()
+        max_shadow = np.percentile(imp[n_real:], 95)
 
         for col_name in feature_cols:
             indices = col_index_map[col_name]
