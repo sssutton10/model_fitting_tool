@@ -151,23 +151,22 @@ def suggest_bins_optbin(
     **optbin_kwargs: Any,
 ) -> List[float]:
     """
-    Optimal breakpoints via ``optbinning``.
+    Optimal breakpoints via ``optbinning.OptimalBinning``.
 
     Uses a MILP / CP-SAT solver to find splits that maximise the statistical
     divergence between adjacent bins while enforcing monotonicity and minimum
-    bin-size constraints.  A binary target (≤ 2 unique values) uses
-    ``OptimalBinning``; a continuous target (the usual case for loss ratios)
-    uses ``ContinuousOptimalBinning``.
+    bin-size constraints.
 
-    Extra keyword arguments are forwarded directly to the binning class
-    ``__init__`` (e.g. ``max_n_bins``, ``min_bin_size``, ``monotonic_trend``).
+    Extra keyword arguments are forwarded directly to
+    ``OptimalBinning.__init__`` (e.g. ``max_n_bins``, ``min_bin_size``,
+    ``monotonic_trend``).
 
     Requires
     --------
     ``pip install optbinning``
     """
     try:
-        from optbinning import ContinuousOptimalBinning, OptimalBinning
+        from optbinning import ContinuousOptimalBinning
     except ImportError as exc:
         raise ImportError(
             "The 'optbinning' package is required for this method.\n"
@@ -186,8 +185,7 @@ def suggest_bins_optbin(
     kwargs: Dict[str, Any] = {"name": col, "dtype": "numerical"}
     kwargs.update(optbin_kwargs)
 
-    binning_cls = OptimalBinning if np.unique(y_arr).size <= 2 else ContinuousOptimalBinning
-    ob = binning_cls(**kwargs)
+    ob = ContinuousOptimalBinning(**kwargs)
     ob.fit(arr, y_arr, sample_weight=w)
 
     splits = sorted(
@@ -262,7 +260,9 @@ def suggest_bins_gbm(
         params.update(gbm_kwargs)
 
         mdl = lgb.LGBMRegressor(**params)
-        mdl.fit(arr2d, y_arr, sample_weight=w, feature_name=[col])
+        _json_special = str.maketrans({c: "_" for c in r'[]{}":,\/'})
+        safe_col = col.translate(_json_special)
+        mdl.fit(arr2d, y_arr, sample_weight=w, feature_name=[safe_col])
 
         trees_df = mdl.booster_.trees_to_dataframe()
         for val in trees_df["threshold"].dropna():
@@ -311,7 +311,6 @@ def suggest_bins(
     methods: Sequence[str] = ("quantile", "equal_width", "optbin", "gbm"),
     n_bins: int = 10,
     max_splits: int = 20,
-    show_plot: bool = True,
     figsize: Optional[Tuple[int, int]] = None,
     **method_kwargs: Any,
 ) -> Dict[str, List[float]]:
@@ -333,7 +332,7 @@ def suggest_bins(
         Target bin count for the ``"quantile"`` and ``"equal_width"`` methods.
     max_splits : int
         Maximum thresholds returned by the ``"gbm"`` method.
-    show_plot : bool
+    return_plot : bool
         If ``True``, display the distribution plot after all methods run.
     method_kwargs
         Forward kwargs to individual methods by passing ``quantile_kwargs``,
@@ -397,10 +396,8 @@ def suggest_bins(
             print(f"\n  [ERROR] {method}: {exc}")
 
     print(f"\n{'=' * 62}\n")
-
-    if show_plot and results:
-        fig = _plot_suggestions(col, X, results, weights=weights, figsize=figsize)
-        plt.show()
+    
+    fig = _plot_suggestions(col, X, results, weights=weights, figsize=figsize)
 
     return results
 
@@ -419,11 +416,8 @@ def _plot_suggestions(
     Weighted histogram with each method's splits overlaid as vertical lines.
     """
     arr = X[col].to_numpy().astype(float)
-    w = (
-        weights.to_numpy().astype(float)
-        if weights is not None
-        else np.ones(len(arr))
-    )
+    w = weights.to_numpy().astype(float) if weights is not None else np.ones(len(arr))
+
     mask = arr != MISSING_SENTINEL
     arr, w = arr[mask], w[mask]
 
