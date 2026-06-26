@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
+from datetime import datetime
 
 import numpy as np
 import polars as pl
@@ -13,6 +14,7 @@ try:
         GeneralizedLinearRegressor,
         GeneralizedLinearRegressorCV,
         TweedieDistribution,
+        LogLink
     )
 except ImportError as e:
     raise ImportError("glum is required: pip install glum") from e
@@ -57,7 +59,7 @@ def _resolve_level_arr(
 
     if p.get("is_categorical") and p.get("encoding") == "onehot":
         dropped = p.get("dropped_category", "")
-        level_arr = np.full(n, f"{dropped} (base)", dtype=object)
+        level_arr = np.full(n, dropped, dtype=object)
         for cat in p["categories"]:
             feat = f"{V}_{cat}"
             if feat in cols_set:
@@ -66,8 +68,8 @@ def _resolve_level_arr(
 
     if "bin_edges" in p:
         dropped_bin = p.get("dropped_bin", 0)
-        all_labels = p.get("bin_labels") or make_bin_labels(p["bin_edges"])
-        base_lbl = f"{all_labels[dropped_bin]} (base)"
+        all_labels = p.get("bin_labels")
+        base_lbl = all_labels[dropped_bin]
         level_arr = np.full(n, base_lbl, dtype=object)
         missing_feat = f"{V}_missing"
         if missing_feat in cols_set:
@@ -124,6 +126,7 @@ class FactorModelVersion:
     preprocessor: Optional[Any]       # Optional[Preprocessor]
     preprocessor_vars: List[str]
     train_predictions: np.ndarray
+    offset_col: Optional[str] = None
 
     # Stubs — keep list_versions / compare_models happy
     alpha: Optional[float] = None
@@ -134,7 +137,7 @@ class FactorModelVersion:
     )
     fit_info: Dict[str, Any] = field(default_factory=dict)
 
-    def predict(self, X: pl.DataFrame, missing_factor: float = 1.0) -> np.ndarray:
+    def predict(self, X: pl.DataFrame, missing_factor: float = 1.0, offset: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Score *X* by factor-table lookup and return a numpy array of predictions.
 
@@ -155,9 +158,12 @@ class FactorModelVersion:
         n = len(X)
         product = np.ones(n, dtype=float)
 
+        if offset is not None:
+            product *= offset
+
         factor_by_var = {
-            keys[0]: sub.select(["Level", "Factor"])
-            for keys, sub in self.factor_table.group_by("Variable")
+            grp[0]: df.select(["Level", "Factor"])
+            for grp, df in self.factor_table.group_by("Variable")
         }
 
         for V in self.variables:
@@ -206,20 +212,23 @@ class ModelVersion:
     link: str
     train_predictions: np.ndarray
     fit_info: Dict[str, Any] = field(default_factory=dict)
+    cv_stability: Optional[pl.DataFrame] = None
+    tweedie_power: Optional[float] = 1.50
+    gradient_tol: Optional[float] = None
 
-    def predict(self, X: pl.DataFrame) -> np.ndarray:
+    def predict(self, X: pl.DataFrame, offset:Optional[np.ndarray] = None) -> np.ndarray:
         """Transform *X* through the preprocessor and return model predictions."""
         Xt = self.preprocessor.transform(X).to_numpy().astype(float)
-        return self.glm.predict(Xt)
+        return self.glm.predict(Xt, offset=offset)
 
-    def coefficient_table(self) -> pl.DataFrame:
-        """Return coefficients sorted by descending absolute value."""
-        return (
-            self.coefficients
-            .with_columns(pl.col("coefficient").abs().alias("_abs"))
-            .sort("_abs", descending=True)
-            .drop("_abs")
-        )
+    # def coefficient_table(self) -> pl.DataFrame:
+    #     """Return coefficients sorted by descending absolute value."""
+    #     return (
+    #         self.coefficients
+    #         .with_columns(pl.col("coefficient").abs().alias("_abs"))
+    #         .sort("_abs", descending=True)
+    #         .drop("_abs")
+    #     )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -238,7 +247,7 @@ def _resolve_family(family: Any, tweedie_power: float = 1.5) -> Any:
 def _build_preprocessor(
     variables: List[str],
     X: pl.DataFrame,
-    configs: Dict[str, VariableConfig],
+    configs: Optional[Dict[str, VariableConfig]] = None,
 ) -> Preprocessor:
     """Build (unfitted) Preprocessor, filling absent variables with defaults."""
     cfgs = []
@@ -272,11 +281,13 @@ def _build_glm(
     l1_ratio: float,
     fit_intercept: bool,
     max_iter: int,
+    gradient_tol: Optional[float] = None
 ) -> GeneralizedLinearRegressor:
     return GeneralizedLinearRegressor(
         family=family, link=link,
         alpha=alpha, l1_ratio=l1_ratio,
-        fit_intercept=fit_intercept, max_iter=max_iter,
+        fit_intercept=fit_intercept, max_iter=max_iter, scale_predictors=True,
+        gradient_tol=gradient_tol
     )
 
 
@@ -306,23 +317,24 @@ def _geometric_mean_signed(values: np.ndarray) -> float:
 
 def fit_model(
     X: pl.DataFrame,
-    y: pl.Series,
+    y: np.ndarray,
     variables: List[str],
     version_name: str,
-    configs: Dict[str, VariableConfig],
-    weights: Optional[pl.Series] = None,
+    configs: Optional[Dict[str, VariableConfig]] = {},
+    weights: Optional[np.ndarray] = None,
+    offset: Optional[np.ndarray] = None,
     family: Any = None,
-    link: str = "log",
+    link: Any = LogLink(),
     tweedie_power: float = 1.5,
+    preprocessor: Optional[Preprocessor] = None,
     alpha: Optional[float] = None,
     l1_ratio: Union[float, List[float]] = 0.5,
     use_cv: bool = True,
     cv: Any = 5,
-    alphas: Optional[np.ndarray] = None,
-    l1_ratios: Optional[List[float]] = None,
     max_iter: int = 1000,
     fit_intercept: bool = True,
     drop_reference: str = "max_weight",
+    gradient_tol: Optional[float] = None
 ) -> ModelVersion:
     """
     Fit an elastic net GLM and return a :class:`ModelVersion`.
@@ -343,9 +355,8 @@ def fit_model(
         Accepted strings: ``"tweedie"`` (default), ``"poisson"``, ``"gamma"``.
         Defaults to ``TweedieDistribution(power=tweedie_power)``.
     alpha : float, optional
-        Fixed regularisation strength.  When provided, ``use_cv`` is
-        overridden to ``False`` and no cross-validation is performed.
-        Pass ``0.0`` for an unpenalised GLM.
+        Fixed regularisation strength.  Ignored when ``use_cv=True``.
+        Set to ``0`` for an unpenalised GLM.
     l1_ratio : float or list of float
         Elastic-net mixing.  List triggers CV search.
     use_cv : bool
@@ -356,58 +367,53 @@ def fit_model(
         other sklearn splitter) uses the provided fold assignments.
     alphas : np.ndarray, optional
         Custom alpha grid for CV.
-    l1_ratios : list of float, optional
-        Custom l1_ratio grid for CV.
     """
     family = _resolve_family(family, tweedie_power)
 
-    prep = _build_preprocessor(variables, X, configs)
-    fit_weights = weights if drop_reference == "max_weight" else None
-    prep.fit(X, weights=fit_weights)
+    prep = _build_preprocessor(variables, X, configs) if preprocessor is None else preprocessor
+
+    if not prep._fitted:
+        fit_weights = weights if drop_reference == "max_weight" else None
+        prep.fit(X, weights=fit_weights)
     Xt = prep.transform(X).to_numpy().astype(float)
     feature_names = prep.get_feature_names()
-    y_arr = y.to_numpy().astype(float)
-    w_arr = weights.to_numpy().astype(float) if weights is not None else None
 
-    if alpha is not None:
-        use_cv = False
+    link = LogLink() if link is None else link
 
     if use_cv:
-        cv_l1 = l1_ratios if l1_ratios is not None else (
-            l1_ratio if isinstance(l1_ratio, list) else [l1_ratio]
-        )
-        cv_alphas = alphas if alphas is not None else np.logspace(-4, 2, 40)
-
+        cv_l1 = l1_ratio if isinstance(l1_ratio, list) else [l1_ratio]
+        
         glm_cv = GeneralizedLinearRegressorCV(
             family=family,
             link=link,
             l1_ratio=cv_l1,
-            alphas=cv_alphas,
             cv=cv,
             fit_intercept=fit_intercept,
             max_iter=max_iter,
+            scale_predictors=True,
+            gradient_tol=gradient_tol
         )
-        glm_cv.fit(Xt, y_arr, sample_weight=w_arr)
+        glm_cv.fit(Xt, y, sample_weight=weights, offset=offset)
         best_alpha = float(glm_cv.alpha_)
         best_l1 = float(glm_cv.l1_ratio_)
 
-        glm = _build_glm(family, link, best_alpha, best_l1, fit_intercept, max_iter)
-        glm.fit(Xt, y_arr, sample_weight=w_arr)
+        glm = _build_glm(family, link, best_alpha, best_l1, fit_intercept, max_iter, gradient_tol)
+        glm.fit(Xt, y, sample_weight=weights, offset=offset)
         cv_label = cv if isinstance(cv, int) else type(cv).__name__
         fit_info: Dict[str, Any] = {
             "cv_folds": cv_label,
-            "cv_alpha_grid": cv_alphas.tolist(),
             "cv_l1_ratio_grid": cv_l1,
         }
     else:
         best_alpha = alpha if alpha is not None else 0.0
-        best_l1 = l1_ratio if not isinstance(l1_ratio, list) else l1_ratio[0]
-        glm = _build_glm(family, link, best_alpha, best_l1, fit_intercept, max_iter)
-        glm.fit(Xt, y_arr, sample_weight=w_arr)
+        best_l1 = (l1_ratio if not isinstance(l1_ratio, list) else l1_ratio[0])
+        glm = _build_glm(family, link, best_alpha, best_l1, fit_intercept, max_iter, gradient_tol)
+        glm.fit(Xt, y, sample_weight=weights, offset=offset)
         fit_info = {}
 
+    fit_info['Fit_Time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     coef_df = _extract_coefficients(glm, feature_names)
-    preds = glm.predict(Xt)
+    preds = glm.predict(Xt, offset=offset)
 
     return ModelVersion(
         name=version_name,
@@ -422,6 +428,8 @@ def fit_model(
         link=link,
         train_predictions=preds,
         fit_info=fit_info,
+        tweedie_power=tweedie_power,
+        gradient_tol=gradient_tol
     )
 
 
@@ -429,17 +437,19 @@ def fit_model(
 
 def fit_cv_stability(
     X: pl.DataFrame,
-    y: pl.Series,
+    y: np.ndarray,
     variables: List[str],
     configs: Dict[str, VariableConfig],
     fold_col: str,
-    weights: Optional[pl.Series] = None,
+    weights: Optional[np.ndarray] = None,
+    offset: Optional[np.ndarray] = None,
     family: Any = None,
     link: str = "log",
     tweedie_power: float = 1.5,
     alpha: float = 0.01,
     l1_ratio: float = 0.5,
     max_iter: int = 1000,
+    gradient_tol: Optional[float] = None,
     fit_intercept: bool = True,
     drop_reference: str = "max_weight",
 ) -> pl.DataFrame:
@@ -485,21 +495,20 @@ def fit_cv_stability(
     folds = sorted(X[fold_col].unique().to_list())
     records: List[Dict[str, Any]] = []
 
-    y_arr_full = y.to_numpy().astype(float)
-    w_arr_full = weights.to_numpy().astype(float) if weights is not None else None
     Xt_full = ref_prep.transform(X_feats).to_numpy().astype(float)
 
     for fold_val in folds:
         train_mask = (X[fold_col] != fold_val).to_numpy()
 
         Xt = Xt_full[train_mask]
-        y_train = y_arr_full[train_mask]
-        w_train = w_arr_full[train_mask] if w_arr_full is not None else None
+        y_train = y[train_mask]
+        w_train = weights[train_mask] if weights is not None else None
+        offset_train = offset[train_mask] if offset is not None else None
 
-        glm = _build_glm(family, link, alpha, l1_ratio, fit_intercept, max_iter)
-        glm.fit(Xt, y_train, sample_weight=w_train)
+        glm = _build_glm(family, link, alpha, l1_ratio, fit_intercept, max_iter, gradient_tol)
+        glm.fit(Xt, y_train, sample_weight=w_train, offset=offset_train)
 
-        row: Dict[str, Any] = {"fold": str(fold_val), "intercept": float(glm.intercept_)}
+        row: Dict[str, Any] = {"fold": f"fold_{str(fold_val)}", "intercept": float(glm.intercept_)}
         for name, val in zip(feature_names, glm.coef_):
             row[name] = float(val)
         records.append(row)
@@ -521,8 +530,6 @@ def fit_cv_stability(
         cv_row[col] = cv_pct
 
     summary = pl.DataFrame([geomean_row, std_row, cv_row])
-
-    all_cols = stability.columns
-    summary = summary.select(all_cols)
+    summary = summary.select(stability.columns)
 
     return pl.concat([stability, summary])
