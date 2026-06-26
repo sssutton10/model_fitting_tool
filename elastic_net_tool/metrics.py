@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Union
+from xml.parsers.expat import errors
 
 import numpy as np
 import polars as pl
 
-# np.trapz was renamed to np.trapezoid in numpy 2.0 and removed in 2.4
-_trapezoid = getattr(np, "trapezoid", None) or np.trapz
-
 
 # ── Gini coefficient ──────────────────────────────────────────────────────────
+
+def _gini(y_pred: np.ndarray, y_true: np.ndarray, w: np.ndarray) -> float:
+    idx = np.argsort(-y_pred)
+    ys, ws = y_true[idx], w[idx]
+    cum_w = np.concatenate([[0.0], np.cumsum(ws) / ws.sum()])
+    total_loss = (ys * ws).sum()
+    if total_loss == 0:
+        return 0.0
+    cum_loss = np.concatenate([[0.0], np.cumsum(ys * ws) / total_loss])
+    return float(2.0 * np.trapezoid(cum_loss, cum_w) - 1.0)
 
 def gini_coefficient(
     y_true: np.ndarray,
@@ -31,84 +39,34 @@ def gini_coefficient(
         Divide by the oracle Gini (sort by ``y_true``) to get a value in
         [0, 1].  A score of 1.0 means the model perfectly ranks risks.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    w = np.ones(len(y_true)) if weights is None else np.asarray(weights, dtype=float)
+    w = np.ones(len(y_true)) if weights is None else weights
 
-    def _gini(order_by: np.ndarray) -> float:
-        idx = np.argsort(-order_by)
-        ys, ws = y_true[idx], w[idx]
-        cum_w = np.concatenate([[0.0], np.cumsum(ws) / ws.sum()])
-        total_loss = (ys * ws).sum()
-        if total_loss == 0:
-            return 0.0
-        cum_loss = np.concatenate([[0.0], np.cumsum(ys * ws) / total_loss])
-        return float(2.0 * _trapezoid(cum_loss, cum_w) - 1.0)
+    model_gini = _gini(y_pred, y_true, w)
+    perfect = _gini(y_true, y_true, w) if normalize else 1.0
 
-    model_gini = _gini(y_pred)
-    if normalize:
-        perfect = _gini(y_true)
-        return model_gini / perfect if abs(perfect) > 1e-12 else 0.0
-    return model_gini
-
-
-# ── Equal-weight bucket assignment ────────────────────────────────────────────
-
-def _equal_weight_buckets(
-    pred: np.ndarray,
-    weights: np.ndarray,
-    n_buckets: int,
-) -> np.ndarray:
-    """
-    Assign bucket indices ``0 … n_buckets-1`` so each bucket contains
-    approximately equal total weight (exposure).
-
-    Observations are first sorted by ``pred`` ascending.  Cumulative weight
-    is then split into ``n_buckets`` equal segments.
-
-    Parameters
-    ----------
-    pred : np.ndarray
-        Model predictions (used for ordering).
-    weights : np.ndarray
-        Sample weights (must be positive).
-    n_buckets : int
-
-    Returns
-    -------
-    np.ndarray of int, same length as *pred*.
-    """
-    order = np.argsort(pred)
-    sorted_w = weights[order]
-    cum_w = np.cumsum(sorted_w)
-    total_w = cum_w[-1]
-    target = total_w / n_buckets
-
-    bucket_sorted = np.zeros(len(pred), dtype=int)
-    current_bucket = 0
-    threshold = target
-
-    for i, cw in enumerate(cum_w):
-        bucket_sorted[i] = current_bucket
-        # Advance bucket when we've accumulated enough weight,
-        # but don't exceed the last bucket index
-        if cw >= threshold and current_bucket < n_buckets - 1:
-            current_bucket += 1
-            threshold = target * (current_bucket + 1)
-
-    # Map back to original row order
-    result = np.empty(len(pred), dtype=int)
-    result[order] = bucket_sorted
-    return result
-
+    return model_gini / perfect if perfect > 1e-12 else 0.0
 
 # ── Lift table ────────────────────────────────────────────────────────────────
+
+def _weighted_relativity(vals1: pl.Series, weights: pl.Series, vals2: Optional[pl.Series] = None) -> pl.Series:
+    """
+    Compute relativity to the weighted mean for one or two columns in a summary DataFrame.
+    """
+    vals1_mean = vals1.sum() / weights.sum()
+    rels1 = (vals1 / weights) / vals1_mean if vals1_mean > 1e-12 else np.zeros_like(vals1)
+
+    rels2 = None
+    if vals2 is not None:
+        vals2_mean = vals2.sum() / weights.sum()
+        rels2 = (vals2 / weights) / vals2_mean if vals2_mean > 1e-12 else np.zeros_like(vals2)
+
+    return rels1, rels2
 
 def lift_table(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     weights: Optional[np.ndarray] = None,
-    n_buckets: int = 10,
+    n_buckets: int = 10
 ) -> pl.DataFrame:
     """
     Build a lift table with equal-weight buckets sorted by ``y_pred``.
@@ -120,32 +78,54 @@ def lift_table(
     pl.DataFrame
         Columns: ``bucket``, ``actual``, ``predicted``, ``exposure``, ``lift``.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    w = np.ones(len(y_true)) if weights is None else np.asarray(weights, dtype=float)
+    w = np.ones(len(y_true)) if weights is None else weights
 
-    buckets = _equal_weight_buckets(y_pred, w, n_buckets)
-    overall_mean = float(np.average(y_true, weights=w)) if w.sum() > 0 else 0.0
+    bks = np.quantile(y_pred, q=np.linspace(0, 1, n_buckets + 1), weights=w, method='inverted_cdf')
+    bks = sorted(set(dict.fromkeys(bks)))[1:-1]  # Exclude min and max
 
-    rows = []
-    for b in range(n_buckets):
-        mask = buckets == b
-        if not mask.any():
-            continue
-        yw, ww = y_true[mask], w[mask]
-        wb = float(ww.sum())
-        actual = float(np.average(yw, weights=ww)) if wb > 0 else 0.0
-        predicted = float(np.average(y_pred[mask], weights=ww)) if wb > 0 else 0.0
-        rows.append({
-            "bucket": b + 1,
-            "actual": actual,
-            "predicted": predicted,
-            "exposure": wb,
-            "lift": actual / overall_mean if overall_mean != 0 else float("nan"),
-        })
+    lift_tab = pl.DataFrame(
+        {
+            "predicted_ratio": y_pred,
+            "exposure": w,
+            'actual': y_true * w,
+            'predicted': y_pred * w
+        }
+    )
+    lift_tab = lift_tab.with_columns([
+        pl.col('predicted_ratio').cut(bks, labels=[str(x) for x in range(1, n_buckets + 1)], left_closed=True).cast(pl.String).cast(pl.Int8).alias("bucket")
+    ])
 
-    return pl.DataFrame(rows)
+    
+    lift_tab_agg = lift_tab.group_by('bucket').agg(pl.exclude('predicted_ratio').sum()).filter(pl.col('bucket').is_not_null()).sort("bucket", descending=False)
 
+    pred_rels, act_rels = _weighted_relativity(lift_tab_agg['predicted'], lift_tab_agg['exposure'], lift_tab_agg['actual'])
+
+    lift_tab_agg = lift_tab_agg.with_columns(pred_rels.alias("predicted"), act_rels.alias("actual"))
+
+    return lift_tab_agg.select(pl.col('bucket', 'actual', 'predicted', 'exposure'))
+
+def lift_rmse(lift_tab: pl.DataFrame) -> float:
+    """
+    Compute the RMSE of predicted vs actual loss amounts across lift table buckets.
+
+    This is a single-number summary of how well the model's predicted risk
+    matches actual risk across the distribution of predictions.
+    """
+    total_loss_ratio = np.average(lift_tab["actual"], weights=lift_tab["exposure"])
+    preds_for_rmse = lift_tab["predicted"] * total_loss_ratio * lift_tab["exposure"]
+
+    residuals = preds_for_rmse - (lift_tab["actual"] * lift_tab["exposure"]) 
+    return float(np.sqrt(np.average(residuals ** 2, weights=lift_tab["exposure"])))
+
+def lift_range(lift_tab: pl.DataFrame) -> float:
+    """
+    Compute the range of predicted loss ratio relativities across lift table buckets.
+
+    This is a single-number summary of how much the model differentiates risk
+    across the distribution of predictions.  A higher range indicates better
+    discrimination.
+    """
+    return float(lift_tab['actual'][lift_tab['bucket'].arg_max()] / lift_tab['predicted'][lift_tab['bucket'].arg_max()])
 
 # ── Double lift table ─────────────────────────────────────────────────────────
 
@@ -168,34 +148,39 @@ def double_lift_table(
         Columns: ``bucket``, ``actual``, ``model1``, ``model2``,
         ``ratio_mean``, ``exposure``.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    pred1 = np.asarray(pred1, dtype=float)
-    pred2 = np.asarray(pred2, dtype=float)
-    w = np.ones(len(y_true)) if weights is None else np.asarray(weights, dtype=float)
+    w = np.ones(len(y_true)) if weights is None else weights
 
-    safe_pred2 = np.where(np.abs(pred2) < 1e-12, 1e-12, pred2)
-    ratio = pred1 / safe_pred2
+    pred_ratio = pred2 / pred1  # Sort ratio
+    bks = np.quantile(pred_ratio, q=np.linspace(0, 1, n_buckets + 1), weights=w, method='inverted_cdf')
 
-    buckets = _equal_weight_buckets(ratio, w, n_buckets)
+    # Remove duplicates while preserving order of breaks
+    bks = sorted(set(dict.fromkeys(bks)))[1:-1]  # Exclude min and max
 
-    rows = []
-    for b in range(n_buckets):
-        mask = buckets == b
-        if not mask.any():
-            continue
-        ww = w[mask]
-        wb = float(ww.sum())
-        rows.append({
-            "bucket": b + 1,
-            "actual": float(np.average(y_true[mask], weights=ww)) if wb > 0 else 0.0,
-            "model1": float(np.average(pred1[mask], weights=ww)) if wb > 0 else 0.0,
-            "model2": float(np.average(pred2[mask], weights=ww)) if wb > 0 else 0.0,
-            "ratio_mean": float(np.average(ratio[mask], weights=ww)) if wb > 0 else 0.0,
-            "exposure": wb,
-        })
+    dl_tab = pl.DataFrame(
+        {
+            "Actual_Loss": y_true * w,
+            "Pred1_Loss": pred1 * w,
+            "Pred2_Loss": pred2 * w,
+            "Ratio": pred_ratio,
+            "weight": w,
+        }
+    )
+    dl_tab = dl_tab.with_columns([
+        pl.col('Ratio').cut(bks, labels=[str(x) for x in range(1, n_buckets + 1)], left_closed=True).cast(pl.String).cast(pl.Int8).alias("bucket")
+    ])
 
-    return pl.DataFrame(rows)
+    dl_agg = (dl_tab.group_by("bucket").agg(pl.exclude('Ratio').sum())).filter(pl.col('bucket').is_not_null()).sort("bucket", descending=False)
 
+    pred1_rels, pred2_rels = _weighted_relativity(dl_agg["Pred1_Loss"], dl_agg["weight"], dl_agg["Pred2_Loss"])
+    act_rels, _ = _weighted_relativity(dl_agg["Actual_Loss"], dl_agg["weight"])
+
+    dl_agg = dl_agg.with_columns([
+        pred1_rels.alias('model1'),
+        pred2_rels.alias('model2'),
+        act_rels.alias("actual"),
+    ])
+
+    return dl_agg.select(pl.col('bucket', 'weight', 'actual', 'model1', 'model2'))
 
 # ── Summary metrics ───────────────────────────────────────────────────────────
 
@@ -213,19 +198,23 @@ def compute_metrics(
     pl.DataFrame
         Columns: ``metric``, ``<version_name>``.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    w = np.ones(len(y_true)) if weights is None else np.asarray(weights, dtype=float)
+    w = np.ones(len(y_true)) if weights is None else weights
 
-    resid = y_true - y_pred
-    mse = float(np.average(resid ** 2, weights=w))
+    resid = w * (y_true - y_pred)
+    mse = np.average(resid ** 2, weights=w)
+
+    lift_tab = lift_table(y_true, y_pred, weights, n_buckets=20)
+    lift_range_val = lift_range(lift_tab)
+    lift_rmse_val = lift_rmse(lift_tab)
 
     metrics = {
         "mse": mse,
         "rmse": mse ** 0.5,
-        "mae": float(np.average(np.abs(resid), weights=w)),
+        "mae": np.average(np.abs(resid), weights=w),
         "gini": gini_coefficient(y_true, y_pred, w, normalize=False),
         "gini_norm": gini_coefficient(y_true, y_pred, w, normalize=True),
+        'lift_range': lift_range_val,
+        'lift_rmse': lift_rmse_val
     }
     return pl.DataFrame({"metric": list(metrics.keys()), version_name: list(metrics.values())})
 
@@ -292,8 +281,8 @@ def compare_metrics(
     merged = m1.join(m2, on="metric")
 
     # ── winner annotation ────────────────────────────────────────────────────
-    _lower_better = {"mse", "rmse", "mae"}
-    _higher_better = {"gini", "gini_norm"}
+    _lower_better = {"mse", "rmse", "mae", 'lift_rmse'}
+    _higher_better = {"gini", "gini_norm", 'lift_range'}
 
     winners: list[str] = []
     for row in merged.iter_rows(named=True):
@@ -396,15 +385,13 @@ def bootstrap_metrics(
         Columns: ``metric``, ``point_estimate``, ``ci_lower``, ``ci_upper``,
         ``std_error``.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    w = np.ones(len(y_true)) if weights is None else np.asarray(weights, dtype=float)
+    w = np.ones(len(y_true)) if weights is None else weights
     rng = np.random.RandomState(random_state)
 
     if metric_fns is None:
         metric_fns = {
             "gini_norm": lambda yt, yp, wt: gini_coefficient(yt, yp, wt, normalize=True),
-            "mse": lambda yt, yp, wt: -float(np.average((yt - yp) ** 2, weights=wt)),
+            "mse": lambda yt, yp, wt: -np.average((yt - yp) ** 2, weights=wt),
         }
 
     alpha = (1 - ci) / 2
