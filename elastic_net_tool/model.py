@@ -19,7 +19,10 @@ try:
 except ImportError as e:
     raise ImportError("glum is required: pip install glum") from e
 
-from .variable import Preprocessor, VariableConfig, default_config, make_bin_labels
+from .variable import (
+    FittedBinnedNumericParams, FittedCategoricalParams, FittedParams,
+    Preprocessor, VariableConfig, default_config, make_bin_labels,
+)
 
 _ZERO_THRESHOLD = 1e-10
 
@@ -52,23 +55,23 @@ def _resolve_level_arr(
     Xt: Optional[pl.DataFrame],
     cols_set: set,
     n: int,
-    p: Optional[Dict[str, Any]],
+    p: Optional[FittedParams],
 ) -> np.ndarray:
     if p is None:
         return np.array(X[V].cast(pl.String).to_list(), dtype=object)
 
-    if p.get("is_categorical") and p.get("encoding") == "onehot":
-        dropped = p.get("dropped_category", "")
+    if isinstance(p, FittedCategoricalParams) and p.encoding == "onehot":
+        dropped = p.dropped_category or ""
         level_arr = np.full(n, dropped, dtype=object)
-        for cat in p["categories"]:
+        for cat in p.categories:
             feat = f"{V}_{cat}"
             if feat in cols_set:
                 level_arr[Xt[feat].to_numpy().astype(bool)] = str(cat)
         return level_arr
 
-    if "bin_edges" in p:
-        dropped_bin = p.get("dropped_bin", 0)
-        all_labels = p.get("bin_labels")
+    if isinstance(p, FittedBinnedNumericParams):
+        dropped_bin = p.dropped_bin
+        all_labels = p.bin_labels
         base_lbl = all_labels[dropped_bin]
         level_arr = np.full(n, base_lbl, dtype=object)
         missing_feat = f"{V}_missing"

@@ -1,129 +1,37 @@
-"""Variable configuration and preprocessing pipeline (polars backend)."""
+"""Variable configuration and robust, fitted preprocessing (polars backend)."""
 
 from __future__ import annotations
 
 import string
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 import polars as pl
 
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
 MISSING_SENTINEL: float = -999_999_999.0
-"""Sentinel value used to indicate 'missing' in continuous variables during binning."""
-
-_CAT_MISSING: str = "__MISSING__"
-"""Placeholder used to represent missing values in categorical columns before imputation."""
-
-# Polars numeric dtypes
-_NUMERIC_DTYPES = frozenset({
-    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-    pl.Float32, pl.Float64,
-})
+_CAT_MISSING = "__MISSING__"
+_NUMERIC_DTYPES = frozenset({pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8,
+    pl.UInt16, pl.UInt32, pl.UInt64, pl.Float32, pl.Float64})
+_IMPUTE_STRATEGIES = frozenset({"median", "mean", "most_frequent", "constant"})
 
 
 def _is_str_or_cat(dtype: pl.PolarsDataType) -> bool:
-    """Return True for string / categorical polars dtypes."""
     return dtype not in _NUMERIC_DTYPES and dtype not in (pl.Boolean, pl.Date,
-                                                           pl.Datetime, pl.Duration,
-                                                           pl.Time, pl.Null)
+        pl.Datetime, pl.Duration, pl.Time, pl.Null)
 
 
 def _is_sentinel(arr: np.ndarray) -> np.ndarray:
-    """Return a boolean mask where *arr* equals MISSING_SENTINEL (within floating-point tolerance)."""
     return np.isclose(arr, MISSING_SENTINEL, rtol=0, atol=1.0)
 
 
-# ── Configuration dataclass ───────────────────────────────────────────────────
-
 @dataclass
 class VariableConfig:
+    """Declarative preprocessing configuration for one output variable.
+
+    ``custom_transform`` receives a Polars DataFrame containing ``input_cols``
+    (or ``[col]``) and must return one scalar value per input row.
     """
-    Preprocessing configuration for one model variable (or derived variable).
-
-    Single-column usage
-    -------------------
-    Set ``col`` to the source column name.  All transforms operate on that
-    column.
-
-    Multi-column derived variable
-    -----------------------------
-    Set ``col`` to the *output* name and ``input_cols`` to the list of source
-    columns.  ``custom_transform`` is then called as::
-
-        custom_transform(arr_col1, arr_col2, ...) -> np.ndarray
-
-    where each positional argument is the numpy array for the corresponding
-    entry in ``input_cols``.  The result is treated as a new numeric (or
-    categorical, if ``is_categorical=True``) column named ``col``.
-
-    Parameters
-    ----------
-    col : str
-        Output variable name (also the source column when ``input_cols`` is
-        ``None``).
-    input_cols : list of str, optional
-        Source columns for multi-input transforms.  When ``None``, ``col``
-        itself is the only input.
-    cap_lower : float, optional
-        Lower cap
-    cap_upper : float, optional
-        Upper cap
-    log_transform : bool
-        Apply log1p after capping.
-    impute_strategy : str, optional
-        ``'median'``, ``'mean'``, ``'most_frequent'``, ``'constant'``, or
-        ``None`` (leave nulls in place).
-    impute_value : scalar, optional
-        Fill value for ``impute_strategy='constant'``.
-    n_bins : int, optional
-        Number of *quantile-based* bins for a continuous variable.  Ignored
-        when ``bin_edges`` is supplied.
-    bin_edges : list of float, optional
-        Explicit breakpoints for binning (e.g. ``[0, 2, 5, 10, 20]``).
-        Takes precedence over ``n_bins``.  The column is one-hot encoded
-        after binning.  Any value equal to :data:`MISSING_SENTINEL` gets its
-        own ``{col}_missing`` dummy column.
-    standardize : bool
-        Standardise the variable after caps / log.  Ignored when binning.
-    degree : int
-        Polynomial degree for continuous (unbinned) variables.  ``1`` (default)
-        means no expansion.  ``2`` adds a squared term (``col^2``), ``3`` adds
-        cubic (``col^3``), etc.  Ignored when ``bin_edges`` / ``n_bins`` is set
-        or for categorical variables.  Standardisation is applied to the base
-        value first; higher-degree terms are powers of the standardised value.
-    encoding : {'auto', 'onehot', None}
-        Encoding for categorical variables.  ``'auto'`` detects from dtype.
-    is_categorical : bool, optional
-        Force categorical treatment.  ``None`` auto-detects from dtype.
-    right_closed: bool
-        When binning, whether bins include the right edge (``(lo, hi]``) or left
-    custom_transform : callable, optional
-        May be a **named function** or a lambda.  Any callable is accepted.
-
-        **Numeric** single-col: ``f(arr: np.ndarray, **kw) -> np.ndarray``,
-        applied before capping / log / binning.
-
-        **Categorical** single-col: ``f(val: Any, **kw) -> Any``, applied
-        element-wise before encoding (can remap/group categories).
-
-        **Multi-col** (``input_cols`` set): ``f(*arrays, **kw) -> np.ndarray``,
-        called once with each input column's numpy array as positional args.
-    transform_kwargs : dict, optional
-        Keyword arguments forwarded to ``custom_transform`` on every call.
-        Useful for passing parameters to a named function without a closure::
-
-            def scale(arr, factor=1.0):
-                return arr / factor
-
-            VariableConfig('mileage', custom_transform=scale,
-                           transform_kwargs={'factor': 1000})
-    """
-
     col: str
     input_cols: Optional[List[str]] = None
     cap_lower: Optional[float] = None
@@ -137,573 +45,376 @@ class VariableConfig:
     degree: int = 1
     encoding: Optional[str] = "auto"
     is_categorical: Optional[bool] = None
-    right_closed: Optional[bool] = False
+    right_closed: bool = False
     custom_transform: Optional[Callable[..., Any]] = None
     transform_kwargs: Optional[Dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.col, str) or not self.col.strip():
+            raise ValueError("VariableConfig.col must be a non-empty string.")
+        if self.input_cols is not None:
+            if not self.input_cols or any(not isinstance(c, str) or not c for c in self.input_cols):
+                raise ValueError(f"Variable '{self.col}' input_cols must be non-empty strings.")
+            if len(set(self.input_cols)) != len(self.input_cols):
+                raise ValueError(f"Variable '{self.col}' input_cols must not contain duplicates.")
+            if self.custom_transform is None:
+                raise ValueError(f"Variable '{self.col}' has input_cols but no custom_transform.")
+        if self.custom_transform is not None and not callable(self.custom_transform):
+            raise TypeError(f"Variable '{self.col}' custom_transform must be callable.")
+        if self.transform_kwargs is not None and not isinstance(self.transform_kwargs, dict):
+            raise TypeError(f"Variable '{self.col}' transform_kwargs must be a dict or None.")
+        if self.impute_strategy not in _IMPUTE_STRATEGIES | {None}:
+            raise ValueError(f"Variable '{self.col}' has unsupported impute_strategy {self.impute_strategy!r}.")
+        if self.impute_strategy == "constant" and self.impute_value is None:
+            raise ValueError(f"Variable '{self.col}' requires impute_value for constant imputation.")
+        if self.encoding not in {"auto", "onehot", None}:
+            raise ValueError(f"Variable '{self.col}' encoding must be 'auto', 'onehot', or None.")
+        if not isinstance(self.degree, int) or isinstance(self.degree, bool) or self.degree < 1:
+            raise ValueError(f"Variable '{self.col}' degree must be a positive integer.")
+        if self.n_bins is not None and (not isinstance(self.n_bins, int) or isinstance(self.n_bins, bool) or self.n_bins < 2):
+            raise ValueError(f"Variable '{self.col}' n_bins must be an integer >= 2.")
+        if self.n_bins is not None and self.bin_edges is not None:
+            raise ValueError(f"Variable '{self.col}' cannot set both n_bins and bin_edges.")
+        for name, value in (("cap_lower", self.cap_lower), ("cap_upper", self.cap_upper)):
+            if value is not None and (not np.isscalar(value) or not np.isfinite(float(value))):
+                raise ValueError(f"Variable '{self.col}' {name} must be finite when supplied.")
+        if self.cap_lower is not None and self.cap_upper is not None and self.cap_lower > self.cap_upper:
+            raise ValueError(f"Variable '{self.col}' cap_lower cannot exceed cap_upper.")
+        if self.bin_edges is not None:
+            edges = np.asarray(self.bin_edges, dtype=float)
+            if edges.ndim != 1 or len(edges) == 0 or not np.all(np.isfinite(edges)) or not np.all(np.diff(edges) > 0):
+                raise ValueError(f"Variable '{self.col}' bin_edges must be a non-empty, finite, strictly increasing sequence.")
+            self.bin_edges = edges.tolist()
 
-# ── Default config ────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class FittedVariableParams:
+    is_categorical: bool
+    impute_val: Optional[Union[float, str]]
+
+
+@dataclass(frozen=True)
+class FittedCategoricalParams(FittedVariableParams):
+    encoding: Optional[Literal["onehot"]]
+    categories: tuple[str, ...] = ()
+    dropped_category: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FittedNumericParams(FittedVariableParams):
+    cap_lower_val: Optional[float] = None
+    cap_upper_val: Optional[float] = None
+    right_closed: bool = False
+    std_mean: Optional[float] = None
+    std_std: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class FittedBinnedNumericParams(FittedNumericParams):
+    bin_edges: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    bin_labels: tuple[str, ...] = ()
+    dropped_bin: int = 0
+    has_sentinel_bin: bool = False
+
+
+FittedParams = Union[FittedCategoricalParams, FittedNumericParams, FittedBinnedNumericParams]
+
 
 def default_config(col: str, s: pl.Series) -> VariableConfig:
-    """Return a sensible default :class:`VariableConfig` based on dtype."""
     if _is_str_or_cat(s.dtype):
-        return VariableConfig(
-            col=col,
-            log_transform=False,
-            impute_strategy="most_frequent",
-            encoding="auto",
-            is_categorical=True,
-        )
-    return VariableConfig(
-        col=col,
-        is_categorical=False,
-    )
+        return VariableConfig(col=col, impute_strategy="most_frequent", encoding="auto", is_categorical=True)
+    return VariableConfig(col=col, is_categorical=False)
 
 
-# ── Binning helpers ───────────────────────────────────────────────────────────
-
-def compute_quantile_bin_edges(
-    arr: np.ndarray, n_bins: int, weights: Optional[np.ndarray] = None
-) -> np.ndarray:
-    """
-    Compute quantile-based bin edges from *arr*, excluding sentinel/NaN values.
-    Returns a monotone array of at least 2 unique values.
-    """
-    valid_mask = (arr != MISSING_SENTINEL) & np.isfinite(arr)
-    valid = arr[valid_mask]
-    if len(valid) == 0:
-        return np.array([-np.inf, np.inf])
-
-    percentiles = np.linspace(0, 100, n_bins + 1)
+def compute_quantile_bin_edges(arr: np.ndarray, n_bins: int, weights: Optional[np.ndarray] = None) -> np.ndarray:
+    if not isinstance(n_bins, int) or n_bins < 2:
+        raise ValueError("n_bins must be an integer >= 2.")
+    values = np.asarray(arr, dtype=float)
+    if values.ndim != 1:
+        raise ValueError("arr must be one-dimensional.")
+    valid_mask = np.isfinite(values) & ~_is_sentinel(values)
+    valid = values[valid_mask]
     if weights is not None:
-        w_valid = np.asarray(weights, dtype=float)[valid_mask]
-        edges = np.unique(np.percentile(valid, percentiles, weights=w_valid, method="inverted_cdf"))
+        w = _validate_weights(weights, len(values))
+        w_valid = w[valid_mask]
     else:
-        edges = np.unique(np.percentile(valid, percentiles))
-
+        w_valid = None
+    if not len(valid):
+        return np.array([-np.inf, np.inf])
+    percentiles = np.linspace(0, 100, n_bins + 1)
+    edges = np.unique(np.percentile(valid, percentiles, weights=w_valid, method="inverted_cdf")) if w_valid is not None else np.unique(np.percentile(valid, percentiles))
     if len(edges) < 2:
-        mn, mx = float(valid.min()), float(valid.max())
-        edges = np.array([mn - 1e-9, mx + 1e-9])
+        value = float(valid[0])
+        return np.array([value - 1e-9, value + 1e-9])
     return edges
 
 
-# def _fmt_edge(v: float) -> str:
-#     """Format a bin edge: no decimal point for whole numbers, else ≤3 decimal places."""
-#     if v == int(v):
-#         return str(int(v))
-#     return f"{v:.3f}".rstrip("0").rstrip(".")
+def _fmt(x: float, dec: int = 3) -> str:
+    return str(int(x)) if x == int(x) else format(round(x, dec), f",.{dec}f")
 
 
-# def _bin_letter(i: int) -> str:
-#     """0→'A', 1→'B', …, 25→'Z', 26→'AA', 27→'AB', …"""
-#     letters = string.ascii_uppercase
-#     if i < 26:
-#         return letters[i]
-#     return letters[i // 26 - 1] + letters[i % 26]
+def _bin_letter(index: int) -> str:
+    letters = string.ascii_uppercase
+    return letters[index] if index < 26 else letters[index // 26 - 1] + letters[index % 26]
 
 
-# def make_bin_labels(breaks: np.ndarray, right: bool = False, min_val: Optional[float] = None, max_val: Optional[float] = None) -> List[str]:
-#     """
-#     Return human-readable label strings for the n+1 bins defined by *n* break points.
+def make_bin_labels(breaks: Sequence[float], min_val: float, max_val: float, right: bool = False, dec: int = 3) -> List[str]:
+    edges = np.asarray(breaks, dtype=float)
+    if edges.ndim != 1 or not len(edges):
+        raise ValueError("breaks must be a non-empty one-dimensional sequence.")
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError("breaks must be strictly increasing.")
+    labels = [f"{_bin_letter(0)}_[{_fmt(float(min_val), dec)}, {_fmt(edges[0], dec)}{']' if right else ')'}"]
+    for i in range(1, len(edges)):
+        labels.append(f"{_bin_letter(i)}_{'(' if right else '['}{_fmt(edges[i - 1], dec)}, {_fmt(edges[i], dec)}{']' if right else ')'}")
+    labels.append(f"{_bin_letter(len(edges))}_({_fmt(edges[-1], dec)}, {_fmt(float(max_val), dec)}]")
+    return labels
 
-#     Labels:
-#       bin 0 (all below first break): ``'{letter}_<hi'``
-#       bins 1 … n-1 (interior):       ``'{letter}_[lo, hi)'`` or ``'{letter}_(lo, hi]'`` if right-closed
-#       bin n (all above last break):   ``'{letter}_lo+'``
-#     """
-#     n = len(breaks)
-#     if n == 0:
-#         return ["A_all"]
-#     labels: List[str] = []
-#     for i in range(n + 1):
-#         letter = _bin_letter(i)
-#         if i == 0:
-#             hi = _fmt_edge(float(breaks[0]))
-#             if min_val is not None and abs(min_val - breaks[0]) <= 1e-5:
-#                 labels.append(f"{letter}_{hi}")
-#             else:
-#                 symb = '<' if not right else '≤'
-#                 labels.append(f"{letter}_{symb}{hi}")
-#         elif i == n:
-#             lo = _fmt_edge(float(breaks[-1]))
-#             if max_val is not None and abs(max_val - breaks[i - 1]) <= 1e-5:
-#                 labels.append(f"{letter}_{lo}")
-#             else:
-#                 labels.append(f"{letter}_{lo}+")
-#         else:
-#             lo = _fmt_edge(float(breaks[i - 1]))
-#             l_sym = "[" if not right else '('
-#             hi = _fmt_edge(float(breaks[i]))
-#             h_sym = ")" if not right else ']'
-#             labels.append(f"{letter}_{l_sym}{lo}, {hi}{h_sym}")
-#     return labels
 
-def _fmt(x, dec=3):
-    if x == int(x):
-        return str(int(x))
-    return format(round(x, dec), f",.{dec}f")
-    
-def make_bin_labels(breaks, min_val, max_val, right=False, dec=3):
-    """
-    Generate labeled interval strings from internal break points,
-    producing open-ended first and last buckets.
+def _validate_weights(weights: np.ndarray, n_rows: int) -> np.ndarray:
+    arr = np.asarray(weights, dtype=float)
+    if arr.ndim != 1 or len(arr) != n_rows:
+        raise ValueError(f"weights must be one-dimensional with length {n_rows}.")
+    if not np.all(np.isfinite(arr)) or np.any(arr < 0) or arr.sum() <= 0:
+        raise ValueError("weights must be finite, non-negative, and have a positive total.")
+    return arr
 
-    Parameters
-    ----------
-    breaks : array-like of float
-        Internal break points only (sorted).
-    right : bool, default False
-        Whether intervals are right-closed.
-    decimals : int or None
-        Decimal places for formatting.
-
-    Returns
-    -------
-    list[str]
-    """
-
-    breaks = np.asarray(breaks, dtype=float)
-
-    out = []
-    ascii_val = 65  # 'A'
-    n = len(breaks)
-
-    # ---- FIRST bucket ----
-    label = chr(ascii_val)
-    out.append(f"{label}_[{_fmt(min_val, dec)}, {_fmt(breaks[0], dec)}{']' if right else ')'}")
-    ascii_val += 1
-
-    # ---- MIDDLE buckets (only if n > 1) ----
-    for i in range(1, n):
-        label = chr(ascii_val)
-
-        left_bracket = "(" if right else "["
-        right_bracket = "]" if right else ")"
-
-        # duplicate break adjustment
-        if i > 1 and breaks[i - 2] == breaks[i - 1]:
-            left_bracket = "("
-        if (i + 1) < n and breaks[i + 1] == breaks[i]:
-            right_bracket = ")"
-
-        if breaks[i - 1] == breaks[i]:
-            out.append(f"{label}_{_fmt(breaks[i], dec)}")
-        else:
-            out.append(
-                f"{label}_"
-                f"{left_bracket}{_fmt(breaks[i - 1], dec)}, {_fmt(breaks[i], dec)}"
-                f"{right_bracket}"
-            )
-        ascii_val += 1
-
-    # ---- LAST bucket ----
-    label = chr(ascii_val)
-    out.append(f"{label}_({_fmt(breaks[-1], dec)}, {_fmt(max_val, dec)}]")
-
-    return out
-
-# ── Preprocessor ─────────────────────────────────────────────────────────────
 
 class Preprocessor:
-    """
-    Fits variable transformations on training data and applies them to any
-    polars DataFrame with matching columns.
-
-    Parameters
-    ----------
-    configs : list of VariableConfig
-    """
-
+    """Fit and apply validated variable transformations to Polars DataFrames."""
     def __init__(self, configs: List[VariableConfig]):
-        self.configs: Dict[str, VariableConfig] = {c.col: c for c in configs}
-        self._params: Dict[str, Dict[str, Any]] = {}
+        if not configs:
+            raise ValueError("Preprocessor requires at least one VariableConfig.")
+        if any(not isinstance(c, VariableConfig) for c in configs):
+            raise TypeError("configs must contain VariableConfig instances.")
+        if len({c.col for c in configs}) != len(configs):
+            raise ValueError("Preprocessor configs must have unique output names.")
+        self.configs = {c.col: c for c in configs}
+        self._params: Dict[str, FittedParams] = {}
         self.feature_names_: List[str] = []
         self._fitted = False
 
-    # ── Public API ───────────────────────────────────────────────────────
-
-    def fit(
-        self,
-        X: pl.DataFrame,
-        y: Optional[np.ndarray] = None,
-        weights: Optional[np.ndarray] = None,
-    ) -> "Preprocessor":
-        """
-        Learn transformation parameters from the training DataFrame.
-
-        Parameters
-        ----------
-        weights : np.ndarray, optional
-            Exposure weights used to select the reference (dropped) level when
-            one-hot encoding categorical variables.  The level with the highest
-            total weight is dropped.  When ``None``, the first level
-            alphabetically is dropped (legacy behaviour).
-        """
-        self._params = {}
-        for col, cfg in self.configs.items():
-            raw = self._resolve_raw_series(X, cfg)
-            self._params[col] = self._fit_col(raw, cfg, weights=weights)
+    def fit(self, X: pl.DataFrame, y: Optional[np.ndarray] = None, weights: Optional[np.ndarray] = None) -> "Preprocessor":
+        self._validate_X(X, "fit")
+        if len(X) == 0:
+            raise ValueError("Cannot fit a Preprocessor on an empty DataFrame.")
+        if y is not None and (np.asarray(y).ndim != 1 or len(y) != len(X)):
+            raise ValueError("y must be one-dimensional and aligned with X.")
+        w = _validate_weights(weights, len(X)) if weights is not None else None
+        self._params = {col: self._fit_col(self._resolve_raw_series(X, cfg), cfg, w) for col, cfg in self.configs.items()}
         self._compute_feature_names()
         self._fitted = True
         return self
 
     def transform(self, X: pl.DataFrame) -> pl.DataFrame:
-        """Apply fitted transformations. Returns design matrix as pl.DataFrame."""
         if not self._fitted:
             raise RuntimeError("Call fit() before transform().")
+        self._validate_X(X, "transform")
         out: Dict[str, np.ndarray] = {}
         for col, cfg in self.configs.items():
-            raw = self._resolve_raw_series(X, cfg)
-            self._transform_col(raw, cfg, self._params[col], out)
+            self._transform_col(self._resolve_raw_series(X, cfg), cfg, self._params[col], out)
         return pl.DataFrame(out)
 
-    def fit_transform(self, X: pl.DataFrame, y: Optional[np.ndarray] = None) -> pl.DataFrame:
-        return self.fit(X, y).transform(X)
+    def fit_transform(self, X: pl.DataFrame, y: Optional[np.ndarray] = None, weights: Optional[np.ndarray] = None) -> pl.DataFrame:
+        return self.fit(X, y=y, weights=weights).transform(X)
 
     def get_feature_names(self) -> List[str]:
+        if not self._fitted:
+            raise RuntimeError("Call fit() before requesting feature names.")
         return list(self.feature_names_)
 
-    # ── Raw series resolution ────────────────────────────────────────────
+    def _validate_X(self, X: pl.DataFrame, operation: str) -> None:
+        if not isinstance(X, pl.DataFrame):
+            raise TypeError(f"X for {operation} must be a polars DataFrame.")
+        required = {source for cfg in self.configs.values() for source in (cfg.input_cols or [cfg.col])}
+        missing = sorted(required - set(X.columns))
+        if missing:
+            raise ValueError(f"X for {operation} is missing required columns: {missing}.")
 
     def _resolve_raw_series(self, X: pl.DataFrame, cfg: VariableConfig) -> pl.Series:
-        """
-        Return the raw (pre-pipeline) series for *cfg*.
-
-        If ``cfg.custom_transform`` is set, it is called as
-        ``custom_transform(df, **transform_kwargs)`` where *df* is a
-        :class:`polars.DataFrame` containing only the relevant input columns
-        (``input_cols`` when set, otherwise ``[col]``).  The result is wrapped
-        as a :class:`pl.Series` named ``cfg.col``.
-
-        For multi-input configs without a custom_transform a ``ValueError`` is
-        raised, since there is no meaningful default combination.
-        """
-        if cfg.custom_transform is not None:
-            cols = cfg.input_cols if cfg.input_cols is not None else [cfg.col]
+        if cfg.custom_transform is None:
+            return X[cfg.col]
+        cols = cfg.input_cols or [cfg.col]
+        try:
             result = cfg.custom_transform(X.select(cols), **(cfg.transform_kwargs or {}))
-            return pl.Series(cfg.col, result)
-        if cfg.input_cols is not None:
-            raise ValueError(
-                f"Variable '{cfg.col}' has input_cols but no custom_transform."
-            )
-        return X[cfg.col]
+        except Exception as exc:
+            raise ValueError(f"custom_transform for variable '{cfg.col}' failed: {exc}") from exc
+        arr = np.asarray(result)
+        if arr.ndim != 1 or len(arr) != len(X):
+            raise ValueError(f"custom_transform for variable '{cfg.col}' must return one value per row ({len(X)}); got shape {arr.shape}.")
+        return pl.Series(cfg.col, result)
 
-    # ── Fitting ──────────────────────────────────────────────────────────
+    def _fit_col(self, s: pl.Series, cfg: VariableConfig, weights: Optional[np.ndarray]) -> FittedParams:
+        is_cat = _is_str_or_cat(s.dtype) if cfg.is_categorical is None else cfg.is_categorical
+        if is_cat:
+            if cfg.n_bins is not None or cfg.bin_edges is not None or cfg.standardize or cfg.degree != 1 or cfg.log_transform or cfg.cap_lower is not None or cfg.cap_upper is not None:
+                raise ValueError(f"Categorical variable '{cfg.col}' cannot use numeric transforms or binning.")
+            return self._fit_cat(s, cfg, weights)
+        if cfg.encoding not in {"auto", None}:
+            raise ValueError(f"Numeric variable '{cfg.col}' cannot use encoding={cfg.encoding!r}.")
+        return self._fit_num(s, cfg, weights)
 
-    def _fit_col(
-        self,
-        s: pl.Series,
-        cfg: VariableConfig,
-        weights: Optional[np.ndarray] = None,
-    ) -> Dict[str, Any]:
-        p: Dict[str, Any] = {}
-        p["is_categorical"] = _is_str_or_cat(s.dtype) if cfg.is_categorical is None else cfg.is_categorical
-        p['right_closed'] = cfg.right_closed
+    def _fit_cat(self, s: pl.Series, cfg: VariableConfig, weights: Optional[np.ndarray]) -> FittedCategoricalParams:
+        impute_val = self._fit_cat_impute(s, cfg)
+        encoding: Optional[Literal["onehot"]] = "onehot" if cfg.encoding in {"auto", "onehot"} else None
+        vals = self._normalize_cat_vals(s, impute_val)
+        if any(v == _CAT_MISSING for v in vals):
+            raise ValueError(f"Categorical variable '{cfg.col}' has missing values but no usable imputation strategy.")
+        cats = tuple(sorted(set(vals)))
+        if not cats:
+            raise ValueError(f"Categorical variable '{cfg.col}' has no observed categories after imputation.")
+        dropped = self._max_weight_category(vals, cats, weights)
+        return FittedCategoricalParams(True, impute_val, encoding, tuple(c for c in cats if c != dropped), dropped)
 
-        if p["is_categorical"]:
-            p["impute_val"] = self._fit_cat_impute(s, cfg)
-
-            enc = "onehot" if cfg.encoding in ("auto", "onehot") else None
-            p["encoding"] = enc
-
-            if enc == "onehot":
-                # s already has custom_transform applied (via _resolve_raw_series)
-                raw_arr = s.cast(pl.Utf8, strict=False).fill_null(_CAT_MISSING)
-                cats = raw_arr.filter(~raw_arr.is_in([_CAT_MISSING, "None", None])).unique().sort()
-                drop_cat = self._max_weight_category(raw_arr, cats, weights)
-                p["categories"] = [c for c in cats if c != drop_cat]
-                p["dropped_category"] = drop_cat
-            else:
-                p["categories"] = []
-        else:
-            arr = self._to_float_array(s)
-            p["impute_val"] = self._fit_num_impute(arr, cfg)
-
-            imputed = arr.copy()
-            if p["impute_val"] is not None:
-                nan_mask = ~np.isfinite(imputed) | _is_sentinel(imputed)
-                imputed[nan_mask] = p["impute_val"]
-
-            # Cap bounds (on imputed values, ignoring sentinel)
-            if cfg.cap_lower is not None:
-                p["cap_lower_val"] = float(cfg.cap_lower)
-            if cfg.cap_upper is not None:
-                p["cap_upper_val"] = float(cfg.cap_upper)
-
-            transformed = self._apply_num_transforms(imputed, cfg, p)
-
-            w_arr = weights if weights is not None else None
-            breaks: Optional[np.ndarray] = None
-            if cfg.bin_edges is not None:
-                breaks = np.asarray(cfg.bin_edges, dtype=float)
-            elif cfg.n_bins is not None and cfg.n_bins > 0:
-                full_edges = compute_quantile_bin_edges(transformed, cfg.n_bins, weights=w_arr)
-                breaks = full_edges[1:-1]
-
-            if breaks is not None:
-                min_val, max_val = transformed.min(), transformed.max()
-                all_labels = make_bin_labels(breaks, min_val, max_val, p['right_closed'])
-                is_sent_tr = _is_sentinel(transformed)
-                ts = pl.Series("_v", transformed).set(pl.Series(is_sent_tr), None)
-                binned_labels = ts.cut(
-                    list(breaks), labels=all_labels, left_closed=not p['right_closed']
-                ).cast(pl.Utf8)
-                eff_w = w_arr if w_arr is not None else np.ones(len(transformed))
-                bin_weights = np.array([
-                    eff_w[(binned_labels == label).fill_null(False).to_numpy()].sum()
-                    for label in all_labels
-                ])
-                p["bin_edges"] = breaks
-                p["dropped_bin"] = int(bin_weights.argmax())
-                p["bin_labels"] = all_labels
-                p["has_sentinel_bin"] = bool(np.any(is_sent_tr))
-
-            if cfg.standardize and breaks is None:
-                valid_t = transformed[np.isfinite(transformed)]
-                p["std_mean"] = float(valid_t.mean()) if len(valid_t) else 0.0
-                p["std_std"] = max(float(valid_t.std()), 1e-10)
-
-        return p
+    def _fit_num(self, s: pl.Series, cfg: VariableConfig, weights: Optional[np.ndarray]) -> FittedParams:
+        arr = self._to_float_array(s, cfg.col)
+        impute_val = self._fit_num_impute(arr, cfg)
+        missing = ~np.isfinite(arr) | _is_sentinel(arr)
+        if missing.any() and impute_val is None and cfg.n_bins is None and cfg.bin_edges is None:
+            raise ValueError(f"Numeric variable '{cfg.col}' has missing values; configure imputation or binning.")
+        imputed = arr.copy()
+        if impute_val is not None:
+            imputed[missing] = impute_val
+        transformed = self._apply_num_transforms(imputed, cfg, cfg.cap_lower, cfg.cap_upper)
+        breaks = np.asarray(cfg.bin_edges, dtype=float) if cfg.bin_edges is not None else None
+        if cfg.n_bins is not None:
+            breaks = compute_quantile_bin_edges(transformed, cfg.n_bins, weights)
+            breaks = breaks[1:-1]
+        common = dict(is_categorical=False, impute_val=impute_val, cap_lower_val=cfg.cap_lower,
+                      cap_upper_val=cfg.cap_upper, right_closed=cfg.right_closed)
+        if breaks is not None:
+            if not len(breaks):
+                raise ValueError(f"Variable '{cfg.col}' cannot form bins from a constant or all-missing feature.")
+            valid = transformed[np.isfinite(transformed) & ~_is_sentinel(transformed)]
+            if not len(valid):
+                raise ValueError(f"Variable '{cfg.col}' has no finite values for binning.")
+            labels = tuple(make_bin_labels(breaks, float(valid.min()), float(valid.max()), cfg.right_closed))
+            sentinel = _is_sentinel(transformed)
+            cut = pl.Series(cfg.col, transformed).set(pl.Series(sentinel), None).cut(list(breaks), labels=list(labels), left_closed=not cfg.right_closed).cast(pl.String)
+            eff_weights = weights if weights is not None else np.ones(len(transformed))
+            bin_weights = np.array([eff_weights[(cut == label).fill_null(False).to_numpy()].sum() for label in labels])
+            return FittedBinnedNumericParams(**common, bin_edges=breaks, bin_labels=labels,
+                dropped_bin=int(bin_weights.argmax()), has_sentinel_bin=bool(sentinel.any()))
+        valid = transformed[np.isfinite(transformed) & ~_is_sentinel(transformed)]
+        mean = float(valid.mean()) if cfg.standardize and len(valid) else (0.0 if cfg.standardize else None)
+        std = max(float(valid.std()), 1e-10) if cfg.standardize and len(valid) else (1.0 if cfg.standardize else None)
+        return FittedNumericParams(**common, std_mean=mean, std_std=std)
 
     @staticmethod
-    def _detect_categorical(s: pl.Series, cfg: VariableConfig) -> bool:
-        if cfg.is_categorical is not None:
-            return cfg.is_categorical
-        # Multi-input result: rely on is_categorical flag
-        if cfg.input_cols is not None:
-            return False
-        return _is_str_or_cat(s.dtype)
-
-    @staticmethod
-    def _to_float_array(s: pl.Series) -> np.ndarray:
-        """Cast to float64 numpy array, converting nulls to sentinel value."""
-        return s.cast(pl.Float64, strict=False).fill_null(MISSING_SENTINEL).to_numpy(allow_copy=True)
+    def _to_float_array(s: pl.Series, col: str) -> np.ndarray:
+        try:
+            return s.cast(pl.Float64, strict=True).fill_null(MISSING_SENTINEL).to_numpy(allow_copy=True)
+        except Exception as exc:
+            raise ValueError(f"Numeric variable '{col}' cannot be cast to Float64.") from exc
 
     @staticmethod
     def _fit_num_impute(arr: np.ndarray, cfg: VariableConfig) -> Optional[float]:
-        # Exclude sentinel when computing impute value
-        strat = cfg.impute_strategy
-        if strat is None and cfg.impute_value is None:
-                return None
-        strat = strat or "constant"
-        
+        if cfg.impute_strategy is None:
+            return None
         valid = arr[np.isfinite(arr) & ~_is_sentinel(arr)]
-        if strat == "median":
-            return float(np.median(valid)) if len(valid) else 0.0
-        if strat == "mean":
-            return float(np.mean(valid)) if len(valid) else 0.0
-        if strat == "most_frequent":
+        if cfg.impute_strategy == "median": return float(np.median(valid)) if len(valid) else 0.0
+        if cfg.impute_strategy == "mean": return float(np.mean(valid)) if len(valid) else 0.0
+        if cfg.impute_strategy == "most_frequent":
             vals, counts = np.unique(valid, return_counts=True)
             return float(vals[counts.argmax()]) if len(vals) else 0.0
-        if strat == "constant":
-            return float(cfg.impute_value) if cfg.impute_value is not None else 0.0
-        return None
+        return float(cfg.impute_value)
 
     @staticmethod
     def _fit_cat_impute(s: pl.Series, cfg: VariableConfig) -> Optional[str]:
-        strat = cfg.impute_strategy or "most_frequent"
-        if strat == "most_frequent":
-            modes = s.drop_nulls().mode()
-            return modes.to_list()[0] if len(modes) else None
-        if strat == "constant" and cfg.impute_value is not None:
-            return str(cfg.impute_value)
+        strategy = cfg.impute_strategy or "most_frequent"
+        if strategy == "most_frequent":
+            modes = s.drop_nulls().cast(pl.String, strict=False).mode()
+            return str(modes[0]) if len(modes) else None
+        if strategy == "constant": return str(cfg.impute_value)
+        if strategy in {"mean", "median"}: raise ValueError(f"Categorical variable '{cfg.col}' cannot use {strategy} imputation.")
         return None
 
     @staticmethod
-    def _max_weight_category(
-        s: pl.Series,
-        cats: List[str],
-        weights: Optional[pl.Series],
-    ) -> str:
-        """
-        Return the category with the highest total weight.
-        Falls back to the first alphabetical category when *weights* is None.
-        """
-        if weights is None or len(cats) == 0:
-            return cats[0] if len(cats) > 0 else ""
-        s_str = s.cast(pl.Utf8).fill_null(_CAT_MISSING).to_list()
-
-        temp = pl.DataFrame({'vals': s_str, 'weights': weights})
-        temp_agg = temp.group_by(pl.col('vals')).sum()
-        temp_agg = temp_agg.sort('weights', descending=True)
-
-        return temp_agg['vals'][0]
+    def _max_weight_category(vals: List[str], cats: Sequence[str], weights: Optional[np.ndarray]) -> str:
+        if weights is None: return cats[0]
+        totals = {cat: 0.0 for cat in cats}
+        for value, weight in zip(vals, weights): totals[value] += float(weight)
+        return min(cats, key=lambda cat: (-totals[cat], cat))
 
     @staticmethod
-    def _apply_num_transforms(
-        arr: np.ndarray, cfg: VariableConfig, p: Dict[str, Any]
-    ) -> np.ndarray:
-        """Apply cap → log (no standardisation, ignores sentinel)."""
-        out = arr.copy()
-        is_sent = _is_sentinel(out)
-        if "cap_lower_val" in p:
-            out = np.where(is_sent, out, np.maximum(out, p["cap_lower_val"]))
-        if "cap_upper_val" in p:
-            out = np.where(is_sent, out, np.minimum(out, p["cap_upper_val"]))
+    def _apply_num_transforms(arr: np.ndarray, cfg: VariableConfig, cap_lower: Optional[float], cap_upper: Optional[float]) -> np.ndarray:
+        out = arr.copy(); sentinel = _is_sentinel(out)
+        if cap_lower is not None: out = np.where(sentinel, out, np.maximum(out, cap_lower))
+        if cap_upper is not None: out = np.where(sentinel, out, np.minimum(out, cap_upper))
         if cfg.log_transform:
-            assert np.min(out) > 0, "Cannot log values when any are 0 or negative"
-            out = np.where(is_sent, out, np.log(out))
+            valid = out[~sentinel]
+            if len(valid) and (not np.all(np.isfinite(valid)) or np.any(valid <= 0)):
+                raise ValueError(f"Variable '{cfg.col}' cannot apply log_transform to zero, negative, or non-finite values.")
+            out = np.where(sentinel, out, np.log(out))
         return out
-
-    # ── Transformation ───────────────────────────────────────────────────
-
-    def _transform_col(
-        self,
-        s: pl.Series,
-        cfg: VariableConfig,
-        p: Dict[str, Any],
-        out: Dict[str, np.ndarray],
-    ) -> None:
-        if p["is_categorical"]:
-            self._transform_cat(s, cfg, p, out)
-        else:
-            self._transform_num(s, cfg, p, out)
 
     @staticmethod
     def _normalize_cat_vals(s: pl.Series, impute_val: Optional[str]) -> List[str]:
-        """Cast *s* to strings, fill nulls, and apply categorical imputation."""
-        vals = s.cast(pl.Utf8, strict=False).fill_null(_CAT_MISSING).to_list()
-        if impute_val is not None:
-            return [str(impute_val) if str(v) in (_CAT_MISSING, "None") else str(v) for v in vals]
-        return [str(v) for v in vals]
+        vals = s.cast(pl.String, strict=False).fill_null(_CAT_MISSING).to_list()
+        return [str(impute_val) if str(v) in {_CAT_MISSING, "None"} and impute_val is not None else str(v) for v in vals]
 
-    def _transform_cat(
-        self,
-        s: pl.Series,
-        cfg: VariableConfig,
-        p: Dict[str, Any],
-        out: Dict[str, np.ndarray],
-    ) -> None:
-        vals = self._normalize_cat_vals(s, p.get("impute_val"))
+    def _transform_col(self, s: pl.Series, cfg: VariableConfig, p: FittedParams, out: Dict[str, np.ndarray]) -> None:
+        if isinstance(p, FittedCategoricalParams): self._transform_cat(s, cfg, p, out)
+        else: self._transform_num(s, cfg, p, out)
 
-        if p.get("encoding") == "onehot":
-            series = pl.Series(cfg.col, vals)
-            dummies = series.to_dummies()
-            for cat in p["categories"]:
-                col_name = f"{cfg.col}_{cat}"
-                if col_name in dummies.columns:
-                    out[col_name] = dummies[col_name].cast(pl.Float64).to_numpy()
-                else:
-                    out[col_name] = np.zeros(len(vals), dtype=float)
-        else:
-            out[cfg.col] = np.array(vals)
+    def _transform_cat(self, s: pl.Series, cfg: VariableConfig, p: FittedCategoricalParams, out: Dict[str, np.ndarray]) -> None:
+        vals = self._normalize_cat_vals(s, p.impute_val)
+        known = set(p.categories) | ({p.dropped_category} if p.dropped_category is not None else set())
+        unknown = sorted(set(vals) - known)
+        if unknown:
+            raise ValueError(f"Variable '{cfg.col}' contains unseen categorical levels: {unknown[:10]}.")
+        if p.encoding == "onehot":
+            for cat in p.categories: out[f"{cfg.col}_{cat}"] = (np.asarray(vals, dtype=object) == cat).astype(float)
+        else: out[cfg.col] = np.asarray(vals, dtype=object)
 
-    def _transform_num(
-        self,
-        s: pl.Series,
-        cfg: VariableConfig,
-        p: Dict[str, Any],
-        out: Dict[str, np.ndarray],
-    ) -> None:
-        arr = self._to_float_array(s)
-
-        # Identify sentinel values BEFORE imputation
-        is_sent = _is_sentinel(arr)
-
-        # Impute nulls/NaN (but NOT sentinel)
-        iv = p.get("impute_val")
-        if iv is not None:
-            nan_mask = ~np.isfinite(arr) & ~is_sent
-            arr[nan_mask] = iv
-
-        # Apply cap/log transforms (skips sentinel positions)
-        arr_t = self._apply_num_transforms(arr, cfg, p)
-
-        if "bin_edges" in p:
-            breaks = np.asarray(p["bin_edges"])
-            dropped_bin = p.get("dropped_bin", 0)
-            all_labels = p.get("bin_labels")
-            is_sent_b = _is_sentinel(arr_t)
-            s_cut = pl.Series(cfg.col, arr_t).set(pl.Series(is_sent_b), None)
-            labeled = s_cut.cut(
-                list(breaks), labels=all_labels, left_closed=not p['right_closed']
-            ).cast(pl.Utf8)
-
-            # Missing dummy (always present when binning to ensure consistent schema)
-            if p["has_sentinel_bin"]:
-                out[f"{cfg.col}_missing"] = is_sent_b.astype(float)
-
-            dummies = labeled.to_dummies()
-            for i, label in enumerate(all_labels):
-                if i == dropped_bin:
-                    continue
-                col_name = f"{cfg.col}_{label}"
-                if col_name in dummies.columns:
-                    out[col_name] = dummies[col_name].cast(pl.Float64).to_numpy()
-                else:
-                    out[col_name] = np.zeros(len(arr_t), dtype=float)
-        else:
-            if cfg.standardize and "std_mean" in p:
-                arr_t = (arr_t - p["std_mean"]) / p["std_std"]
-            out[cfg.col] = arr_t
-            for d in range(2, cfg.degree + 1):
-                out[f"{cfg.col}^{d}"] = arr_t ** d
-
-    # ── Feature names ────────────────────────────────────────────────────
+    def _transform_num(self, s: pl.Series, cfg: VariableConfig, p: Union[FittedNumericParams, FittedBinnedNumericParams], out: Dict[str, np.ndarray]) -> None:
+        arr = self._to_float_array(s, cfg.col); sentinel = _is_sentinel(arr); missing = ~np.isfinite(arr) | sentinel
+        if missing.any() and p.impute_val is not None: arr[missing] = float(p.impute_val); sentinel = _is_sentinel(arr)
+        if missing.any() and p.impute_val is None and not isinstance(p, FittedBinnedNumericParams):
+            raise ValueError(f"Numeric variable '{cfg.col}' contains missing values but was fitted without imputation.")
+        transformed = self._apply_num_transforms(arr, cfg, p.cap_lower_val, p.cap_upper_val)
+        if isinstance(p, FittedBinnedNumericParams):
+            sentinel = _is_sentinel(transformed)
+            labelled = pl.Series(cfg.col, transformed).set(pl.Series(sentinel), None).cut(list(p.bin_edges), labels=list(p.bin_labels), left_closed=not p.right_closed).cast(pl.String)
+            if p.has_sentinel_bin: out[f"{cfg.col}_missing"] = sentinel.astype(float)
+            for i, label in enumerate(p.bin_labels):
+                if i != p.dropped_bin: out[f"{cfg.col}_{label}"] = (labelled == label).fill_null(False).to_numpy().astype(float)
+            return
+        if p.std_mean is not None and p.std_std is not None: transformed = (transformed - p.std_mean) / p.std_std
+        out[cfg.col] = transformed
+        for degree in range(2, cfg.degree + 1): out[f"{cfg.col}^{degree}"] = transformed ** degree
 
     def _compute_feature_names(self) -> None:
         names: List[str] = []
         for col, cfg in self.configs.items():
-            p = self._params.get(col, {})
-            if p.get("is_categorical"):
-                if p.get("encoding") == "onehot":
-                    names.extend(f"{col}_{c}" for c in p.get("categories", []))
-                else:
-                    names.append(col)
-            elif "bin_edges" in p:
-                dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels")
-                if p.get("has_sentinel_bin"):
-                    names.append(f"{col}_missing")
-                for i, label in enumerate(all_labels):
-                    if i != dropped_bin:
-                        names.append(f"{col}_{label}")
+            p = self._params[col]
+            if isinstance(p, FittedCategoricalParams):
+                names.extend(f"{col}_{cat}" for cat in p.categories) if p.encoding == "onehot" else names.append(col)
+            elif isinstance(p, FittedBinnedNumericParams):
+                if p.has_sentinel_bin: names.append(f"{col}_missing")
+                names.extend(f"{col}_{label}" for i, label in enumerate(p.bin_labels) if i != p.dropped_bin)
             else:
-                names.append(col)
-                for d in range(2, cfg.degree + 1):
-                    names.append(f"{col}^{d}")
+                names.append(col); names.extend(f"{col}^{d}" for d in range(2, cfg.degree + 1))
         self.feature_names_ = names
 
     def get_bin_labels(self, col: str, s: pl.Series) -> pl.Series:
-        """Return human-readable bin-interval strings for a binned variable."""
-        p = self._params.get(col, {})
-        if "bin_edges" not in p:
-            raise ValueError(f"'{col}' has no bin edges.")
-        cfg = self.configs[col]
-        arr = self._to_float_array(s)
-        is_sent = _is_sentinel(arr)
-        arr_t = self._apply_num_transforms(arr, cfg, p)
-        breaks = np.asarray(p["bin_edges"])
-        all_labels = p.get("bin_labels")
-        s_cut = pl.Series(col, arr_t).set(pl.Series(is_sent), None)
-        labeled = s_cut.cut(
-            list(breaks), labels=all_labels, left_closed=not p['right_closed']
-        ).cast(pl.Utf8).fill_null("Missing")
-        return labeled.rename(col + "_label")
+        if not self._fitted or col not in self._params or not isinstance(self._params[col], FittedBinnedNumericParams):
+            raise ValueError(f"'{col}' has no fitted bin edges.")
+        cfg, p = self.configs[col], self._params[col]
+        assert isinstance(p, FittedBinnedNumericParams)
+        arr = self._to_float_array(s, col); sentinel = _is_sentinel(arr)
+        if p.impute_val is not None: arr[~np.isfinite(arr) | sentinel] = float(p.impute_val); sentinel = _is_sentinel(arr)
+        transformed = self._apply_num_transforms(arr, cfg, p.cap_lower_val, p.cap_upper_val)
+        return pl.Series(col, transformed).set(pl.Series(sentinel), None).cut(list(p.bin_edges), labels=list(p.bin_labels), left_closed=not p.right_closed).cast(pl.String).fill_null("Missing").rename(col + "_label")
 
     def get_level_labels(self, col: str, X: pl.DataFrame) -> pl.Series:
-            """
-            Return display label strings for *col* using fitted preprocessing params.
-
-            Handles binned numeric, categorical (with optional custom remap), and
-            multi-input derived variables.  Call this from plotting code instead of
-            ``get_bin_labels`` when the variable type is not known in advance.
-
-            Returns a pl.Series of strings aligned with *X*.
-            """
-            cfg = self.configs.get(col)
-            if cfg is None:
-                raise ValueError(f"'{col}' is not in preprocessor configs.")
-            p = self._params.get(col, {})
-            raw = self._resolve_raw_series(X, cfg)   # handles multi-input
-
-            if "bin_edges" in p:
-                return self.get_bin_labels(col, raw)
-
-            if p.get("is_categorical"):
-                vals = self._normalize_cat_vals(raw, p.get("impute_val"))
-                vals = ["Missing" if v == _CAT_MISSING else v for v in vals]
-                return pl.Series(col + "_label", vals)
-
-            # Continuous non-binned — return raw values as strings
-            return raw.cast(pl.Utf8).fill_null("Missing").rename(col + "_label")
+        if not self._fitted or col not in self.configs: raise ValueError(f"'{col}' is not in a fitted preprocessor.")
+        self._validate_X(X, "get_level_labels")
+        p, cfg = self._params[col], self.configs[col]; raw = self._resolve_raw_series(X, cfg)
+        if isinstance(p, FittedBinnedNumericParams): return self.get_bin_labels(col, raw)
+        if isinstance(p, FittedCategoricalParams):
+            vals = self._normalize_cat_vals(raw, p.impute_val); known = set(p.categories) | ({p.dropped_category} if p.dropped_category else set())
+            unknown = sorted(set(vals) - known)
+            if unknown: raise ValueError(f"Variable '{col}' contains unseen categorical levels: {unknown[:10]}.")
+            return pl.Series(col + "_label", ["Missing" if v == _CAT_MISSING else v for v in vals])
+        return raw.cast(pl.String).fill_null("Missing").rename(col + "_label")

@@ -15,6 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import polars as pl
 
+_SNAPSHOT_FORMAT_VERSION = 2
+
 
 def _extract_import_statements(fn: Callable) -> List[str]:
     """
@@ -186,6 +188,7 @@ def _make_snapshot(version, tool) -> Dict[str, Any]:
             safe_configs[col] = cfg
 
     return {
+        "format_version": _SNAPSHOT_FORMAT_VERSION,
         "version": {
             "name": version.name,
             "variables": version.variables,
@@ -275,6 +278,12 @@ def load_version(
 
     with open(path, "rb") as f:
         snapshot = pickle.load(f)
+
+    if snapshot.get("format_version") != _SNAPSHOT_FORMAT_VERSION:
+        raise ValueError(
+            "This model artifact predates the typed preprocessing-state format and "
+            "cannot be loaded. Refit and resave the model with the current version."
+        )
 
     # Reconstruct any custom_transform callables from their saved source code
     _restore_custom_transforms(snapshot)

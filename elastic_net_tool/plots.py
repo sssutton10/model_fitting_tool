@@ -11,7 +11,10 @@ import polars as pl
 import seaborn as sns
 
 from .metrics import double_lift_table, gini_coefficient, lift_table, _weighted_relativity
-from .variable import MISSING_SENTINEL, Preprocessor, _is_str_or_cat, compute_quantile_bin_edges, make_bin_labels
+from .variable import (
+    FittedBinnedNumericParams, FittedCategoricalParams, MISSING_SENTINEL,
+    Preprocessor, _is_str_or_cat, compute_quantile_bin_edges, make_bin_labels,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -70,8 +73,8 @@ def _resolve_level(
     columns and ``_bin_for_plot`` for continuous variables.
     """
     if preprocessor is not None and col in preprocessor.configs and breaks is None:
-        p = preprocessor._params.get(col, {})
-        if "bin_edges" in p or p.get("is_categorical"):
+        p = preprocessor._params.get(col)
+        if isinstance(p, (FittedBinnedNumericParams, FittedCategoricalParams)):
             return preprocessor.get_level_labels(col, X)
         elif preprocessor.configs[col].custom_transform:
             s = preprocessor.transform(X)[col]

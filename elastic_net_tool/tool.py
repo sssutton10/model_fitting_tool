@@ -23,7 +23,10 @@ from .plots import (
     univariate_plot,
     decile_lift_chart
 )
-from .variable import Preprocessor, VariableConfig, default_config, make_bin_labels
+from .variable import (
+    FittedBinnedNumericParams, FittedCategoricalParams, Preprocessor,
+    VariableConfig, default_config, make_bin_labels,
+)
 
 
 # ── Module-level helpers for relativities_table ───────────────────────────────
@@ -105,6 +108,7 @@ class ModelingTool:
         weight_col: Optional[str] = None,
         offset_col: Optional[str] = None,
         link: Any = None,
+        tweedie_power: float = 1.5,
         drop_reference: str = "max_weight",
         cv_column: Optional[str] = None,
         current_version: Optional[str] = None,
@@ -136,6 +140,19 @@ class ModelingTool:
         """
         if not isinstance(data, pl.DataFrame):
             raise TypeError(f"data must be a polars DataFrame, got {type(data).__name__}.")
+        if not isinstance(target_col, str) or target_col not in data.columns:
+            raise ValueError(f"target_col '{target_col}' not found in data.")
+        for name, col in (("weight_col", weight_col), ("offset_col", offset_col)):
+            if col is not None and col not in data.columns:
+                raise ValueError(f"{name} '{col}' not found in data.")
+            if col is not None and not data[col].dtype.is_numeric():
+                raise ValueError(f"{name} '{col}' must be numeric, got {data[col].dtype}.")
+        if not data[target_col].dtype.is_numeric():
+            raise ValueError(f"target_col '{target_col}' must be numeric, got {data[target_col].dtype}.")
+        if drop_reference not in {"max_weight", "first"}:
+            raise ValueError("drop_reference must be 'max_weight' or 'first'.")
+        if not isinstance(tweedie_power, (int, float)) or not np.isfinite(tweedie_power):
+            raise ValueError("tweedie_power must be finite.")
         if cv_column is not None and cv_column not in data.columns:
             raise ValueError(
                 f"cv_column '{cv_column}' not found in data.  "
@@ -148,6 +165,9 @@ class ModelingTool:
         self.drop_reference = drop_reference
         self.cv_column = cv_column
         self.link = link
+        self.tweedie_power = float(tweedie_power)
+        self.current_version = current_version
+        self.base_version = base_version
         self.variable_configs: Dict[str, VariableConfig] = {}
         self.model_versions: Dict[str, ModelVersion] = {}
 
@@ -175,6 +195,18 @@ class ModelingTool:
     def _offset_array(self) -> Optional[np.ndarray]:
         """Offset values as a float64 numpy array, or None if no offset column."""
         return self.data[self.offset_col].to_numpy().astype(float) if self.offset_col is not None else None
+
+    def _validate_training_inputs(self) -> None:
+        """Validate target, exposure, and offset arrays before model fitting."""
+        y = self._y_array
+        if len(y) == 0 or not np.all(np.isfinite(y)):
+            raise ValueError("target_col must contain at least one finite numeric value.")
+        weights = self._weights_array
+        if weights is not None and (not np.all(np.isfinite(weights)) or np.any(weights < 0) or weights.sum() <= 0):
+            raise ValueError("weight_col must contain finite non-negative values with a positive total.")
+        offset = self._offset_array
+        if offset is not None and (not np.all(np.isfinite(offset)) or len(offset) != len(y)):
+            raise ValueError("offset_col must contain finite values aligned with target_col.")
 
     # ── Variable management ───────────────────────────────────────────────────
 
@@ -221,6 +253,12 @@ class ModelingTool:
         If no arguments are provided, a default config is inferred from dtype.
         """
         if config is not None:
+            if not isinstance(config, VariableConfig):
+                raise TypeError("config must be a VariableConfig instance.")
+            if config.col != col:
+                raise ValueError("config.col must match the add_variable output name.")
+            if kwargs or input_cols is not None or custom_transform is not None:
+                raise ValueError("Pass either config or individual variable options, not both.")
             self.variable_configs[col] = config
             return self
 
@@ -475,6 +513,15 @@ class ModelingTool:
             ``cv_column`` exists, falls back to 5-fold CV.  Pass an explicit
             integer to override the ``cv_column`` for this specific fit.
         """
+        if not isinstance(variables, list) or not variables or any(not isinstance(v, str) or not v for v in variables):
+            raise ValueError("variables must be a non-empty list of variable names.")
+        if len(set(variables)) != len(variables):
+            raise ValueError("variables must not contain duplicates.")
+        if not isinstance(version, str) or not version:
+            raise ValueError("version must be a non-empty string.")
+        if version in self.model_versions:
+            raise ValueError(f"Version '{version}' already exists; choose a new version name.")
+        self._validate_training_inputs()
         if alpha is not None: 
             use_cv = False # No regularization, so no need for CV; ignore any cv argument passed
             resolved_cv = None
@@ -503,7 +550,7 @@ class ModelingTool:
             offset=self._offset_array,
             family=family,
             link=link or self.link,
-            tweedie_power=tweedie_power,
+            tweedie_power=tweedie_power if tweedie_power is not None else self.tweedie_power,
             preprocessor=preprocessor,
             alpha=alpha,
             l1_ratio=l1_ratio,
@@ -519,7 +566,7 @@ class ModelingTool:
 
         if print_summary:
             self.model_summary(version)
-        return None
+        return mv
 
     def fit_cv_stability(
         self,
@@ -597,9 +644,15 @@ class ModelingTool:
 
     def predict(self, data: pl.DataFrame, version: Optional[str] = None, missing_factor: float = 1.0, offset: Optional[np.ndarray] = None) -> np.ndarray:
         """Generate predictions for *data* using the specified model version."""
+        if not isinstance(data, pl.DataFrame):
+            raise TypeError("data must be a polars DataFrame.")
+        if not isinstance(missing_factor, (int, float)) or not np.isfinite(missing_factor):
+            raise ValueError("missing_factor must be finite.")
         mv = self._get_version(version or self.current_version)
         if offset is None:
-            offset = self.__offset_array
+            offset = data[self.offset_col].to_numpy().astype(float) if self.offset_col and self.offset_col in data.columns else None
+        elif np.asarray(offset).ndim != 1 or len(offset) != len(data) or not np.all(np.isfinite(offset)):
+            raise ValueError("offset must be a finite one-dimensional array aligned with data.")
 
         if isinstance(mv, FactorModelVersion):
             if mv.offset_col and mv.offset_col in data.columns and mv.offset_col != self.offset_col:
@@ -845,7 +898,7 @@ class ModelingTool:
     def _cat_var_rows(
         self,
         var_col: str,
-        p: Dict[str, Any],
+        p: FittedCategoricalParams,
         Xt_df: pl.DataFrame,
         w_arr: np.ndarray,
         total_w: float,
@@ -857,8 +910,8 @@ class ModelingTool:
         total_calib_w: float,
     ) -> List[Dict[str, Any]]:
         """Row dicts for one one-hot categorical variable."""
-        categories = p["categories"]
-        dropped = p.get("dropped_category")
+        categories = p.categories
+        dropped = p.dropped_category
         feats = [f"{var_col}_{cat}" for cat in categories]
 
         train_fw = _weighted_feat_map(Xt_df, feats, w_arr)
@@ -890,7 +943,7 @@ class ModelingTool:
     def _binned_var_rows(
         self,
         var_col: str,
-        p: Dict[str, Any],
+        p: FittedBinnedNumericParams,
         cfg: Any,
         Xt_df: pl.DataFrame,
         w_arr: np.ndarray,
@@ -903,9 +956,9 @@ class ModelingTool:
         total_calib_w: float,
     ) -> List[Dict[str, Any]]:
         """Row dicts for one binned numeric variable."""
-        edges = p["bin_edges"]
-        dropped_bin = p.get("dropped_bin", 0)
-        all_labels = p.get("bin_labels")
+        edges = p.bin_edges
+        dropped_bin = p.dropped_bin
+        all_labels = p.bin_labels
 
         missing_feat = f"{var_col}_missing"
         bin_feats = [
@@ -1012,15 +1065,15 @@ class ModelingTool:
         for var_col in mv.variables:
             if var_col not in prep.configs:
                 continue
-            p = prep._params.get(var_col, {})
+            p = prep._params.get(var_col)
             cfg = prep.configs[var_col]
 
-            if p.get("is_categorical") and p.get("encoding") == "onehot":
+            if isinstance(p, FittedCategoricalParams) and p.encoding == "onehot":
                 rows.extend(self._cat_var_rows(
                     var_col, p, Xt_df, w_arr, total_w, coef_map,
                     fold_names, fold_coef_map, Xt_calib, w_calib, total_calib_w,
                 ))
-            elif "bin_edges" in p:
+            elif isinstance(p, FittedBinnedNumericParams):
                 rows.extend(self._binned_var_rows(
                     var_col, p, cfg, Xt_df, w_arr, total_w, coef_map,
                     fold_names, fold_coef_map, Xt_calib, w_calib, total_calib_w,
@@ -1049,14 +1102,14 @@ class ModelingTool:
         for var_col in mv.variables:
             if var_col not in prep.configs:
                 continue
-            p = prep._params.get(var_col, {})
+            p = prep._params.get(var_col)
             cfg = prep.configs[var_col]
 
-            if p.get("is_categorical") and p.get("encoding") == "onehot":
-                feats = [f"{var_col}_{cat}" for cat in p["categories"]]
-            elif "bin_edges" in p:
-                dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels")
+            if isinstance(p, FittedCategoricalParams) and p.encoding == "onehot":
+                feats = [f"{var_col}_{cat}" for cat in p.categories]
+            elif isinstance(p, FittedBinnedNumericParams):
+                dropped_bin = p.dropped_bin
+                all_labels = p.bin_labels
                 feats = []
                 if f"{var_col}_missing" in Xt_df.columns:
                     feats.append(f"{var_col}_missing")
@@ -1115,17 +1168,17 @@ class ModelingTool:
         """Resolve level strings for one variable, mirroring FactorModelVersion.predict."""
         if V in mv.preprocessor_vars and Xt is not None:
             p = prep._params[V]
-            if p.get("is_categorical") and p.get("encoding") == "onehot":
-                dropped = p.get("dropped_category", "")
+            if isinstance(p, FittedCategoricalParams) and p.encoding == "onehot":
+                dropped = p.dropped_category or ""
                 level_arr = np.full(n, f"{dropped} (base)", dtype=object)
-                for cat in p["categories"]:
+                for cat in p.categories:
                     feat = f"{V}_{cat}"
                     if feat in Xt.columns:
                         level_arr[Xt[feat].to_numpy().astype(bool)] = str(cat)
                 return level_arr
-            if "bin_edges" in p:
-                dropped_bin = p.get("dropped_bin", 0)
-                all_labels = p.get("bin_labels")
+            if isinstance(p, FittedBinnedNumericParams):
+                dropped_bin = p.dropped_bin
+                all_labels = p.bin_labels
                 level_arr = np.full(n, f"{all_labels[dropped_bin]} (base)", dtype=object)
                 missing_feat = f"{V}_missing"
                 if missing_feat in Xt.columns:
