@@ -2,23 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, List
-
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import polars as pl
 import seaborn as sns
 
-from .metrics import double_lift_table, gini_coefficient, lift_table, _weighted_relativity
+from .metrics import (
+    _off_balance_by_state,
+    _weighted_relativity,
+    double_lift_table,
+    gini_coefficient,
+    lift_table,
+)
 from .variable import (
-    FittedBinnedNumericParams, FittedCategoricalParams, MISSING_SENTINEL,
-    Preprocessor, _is_str_or_cat, compute_quantile_bin_edges, make_bin_labels,
+    MISSING_SENTINEL,
+    FittedBinnedNumericParams,
+    FittedCategoricalParams,
+    Preprocessor,
+    _is_str_or_cat,
+    compute_quantile_bin_edges,
+    make_bin_labels,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_DEFAULT_FIG: Tuple[int, int] = (10, 5)
+_DEFAULT_FIG: tuple[int, int] = (10, 5)
 
 # Apply seaborn theme globally so all charts share a consistent aesthetic.
 sns.set_theme(style="whitegrid", palette="muted", font_scale=0.95)
@@ -26,7 +35,7 @@ sns.set_theme(style="whitegrid", palette="muted", font_scale=0.95)
 
 # ── Binning helper for plots ──────────────────────────────────────────────────
 
-def _bin_for_plot(s: pl.Series, n_bins: Optional[int] = 10, breaks: Optional[List[float]] = None) -> pl.Series:
+def _bin_for_plot(s: pl.Series, n_bins: int | None = 10, breaks: list[float] | None = None) -> pl.Series:
     """
     Bin a continuous pl.Series into quantile-based string labels.
 
@@ -57,9 +66,9 @@ def _bin_for_plot(s: pl.Series, n_bins: Optional[int] = 10, breaks: Optional[Lis
 def _resolve_level(
     col: str,
     X: pl.DataFrame,
-    preprocessor: Optional[Preprocessor],
-    n_bins: Optional[int] = 10,
-    breaks: Optional[List[float]] = None,
+    preprocessor: Preprocessor | None,
+    n_bins: int | None = 10,
+    breaks: list[float] | None = None,
 ) -> pl.Series:
     """
     Determine the level series for *col* in *X*.
@@ -110,7 +119,7 @@ def _bar_with_line(
     bar_color: str = "#9ecae1",
     line_color: str = "#e6550d",
     rotation: int = 45,
-    ref_line: Optional[float] = None,
+    ref_line: float | None = None,
 ) -> plt.Axes:
     """Seaborn bar + twinx line chart. Returns the secondary (line) Axes."""
     x = np.arange(len(x_labels))
@@ -142,7 +151,7 @@ def _weighted_agg(
     level: pl.Series,
     y: pl.Series,
     weight: pl.Series,
-    extra_series: Optional[Dict[str, pl.Series]] = None,
+    extra_series: dict[str, pl.Series] | None = None,
 ) -> pl.DataFrame:
     """
     Compute weighted mean of *y* (and optionally other series) by *level*.
@@ -172,19 +181,18 @@ def _weighted_agg(
 
     return summary
 
-
 # ── Univariate plot ───────────────────────────────────────────────────────────
 
 def univariate_plot(
     X: pl.DataFrame,
     y: pl.Series,
     col: str,
-    weights: Optional[pl.Series] = None,
-    n_bins: Optional[int] = 10,
-    breaks: Optional[List[float]] = None,
-    figsize: Optional[Tuple[int, int]] = None,
-    title: Optional[str] = None,
-    preprocessor: Optional[Preprocessor] = None,
+    weights: pl.Series | None = None,
+    n_bins: int | None = 10,
+    breaks: list[float] | None = None,
+    figsize: tuple[int, int] | None = None,
+    title: str | None = None,
+    preprocessor: Preprocessor | None = None,
 ) -> plt.Figure:
     """
     Univariate view of ``col`` vs the target ``y``.
@@ -228,13 +236,14 @@ def ae_chart(
     y: pl.Series,
     col: str,
     predictions: np.ndarray,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     n_bins: int = 10,
-    breaks: Optional[List[float]] = None,
-    figsize: Optional[Tuple[int, int]] = None,
-    title: Optional[str] = None,
+    breaks: list[float] | None = None,
+    figsize: tuple[int, int] | None = None,
+    title: str | None = None,
     version_name: str = "Model",
-    preprocessor: Optional[Preprocessor] = None,
+    preprocessor: Preprocessor | None = None,
+    state_column: str | None = None
 ) -> plt.Figure:
     """
     Actual vs Expected chart for ``col`` using the supplied model predictions.
@@ -248,6 +257,11 @@ def ae_chart(
     Pass *preprocessor* to use fitted bin edges/labels instead of re-binning.
     """
     w = weights if weights is not None else pl.Series("w", np.ones(len(X)))
+
+    if state_column is not None:
+        states = X[state_column]
+        predictions = _off_balance_by_state(predictions, weights, states)
+
     pred_s = pl.Series("_pred", predictions)
     level = _resolve_level(col, X, preprocessor, n_bins, breaks)
 
@@ -292,13 +306,13 @@ def residual_chart(
     y: pl.Series,
     col: str,
     predictions: np.ndarray,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     n_bins: int = 10,
-    breaks: Optional[List[float]] = None,
-    figsize: Optional[Tuple[int, int]] = None,
-    title: Optional[str] = None,
+    breaks: list[float] | None = None,
+    figsize: tuple[int, int] | None = None,
+    title: str | None = None,
     version_name: str = "Model",
-    preprocessor: Optional[Preprocessor] = None,
+    preprocessor: Preprocessor | None = None,
 ) -> plt.Figure:
     """
     Residual signal chart: ``mean_actual_rel / mean_predicted`` per variable level.
@@ -387,17 +401,22 @@ def double_lift_chart(
     y_true: np.ndarray,
     pred1: np.ndarray,
     pred2: np.ndarray,
-    weights: Optional[np.ndarray] = None,
+    weights: np.ndarray | None = None,
     n_buckets: int = 10,
     name1: str = "Model 1",
     name2: str = "Model 2",
-    figsize: Optional[Tuple[int, int]] = None
+    figsize: tuple[int, int] | None = None,
+    states: np.array | None = None
 ) -> plt.Figure:
     """
     Double lift chart comparing two models using equal-weight buckets.
 
     Sorted by pred1/pred2 ratio; each bucket has equal total exposure.
     """
+    if states is not None:
+        pred1 = _off_balance_by_state(pred1, weights, states)
+        pred2 = _off_balance_by_state(pred2, weights, states)
+
     tbl = double_lift_table(y_true, pred1, pred2, weights=weights, n_buckets=n_buckets)
     x = np.arange(len(tbl))
     xlabels = [str(b) for b in tbl["bucket"].to_list()]
@@ -439,10 +458,14 @@ def double_lift_chart(
 
 def decile_lift_chart(y_true: np.ndarray,
     pred: np.ndarray,
-    weights: Optional[np.ndarray] = None,
+    weights: np.ndarray | None = None,
     n_buckets: int = 10,
     title: str = "Model",
+    states: np.ndarray | None = None
     ) -> plt.Figure:
+
+    if states is not None:
+        pred = _off_balance_by_state(pred, weights, states)
 
     tbl = lift_table(y_true, pred, weights=weights, n_buckets=n_buckets)
     plot_data = tbl.select(['bucket', 'actual', 'predicted']).unpivot(index='bucket').to_pandas()
@@ -459,13 +482,86 @@ def decile_lift_chart(y_true: np.ndarray,
     return lc.get_figure()
 
 
+# ── Midpoint movement histogram ───────────────────────────────────────────────
+
+def midpoint_movement_histogram(
+    movements: np.ndarray,
+    weights: np.ndarray,
+    figsize: tuple[int, int] | None = None,
+    title: str | None = None,
+) -> plt.Figure:
+    """
+    Histogram of midpoint movements by bucket, showing percentage of premium and rows.
+
+    Buckets span <-55% to >=55% in 5-percentage-point increments (24 buckets total).
+    Movements should be expressed as decimals (e.g. 0.05 for a 5% increase).
+
+    Parameters
+    ----------
+    movements : array-like
+        Midpoint movement values as decimals, aligned with ``weights``.
+    weights : array-like
+        Premium weight for each observation.
+    figsize : tuple, optional
+        Figure size. Defaults to (16, 5).
+    title : str, optional
+        Chart title.
+
+    Returns
+    -------
+    plt.Figure
+    """
+    movements = np.asarray(movements, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    breaks = [i / 100 for i in range(-55, 60, 5)]  # -0.55, -0.50, ..., 0.55  (23 breaks → 24 buckets)
+
+    labels = [f"<{breaks[0]*100:.0f}%"]
+    for lo, hi in zip(breaks[:-1], breaks[1:]):
+        labels.append(f"[{lo*100:.0f}%, {hi*100:.0f}%)")
+    labels.append(f"≥{breaks[-1]*100:.0f}%")
+
+    # searchsorted with side='right': value == break goes into the higher bucket
+    bucket_idx = np.searchsorted(breaks, movements, side="right")
+
+    n_buckets = len(labels)
+    total_rows = len(movements)
+    total_premium = weights.sum()
+
+    pct_rows = np.zeros(n_buckets)
+    pct_premium = np.zeros(n_buckets)
+    for i in range(n_buckets):
+        mask = bucket_idx == i
+        pct_rows[i] = mask.sum() / total_rows * 100
+        pct_premium[i] = weights[mask].sum() / total_premium * 100
+
+    x = np.arange(n_buckets)
+    width = 0.4
+
+    fig, ax = plt.subplots(figsize=figsize or (16, 5))
+    ax.bar(x - width / 2, pct_premium, width, label="% Premium", color="#3182bd", alpha=0.85)
+    ax.bar(x + width / 2, pct_rows, width, label="% Rows", color="#e6550d", alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=10)
+    ax.set_ylabel("Percentage (%)", fontsize=10)
+    ax.set_xlabel("Midpoint Movement", fontsize=10)
+    ax.set_title(title or "Midpoint Movement Distribution", fontsize=14, fontweight="bold")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.1f}%"))
+    ax.legend(fontsize=11)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    return fig
+
+
 # ── Lorenz / Gini chart ───────────────────────────────────────────────────────
 
 def lorenz_chart(
     y_true: np.ndarray,
-    predictions_dict: Dict[str, np.ndarray],
-    weights: Optional[np.ndarray] = None,
-    figsize: Optional[Tuple[int, int]] = None,
+    predictions_dict: dict[str, np.ndarray],
+    weights: np.ndarray | None = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Lorenz curve for one or more model versions.
@@ -507,7 +603,7 @@ def coefficient_plot(
     coef_df: pl.DataFrame,
     version_name: str = "Model",
     top_n: int = 30,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Horizontal bar chart of model coefficients sorted by absolute value.
@@ -526,7 +622,7 @@ def coefficient_plot(
     )
 
     features = df["feature"].to_list()
-    values = df["coefficient"].to_numpy()
+    values = np.exp(df["coefficient"].to_numpy()) - 1
     colors = ["#e6550d" if v > 0 else "#3182bd" for v in values]
 
     fig, ax = plt.subplots(figsize=figsize or (9, max(4, len(features) * 0.35)))
@@ -537,6 +633,7 @@ def coefficient_plot(
         f"Coefficients — {version_name} (top {len(features)} by |coef|)",
         fontsize=11, fontweight="bold",
     )
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{x + 1:.2f}"))
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     return fig
@@ -547,7 +644,7 @@ def coefficient_plot(
 def cv_stability_plot(
     stability_df: pl.DataFrame,
     top_n: int = 20,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Box plot of coefficient values across CV folds.
@@ -572,16 +669,16 @@ def cv_stability_plot(
     }
     top_features = sorted(means_abs, key=means_abs.get, reverse=True)[:top_n]  # type: ignore[arg-type]
 
-    data = [fold_rows[f].cast(pl.Float64).drop_nulls().to_numpy() for f in top_features]
+    data = [np.exp(fold_rows[f].cast(pl.Float64).drop_nulls()) for f in top_features]
 
     fig, ax = plt.subplots(figsize=figsize or (max(8, len(top_features) * 0.6), 5))
     ax.boxplot(
         data, labels=top_features, patch_artist=True,
-        boxprops=dict(facecolor="#9ecae1", alpha=0.8),
-        medianprops=dict(color="#e6550d", linewidth=2),
-        whiskerprops=dict(linewidth=1.5),
+        boxprops={"facecolor": "#9ecae1", "alpha": 0.8},
+        medianprops={"color": "#e6550d", "linewidth": 2},
+        whiskerprops={"linewidth": 1.5},
     )
-    ax.axhline(0, color="gray", linestyle="--", linewidth=1)
+    ax.axhline(1, color="gray", linestyle="--", linewidth=1)
     ax.set_xticklabels(top_features, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Coefficient Value", fontsize=10)
     ax.set_title(
@@ -597,7 +694,7 @@ def cv_stability_plot(
 
 def metrics_bar_chart(
     metrics_df: pl.DataFrame,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Bar chart comparing key metrics across model versions.
@@ -647,7 +744,7 @@ def metrics_bar_chart(
 def interaction_heatmap(
     ranking_df: pl.DataFrame,
     top_n: int = 15,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Symmetric matrix heatmap of H-statistics from :func:`interaction_ranking`.
@@ -705,7 +802,7 @@ def pd_plot_2d(
     pd_data: pl.DataFrame,
     var1_name: str,
     var2_name: str,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Contour/heatmap of 2D partial dependence.
@@ -747,8 +844,8 @@ def pd_plot_2d(
 def importance_plot(
     importance_df: pl.DataFrame,
     top_n: int = 20,
-    title: Optional[str] = None,
-    figsize: Optional[Tuple[int, int]] = None,
+    title: str | None = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Horizontal bar chart of permutation importance with error bars.
@@ -784,12 +881,12 @@ def residual_heatmap(
     col1: str,
     col2: str,
     predictions: np.ndarray,
-    weights: Optional[pl.Series] = None,
-    preprocessor: Optional[Preprocessor] = None,
+    weights: pl.Series | None = None,
+    preprocessor: Preprocessor | None = None,
     n_bins: int = 8,
-    figsize: Optional[Tuple[int, int]] = None,
-    title: Optional[str] = None,
-) -> Tuple[plt.Figure, pl.DataFrame]:
+    figsize: tuple[int, int] | None = None,
+    title: str | None = None,
+) -> tuple[plt.Figure, pl.DataFrame]:
     """
     2D residual heatmap: actual/expected ratio across two variable dimensions.
 
@@ -904,7 +1001,7 @@ def residual_heatmap(
 def regularization_path_plot(
     path_df: pl.DataFrame,
     top_n: int = 20,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Plot coefficient evolution across regularization strengths.
@@ -956,7 +1053,7 @@ def regularization_path_plot(
 
 def overfitting_plot(
     monitor_df: pl.DataFrame,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Train vs CV metric across model versions.
@@ -995,8 +1092,8 @@ def overfitting_plot(
 
 def bootstrap_ci_plot(
     bootstrap_df: pl.DataFrame,
-    title: Optional[str] = None,
-    figsize: Optional[Tuple[int, int]] = None,
+    title: str | None = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Point estimates with confidence interval error bars.
@@ -1028,7 +1125,7 @@ def bootstrap_ci_plot(
 def relativities_ci_plot(
     relativities_df: pl.DataFrame,
     variable: str,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Relativity per level with bootstrap confidence interval error bars.
