@@ -157,6 +157,12 @@ The first positional argument is always the output variable name. For a derived
 variable like `"region"` created from `"state"`, use `input_cols=["state"]`
 rather than passing `"state"` as the first argument.
 
+Derived variables can depend on other registered derived variables to any
+depth. A downstream transform receives the upstream transform's raw result,
+before the upstream variable's capping, logging, binning, standardisation, or
+encoding. Only variables explicitly passed to `fit_model` are emitted as model
+features; other variables in the chain are construction dependencies.
+
 ### 2. Explore Variables and Breakpoints
 
 `ModelingTool` exposes univariate plotting and several breakpoint suggestion
@@ -285,6 +291,11 @@ tool metadata to rebuild a usable `ModelingTool` later. It also contains custom
 transform serialization support. Named functions are safer than lambdas because
 they can be inspected and reconstructed more reliably.
 
+For chained derived variables, the snapshot includes the fitted preprocessor's
+full dependency closure even when only the final variable is a model predictor.
+Both refit loading and frozen loading therefore reconstruct every upstream raw
+transform. Saving fails early if required transform source cannot be retrieved.
+
 ## Variable Configuration: `VariableConfig`
 
 `VariableConfig` is defined in `elastic_net_tool/variable.py`. It is a dataclass
@@ -356,6 +367,10 @@ because they document important modeling choices.
 matrix. It also records the learned transformation parameters needed to score
 new data consistently.
 
+Its optional `output_cols` argument separates emitted model variables from
+dependency-only configs. Raw derived columns are materialized recursively, but
+only `output_cols` are fitted and returned by `transform`.
+
 It has three main public methods:
 
 - `fit(X, y=None, weights=None)`
@@ -368,7 +383,8 @@ variable name. The feature order used by the model is stored in
 
 ### Fit-Time Responsibilities
 
-During `fit`, each configured variable goes through these steps:
+During `fit`, derived dependencies are materialized first. Each emitted
+variable then goes through these steps:
 
 1. Resolve the raw series.
 2. Apply `custom_transform` if present.
@@ -670,6 +686,8 @@ Practical guidance:
 - Prefer named transform functions over lambdas.
 - Keep transform dependencies importable.
 - Avoid relying on notebook-only local state inside custom transforms.
+- `ModelingTool.load(...)` refits on supplied data; `load_frozen(...)` restores
+  fitted state and may omit data when predictions will be requested later.
 
 Those habits make saved models easier to reload.
 

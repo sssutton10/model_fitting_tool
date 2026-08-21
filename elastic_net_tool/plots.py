@@ -45,9 +45,9 @@ def _bin_for_plot(s: pl.Series, n_bins: int | None = 10, breaks: list[float] | N
     that unregistered variables are displayed consistently.
     """
     arr = s.cast(pl.Float64, strict=False).fill_null(float("nan")).to_numpy(allow_copy=True)
+    is_missing = np.isnan(arr) | np.isclose(arr, MISSING_SENTINEL, rtol=0, atol=1.0)
 
     if breaks is None:
-        is_missing = np.isnan(arr) | np.isclose(arr, MISSING_SENTINEL, rtol=0, atol=1.0)
         valid = arr[~is_missing]
 
         if len(valid) == 0:
@@ -55,7 +55,7 @@ def _bin_for_plot(s: pl.Series, n_bins: int | None = 10, breaks: list[float] | N
 
         full_edges = compute_quantile_bin_edges(valid, n_bins)
         breaks = full_edges[1:-1]
-    all_labels = make_bin_labels(breaks, arr.min(), arr.max())
+    all_labels = make_bin_labels(breaks)
     s_float = pl.Series(s.name, arr).set(pl.Series(is_missing), None)
     labeled = s_float.cut(
         list(breaks), labels=all_labels, left_closed=True
@@ -81,19 +81,24 @@ def _resolve_level(
     Otherwise falls back to direct cast for categorical / low-cardinality
     columns and ``_bin_for_plot`` for continuous variables.
     """
-    if preprocessor is not None and col in preprocessor.configs and breaks is None:
-        p = preprocessor._params.get(col)
-        if isinstance(p, (FittedBinnedNumericParams, FittedCategoricalParams)):
+    if preprocessor is not None and col in preprocessor._params:
+        p = preprocessor._params[col]
+        if breaks is None and isinstance(
+            p, (FittedBinnedNumericParams, FittedCategoricalParams)
+        ):
             return preprocessor.get_level_labels(col, X)
         elif preprocessor.configs[col].custom_transform:
-            s = preprocessor.transform(X)[col]
+            if isinstance(p, FittedBinnedNumericParams):
+                s = preprocessor._materialize_raw_columns(X, [col])[col]
+            else:
+                s = preprocessor.transform(X)[col]
         else:
             s = X[col]
     else:
         s = X[col]
         
     # Continuous non-binned (including polynomial) — bin on the fly
-    if _is_str_or_cat(s.dtype) or s.n_unique() <= 10:
+    if breaks is None and (_is_str_or_cat(s.dtype) or s.n_unique() <= 10):
         return s.cast(pl.Utf8).fill_null("Missing")
     
     return _bin_for_plot(s, n_bins, breaks=breaks)

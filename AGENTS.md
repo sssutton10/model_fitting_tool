@@ -48,7 +48,10 @@ python -m pytest tests/test_variable.py::TestGetBinLabels::test_labels_have_lett
 
 ### `Preprocessor` internals
 
-`Preprocessor.fit(X, weights)` calls `_fit_col` per variable and stores results in `_params: Dict[str, Dict]`. `Preprocessor.transform(X)` calls `_transform_num` or `_transform_cat` per column and concatenates results.
+`Preprocessor` first materializes raw derived columns recursively. `output_cols`
+controls which configs are fitted into `_params` and emitted into the design
+matrix; other configs are dependency-only. `transform(X)` rebuilds the raw
+dependency graph, then transforms only `output_cols`.
 
 Key `_params[col]` keys:
 - **Numeric binned:** `bin_edges` (break points, no outer bounds), `bin_labels` (list of strings), `dropped_bin` (int index of heaviest-weight bin), `has_sentinel_bin`
@@ -71,10 +74,10 @@ def my_transform(df: pl.DataFrame, **kwargs) -> array-like:
 ```
 
 - `df` contains only the relevant columns: `[cfg.col]` for single-column, `cfg.input_cols` for multi-input.
-- Applied once in `_resolve_raw_series`, before any cap / log / binning.
+- Applied once per fit/transform materialization pass, before any cap / log / binning.
 - For categorical remapping, the output list/array of strings becomes the category labels.
 
-> ⚠️ The `VariableConfig` docstring and the `__init__.py` quick-start example still reference the old per-value / per-array signatures — ignore those, the code uses the DataFrame API above.
+The `VariableConfig` docstring and package quick-start use this DataFrame API.
 
 ### glum dependency
 
@@ -84,5 +87,6 @@ def my_transform(df: pl.DataFrame, **kwargs) -> array-like:
 
 - **`ModelVersion.train_predictions`**, not `.predictions` — all model versions (including `FactorModelVersion`) store predictions in `train_predictions`. There is no `.predictions` attribute.
 - **Derived variables with `input_cols`** — when creating a variable from a different source column (e.g. "region" from "state"), use `input_cols=["state"]` not `col="state"`. The first positional arg to `add_variable()` is always the output variable name AND the `col` param. Categorical detection is automatic from the transform's output dtype (string → categorical, numeric → continuous); `is_categorical=True` is only needed to force categorical treatment when the output dtype is numeric.
+- **Chained derived variables** — `input_cols` may name other registered derived variables. Downstream transforms receive the upstream raw custom-transform result, before the upstream cap/log/bin/encoding pipeline. Only variables explicitly requested by the model are emitted as predictors.
 - **`log_transform=True` and sentinels** — `_apply_num_transforms` checks `np.min(out) > 0` which includes sentinel values (`-999_999_999`). This means `log_transform=True` will always fail on columns with sentinel-encoded missings. Also fails if the column can contain 0.
 - **`np.percentile` with weights** — requires `method="inverted_cdf"` on numpy ≥ 2.0. The fix is already applied in `compute_quantile_bin_edges`.

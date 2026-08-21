@@ -43,7 +43,6 @@ from .plots import (
 from .variable import (
     FittedBinnedNumericParams,
     FittedCategoricalParams,
-    Preprocessor,
     VariableConfig,
     default_config,
 )
@@ -246,7 +245,7 @@ class ModelingTool:
                tool.add_variable(
                    'age_x_veh',
                    input_cols=['driver_age', 'vehicle_age'],
-                   custom_transform=lambda age, veh: age * veh,
+                   custom_transform=lambda df: df['driver_age'] * df['vehicle_age'],
                    cap_upper=0.99,
                )
 
@@ -254,7 +253,10 @@ class ModelingTool:
 
                tool.add_variable(
                    'state',
-                   custom_transform=lambda v: 'South' if v in ('TX', 'FL') else 'Other',
+                   custom_transform=lambda df: [
+                       'South' if v in ('TX', 'FL') else 'Other'
+                       for v in df['state']
+                   ],
                    encoding='onehot',
                )
 
@@ -270,10 +272,9 @@ class ModelingTool:
             Source columns for a derived variable built from multiple inputs.
             Must be paired with ``custom_transform``.
         custom_transform : callable, optional
-            Function applied to the raw column(s) before encoding.  For a
-            single-column variable it receives one Series; for multi-input
-            variables it receives one positional argument per column in
-            ``input_cols``.
+            Function called once with a DataFrame containing ``input_cols``
+            (or ``col`` for a single-column transform). Derived inputs are
+            resolved recursively and supplied as raw, pre-pipeline values.
         **kwargs
             Any :class:`~modeling_tool.variable.VariableConfig` field
             (e.g. ``n_bins``, ``bin_edges`` / ``breakpoints``, ``cap_upper``,
@@ -369,9 +370,17 @@ class ModelingTool:
         if version is not None:
             mv = self._get_version(version)
             preprocessor = getattr(mv, "preprocessor", None)
+            if col in self.variable_configs and (
+                preprocessor is None or col not in preprocessor._params
+            ):
+                preprocessor = _build_preprocessor(
+                    [col], self.data, self.variable_configs
+                )
+                preprocessor.fit(self.data, weights=self._weights_array)
         elif col in self.variable_configs:
-            dep_cfgs = self._dependency_configs(col)
-            preprocessor = Preprocessor(dep_cfgs + [self.variable_configs[col]])
+            preprocessor = _build_preprocessor(
+                [col], self.data, self.variable_configs
+            )
             preprocessor.fit(self.data, weights=self._weights_array)
         
         fig = univariate_plot(
@@ -386,17 +395,18 @@ class ModelingTool:
 
     def _data_with_derived_col(self, col: str) -> pl.DataFrame:
         """Return data guaranteed to contain *col*, deriving it via config if needed."""
-        if col in self.data.columns:
-            return self.data
         cfg = self.variable_configs.get(col)
-        if cfg is None or (cfg.input_cols is None and cfg.custom_transform is None):
+        if col in self.data.columns and (cfg is None or cfg.custom_transform is None):
+            return self.data
+        if cfg is None or cfg.custom_transform is None:
             raise ValueError(
                 f"Column '{col}' not found in data and has no derivable config "
-                "(add input_cols/custom_transform to the variable config)."
+                "(register input_cols and custom_transform for the new variable)."
             )
-        dep_cfgs = self._dependency_configs(col)
         stripped = self._strip_config(cfg)
-        prep = Preprocessor(dep_cfgs + [stripped])
+        configs = dict(self.variable_configs)
+        configs[col] = stripped
+        prep = _build_preprocessor([col], self.data, configs)
         prep.fit(self.data, weights=self._weights_array)
         return self.data.with_columns(prep.transform(self.data)[col])
 
@@ -770,8 +780,17 @@ class ModelingTool:
             raise ValueError("missing_factor must be finite.")
         mv = self._get_version(version or self.current_version)
         if offset is None:
-            offset = self._offset_array
-        elif np.asarray(offset).ndim != 1 or len(offset) != len(data) or not np.all(np.isfinite(offset)):
+            if self.offset_col is not None:
+                if self.offset_col not in data.columns:
+                    raise ValueError(
+                        f"offset column '{self.offset_col}' not found in scoring data."
+                    )
+                offset = data[self.offset_col].to_numpy().astype(float)
+        if offset is not None and (
+            np.asarray(offset).ndim != 1
+            or len(offset) != len(data)
+            or not np.all(np.isfinite(offset))
+        ):
             raise ValueError("offset must be a finite one-dimensional array aligned with data.")
 
         if isinstance(mv, FactorModelVersion):
@@ -1283,8 +1302,9 @@ class ModelingTool:
                 continue
 
             if cfg is not None:
-                dep_cfgs = self._dependency_configs(var)
-                temp_prep = Preprocessor(dep_cfgs + [cfg])
+                temp_prep = _build_preprocessor(
+                    [var], self.data, self.variable_configs
+                )
                 temp_prep.fit(self.data, weights=self._weights_array)
                 Xt_temp = temp_prep.transform(self.data)
                 p_temp = temp_prep._params.get(var)
@@ -1601,8 +1621,9 @@ class ModelingTool:
                         f"Variable '{var}' is not a data column and has no input_cols or "
                         "custom_transform; cannot resolve levels."
                     )
-                dep_cfgs = self._dependency_configs(var)
-                vprep = Preprocessor(dep_cfgs + [cfg])
+                vprep = _build_preprocessor(
+                    [var], self.data, self.variable_configs
+                )
                 vprep.fit(self.data, weights=self._weights_array)
                 level_series = _resolve_level(var, self.data, vprep, n_bins)
             else:
@@ -1664,9 +1685,8 @@ class ModelingTool:
         """
         mv = self._get_version(version or self.current_version)
         prep = getattr(mv, "preprocessor", None)
-        if col in self.variable_configs and (prep is None or col not in prep.configs):
-            dep_cfgs = self._dependency_configs(col)
-            prep = Preprocessor(dep_cfgs + [self.variable_configs[col]])
+        if col in self.variable_configs and (prep is None or col not in prep._params):
+            prep = _build_preprocessor([col], self.data, self.variable_configs)
             prep.fit(self.data, weights=self._weights_array)
         fig = ae_chart(
             X=self.data,
@@ -1721,9 +1741,8 @@ class ModelingTool:
         """
         mv = self._get_version(version or self.current_version)
         prep = getattr(mv, "preprocessor", None)
-        if col in self.variable_configs and (prep is None or col not in prep.configs):
-            dep_cfgs = self._dependency_configs(col)
-            prep = Preprocessor(dep_cfgs + [self.variable_configs[col]])
+        if col in self.variable_configs and (prep is None or col not in prep._params):
+            prep = _build_preprocessor([col], self.data, self.variable_configs)
             prep.fit(self.data, weights=self._weights_array)
         fig = residual_chart(
             X=self.data,
@@ -2094,13 +2113,19 @@ class ModelingTool:
             family=vs["family"],
             tweedie_power=vs["tweedie_power"],
             link=vs["link"],
+            gradient_tol=vs.get("gradient_tol"),
             print_summary=True,
         )
-        print(f"Loaded '{vs['name']}' from {filepath!r}, refitted as version 'v1'.")
+        loaded_name = version_name or vs["name"]
+        print(f"Loaded '{vs['name']}' from {filepath!r}, refitted as version '{loaded_name}'.")
         return tool
 
     @classmethod
-    def load_frozen(cls, filepath: str | Path, data: pl.DataFrame) -> ModelingTool:
+    def load_frozen(
+        cls,
+        filepath: str | Path,
+        data: pl.DataFrame | None = None,
+    ) -> ModelingTool:
         """
         Restore a saved version without refitting (prediction-only mode).
 
@@ -2111,26 +2136,33 @@ class ModelingTool:
         ----------
         filepath : str
             Path to the saved ``.pkl`` file.
-        data : pl.DataFrame
+        data : pl.DataFrame, optional
             Dataset used to compute ``train_predictions`` for the loaded
-            version.  Must contain all columns required by the saved model.
+            version. When omitted, the model is restored with empty training
+            predictions and can still score later via ``predict(data)``.
         """
+        if data is not None and not isinstance(data, pl.DataFrame):
+            raise TypeError("data must be a polars DataFrame or None.")
         bundle = load_version(filepath, data=None, refit=False)
         snap = bundle["snapshot"]
         vs = snap["version"]
         ts = snap["tool_settings"]
 
         tool = cls.__new__(cls)
-        tool.data = data.clone()
+        tool.data = data.clone() if data is not None else pl.DataFrame()
         tool.target_col = ts["target_col"]
         tool.weight_col = ts["weight_col"]
         tool.offset_col = ts.get("offset_col", None)
         tool.link = ts["link"]
+        tool.drop_reference = ts.get("drop_reference", "max_weight")
+        tool.cv_column = None
+        tool.current_version = "v1"
+        tool.base_version = None
         tool.variable_configs = ts["variable_configs"]
         tool.model_versions = {}
 
         offset_arr = None
-        if tool.offset_col is not None and tool.offset_col in data.columns:
+        if data is not None and tool.offset_col is not None and tool.offset_col in data.columns:
             offset_arr = data[tool.offset_col].cast(pl.Float64).to_numpy()
 
         if snap.get("version_type") == "factor":
@@ -2141,12 +2173,13 @@ class ModelingTool:
                 factor_table=vs["factor_table"],
                 preprocessor=vs["preprocessor"],
                 preprocessor_vars=vs["preprocessor_vars"],
-                train_predictions=np.ones(len(data)),  # placeholder; overwritten below
+                train_predictions=np.array([]),
                 offset_col=vs["offset_col"],
                 fit_info=vs.get("fit_info", {}),
             )
-            # FactorModelVersion.predict takes a response-scale offset, not log-scale
-            mv.train_predictions = mv.predict(data, offset=offset_arr)
+            if data is not None:
+                # FactorModelVersion.predict takes a response-scale offset, not log-scale
+                mv.train_predictions = mv.predict(data, offset=offset_arr)
         else:
             tool.family = vs["family"]
             from .model import ModelVersion as MV
@@ -2161,11 +2194,14 @@ class ModelingTool:
                 l1_ratio=vs["l1_ratio"],
                 family=vs["family"],
                 link=vs["link"],
-                train_predictions=None,
+                train_predictions=np.array([]),
                 fit_info=vs["fit_info"],
+                cv_stability=vs.get("cv_stability"),
                 tweedie_power=vs["tweedie_power"],
+                gradient_tol=vs.get("gradient_tol"),
             )
-            mv.train_predictions = mv.predict(data, offset=offset_arr)
+            if data is not None:
+                mv.train_predictions = mv.predict(data, offset=offset_arr)
 
         tool.model_versions["v1"] = mv
         print(f"Loaded frozen '{vs['name']}' from {filepath!r} as 'v1'.")
@@ -2714,11 +2750,25 @@ class ModelingTool:
         from .plots import residual_heatmap as _residual_heatmap
 
         mv = self._get_version(version or self.current_version)
+        prep = getattr(mv, "preprocessor", None)
+        analysis_cols = [col1, col2]
+        if any(
+            col in self.variable_configs
+            and (prep is None or col not in prep._params)
+            for col in analysis_cols
+        ):
+            configured_cols = [
+                col for col in analysis_cols if col in self.variable_configs
+            ]
+            prep = _build_preprocessor(
+                configured_cols, self.data, self.variable_configs
+            )
+            prep.fit(self.data, weights=self._weights_array)
         fig, data = _residual_heatmap(
             self.data, self._y, col1, col2,
             predictions=mv.train_predictions,
             weights=self._weights,
-            preprocessor=mv.preprocessor,
+            preprocessor=prep,
             n_bins=n_bins,
             **kwargs,
         )
@@ -3158,36 +3208,6 @@ class ModelingTool:
         if cfg.impute_strategy is None and (cfg.n_bins is not None or cfg.bin_edges is not None):
             strip_kwargs.update(impute_strategy="constant", impute_value=_SENTINEL)
         return _dc_replace(cfg, **strip_kwargs)
-
-    def _dependency_configs(self, col: str, _visited: frozenset | None = None) -> list[VariableConfig]:
-        """Return stripped configs for all upstream derived deps of col, in topological order."""
-        if _visited is None:
-            _visited = frozenset()
-        cfg = self.variable_configs.get(col)
-        if cfg is None or cfg.input_cols is None:
-            return []
-        result: list[VariableConfig] = []
-        seen: set[str] = set()
-        _visited = _visited | {col}
-        for inp in cfg.input_cols:
-            if inp in self.data.columns or inp in seen:
-                continue
-            if inp in _visited:
-                raise ValueError(f"Circular dependency detected in derived variable chain involving '{inp}'.")
-            inp_cfg = self.variable_configs.get(inp)
-            if inp_cfg is None:
-                raise ValueError(
-                    f"Input column '{inp}' for derived variable '{col}' is not in data "
-                    "and has no registered config. Register it with add_variable() first."
-                )
-            for dep_cfg in self._dependency_configs(inp, _visited):
-                if dep_cfg.col not in seen:
-                    result.append(dep_cfg)
-                    seen.add(dep_cfg.col)
-            if inp not in seen:
-                result.append(self._strip_config(inp_cfg))
-                seen.add(inp)
-        return result
 
     def _get_version(self, version: str) -> ModelVersion:
         if version not in self.model_versions:

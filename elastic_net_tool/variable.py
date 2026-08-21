@@ -53,13 +53,13 @@ class VariableConfig:
     Multi-column derived variable
     -----------------------------
     Set ``col`` to the *output* name and ``input_cols`` to the list of source
-    columns.  ``custom_transform`` is then called as::
+    columns. ``custom_transform`` is then called as::
 
-        custom_transform(arr_col1, arr_col2, ...) -> np.ndarray
+        custom_transform(df: pl.DataFrame, **kwargs) -> array-like
 
-    where each positional argument is the numpy array for the corresponding
-    entry in ``input_cols``.  The result is treated as a new numeric (or
-    categorical, if ``is_categorical=True``) column named ``col``.
+    ``df`` contains the columns in ``input_cols``. Inputs may themselves be
+    derived variables; they are resolved recursively, and their raw transform
+    results are supplied before their own preprocessing options are applied.
 
     Parameters
     ----------
@@ -105,20 +105,16 @@ class VariableConfig:
     custom_transform : callable, optional
         May be a **named function** or a lambda.  Any callable is accepted.
 
-        **Numeric** single-col: ``f(arr: np.ndarray, **kw) -> np.ndarray``,
-        applied before capping / log / binning.
-
-        **Categorical** single-col: ``f(val: Any, **kw) -> Any``, applied
-        element-wise before encoding (can remap/group categories).
-
-        **Multi-col** (``input_cols`` set): ``f(*arrays, **kw) -> np.ndarray``,
-        called once with each input column's numpy array as positional args.
+        Called once as ``f(df: pl.DataFrame, **kw) -> array-like``. For a
+        single-column transform, ``df`` contains ``col``. When ``input_cols``
+        is set, it contains those columns in configured order. The transform
+        runs before capping, logging, binning, or categorical encoding.
     transform_kwargs : dict, optional
         Keyword arguments forwarded to ``custom_transform`` on every call.
         Useful for passing parameters to a named function without a closure::
 
-            def scale(arr, factor=1.0):
-                return arr / factor
+            def scale(df, factor=1.0):
+                return df["mileage"] / factor
 
             VariableConfig('mileage', custom_transform=scale,
                            transform_kwargs={'factor': 1000})
@@ -394,9 +390,19 @@ class Preprocessor:
     Parameters
     ----------
     configs : list of VariableConfig
+        Configurations for emitted variables and any derived-variable
+        dependencies needed to construct them.
+    output_cols : sequence of str, optional
+        Variables whose fitted features should be emitted. Dependency-only
+        configs remain available for raw-column construction but are not
+        fitted or included in the design matrix. Defaults to every config.
     """
 
-    def __init__(self, configs: list[VariableConfig]):
+    def __init__(
+        self,
+        configs: list[VariableConfig],
+        output_cols: Sequence[str] | None = None,
+    ):
         if not configs:
             raise ValueError("Preprocessor requires at least one VariableConfig.")
         if any(not isinstance(c, VariableConfig) for c in configs):
@@ -404,6 +410,18 @@ class Preprocessor:
         if len({c.col for c in configs}) != len(configs):
             raise ValueError("Preprocessor configs must have unique output names.")
         self.configs = {c.col: c for c in configs}
+        self.output_cols = list(self.configs) if output_cols is None else list(output_cols)
+        if (
+            not self.output_cols
+            or any(not isinstance(c, str) or not c for c in self.output_cols)
+            or len(set(self.output_cols)) != len(self.output_cols)
+        ):
+            raise ValueError("output_cols must contain unique, non-empty variable names.")
+        unknown_outputs = [c for c in self.output_cols if c not in self.configs]
+        if unknown_outputs:
+            raise ValueError(
+                f"output_cols contains variables without configs: {unknown_outputs}."
+            )
         self._params: dict[str, FittedParams] = {}
         self.feature_names_: list[str] = []
         self._fitted = False
@@ -428,12 +446,11 @@ class Preprocessor:
             alphabetically is dropped (legacy behaviour).
         """
         self._params = {}
-        X_aug = X  # grows with derived columns so downstream configs can reference them
-        for col, cfg in self.configs.items():
-            raw = self._resolve_raw_series(X_aug, cfg)
+        X_aug = self._materialize_raw_columns(X)
+        for col in self._emitted_cols():
+            cfg = self.configs[col]
+            raw = X_aug[col]
             self._params[col] = self._fit_col(raw, cfg, weights=weights)
-            if cfg.custom_transform is not None and col not in X_aug.columns:
-                X_aug = X_aug.with_columns(raw.alias(col))
         self._compute_feature_names()
         self._fitted = True
         return self
@@ -452,12 +469,11 @@ class Preprocessor:
         if not self._fitted:
             raise RuntimeError("Call fit() before transform().")
         out: dict[str, np.ndarray] = {}
-        X_aug = X  # grows with derived columns so downstream configs can reference them
-        for col, cfg in self.configs.items():
-            raw = self._resolve_raw_series(X_aug, cfg)
+        X_aug = self._materialize_raw_columns(X)
+        for col in self._emitted_cols():
+            cfg = self.configs[col]
+            raw = X_aug[col]
             self._transform_col(raw, cfg, self._params[col], out, strict=strict)
-            if cfg.custom_transform is not None and col not in X_aug.columns:
-                X_aug = X_aug.with_columns(raw.alias(col))
         return pl.DataFrame(out)
 
     def fit_transform(self, X: pl.DataFrame, y: np.ndarray | None = None, weights: np.ndarray | None = None) -> pl.DataFrame:
@@ -468,7 +484,86 @@ class Preprocessor:
             raise RuntimeError("Call fit() before requesting feature names.")
         return list(self.feature_names_)
 
+    def _emitted_cols(self) -> list[str]:
+        """Return outputs, including compatibility with older pickles."""
+        return getattr(self, "output_cols", list(self.configs))
+
     # ── Raw series resolution ────────────────────────────────────────────
+
+    def _materialize_raw_columns(
+        self,
+        X: pl.DataFrame,
+        requested_cols: Sequence[str] | None = None,
+    ) -> pl.DataFrame:
+        """Resolve requested raw variables and their dependencies once.
+
+        Downstream transforms receive upstream custom-transform results before
+        any configured cap, log, imputation, binning, standardisation, or
+        encoding is applied.
+        """
+        X_aug = X
+        resolved: set[str] = set()
+        visiting: list[str] = []
+
+        def resolve(col: str, dependent: str | None = None) -> None:
+            nonlocal X_aug
+            if col in resolved:
+                return
+
+            cfg = self.configs.get(col)
+            if cfg is None:
+                if col not in X_aug.columns:
+                    context = f" for derived variable '{dependent}'" if dependent else ""
+                    raise ValueError(
+                        f"Input column '{col}'{context} is not in the DataFrame "
+                        "and has no registered config."
+                    )
+                resolved.add(col)
+                return
+
+            if col in visiting:
+                cycle = " -> ".join(visiting[visiting.index(col):] + [col])
+                raise ValueError(f"Circular dependency in derived variable chain: {cycle}.")
+
+            if cfg.custom_transform is None:
+                if cfg.input_cols is not None:
+                    raise ValueError(
+                        f"Variable '{col}' has input_cols but no custom_transform."
+                    )
+                if col not in X_aug.columns:
+                    raise ValueError(
+                        f"Variable '{col}' is not in the DataFrame and has no "
+                        "custom_transform capable of deriving it."
+                    )
+                resolved.add(col)
+                return
+
+            visiting.append(col)
+            if cfg.input_cols is None:
+                if col not in X_aug.columns:
+                    raise ValueError(
+                        f"Variable '{col}' uses a single-column custom_transform, "
+                        "but its source column is not in the DataFrame. Set input_cols "
+                        "when deriving a new variable name."
+                    )
+            else:
+                for input_col in cfg.input_cols:
+                    resolve(input_col, dependent=col)
+
+            raw = self._resolve_raw_series(X_aug, cfg)
+            if len(raw) != len(X_aug):
+                raise ValueError(
+                    f"custom_transform for variable '{col}' returned {len(raw)} rows; "
+                    f"expected {len(X_aug)}."
+                )
+            X_aug = X_aug.with_columns(raw.alias(col))
+            visiting.pop()
+            resolved.add(col)
+
+        outputs = self._emitted_cols() if requested_cols is None else requested_cols
+        for output_col in outputs:
+            resolve(output_col)
+        return X_aug
 
     def _resolve_raw_series(self, X: pl.DataFrame, cfg: VariableConfig) -> pl.Series:
         """
@@ -650,7 +745,8 @@ class Preprocessor:
 
     def _compute_feature_names(self) -> None:
         names: list[str] = []
-        for col, cfg in self.configs.items():
+        for col in self._emitted_cols():
+            cfg = self.configs[col]
             p = self._params[col]
             if isinstance(p, FittedCategoricalParams):
                 names.extend(f"{col}_{cat}" for cat in p.categories) if p.encoding == "onehot" else names.append(col)
@@ -672,16 +768,9 @@ class Preprocessor:
         return pl.Series(col, transformed).set(pl.Series(sentinel), None).cut(list(p.bin_edges), labels=list(p.bin_labels), left_closed=not p.right_closed).cast(pl.String).fill_null("Missing").rename(col + "_label")
 
     def get_level_labels(self, col: str, X: pl.DataFrame) -> pl.Series:
-        if not self._fitted or col not in self.configs: raise ValueError(f"'{col}' is not in a fitted preprocessor.")
+        if not self._fitted or col not in self._params: raise ValueError(f"'{col}' is not in a fitted preprocessor.")
         p, cfg = self._params[col], self.configs[col]
-        # Build X_aug with upstream derived columns so chained transforms resolve correctly
-        X_aug = X
-        for c, c_cfg in self.configs.items():
-            if c == col:
-                break
-            if c_cfg.custom_transform is not None and c not in X_aug.columns:
-                X_aug = X_aug.with_columns(self._resolve_raw_series(X_aug, c_cfg).alias(c))
-        raw = self._resolve_raw_series(X_aug, cfg)
+        raw = self._materialize_raw_columns(X, [col])[col]
         if isinstance(p, FittedBinnedNumericParams): return self.get_bin_labels(col, raw)
         if isinstance(p, FittedCategoricalParams):
             vals = self._normalize_cat_vals(raw, p.impute_val); known = set(p.categories) | ({p.dropped_category} if p.dropped_category else set())

@@ -15,6 +15,8 @@ from elastic_net_tool.variable import (
     compute_quantile_bin_edges,
     default_config,
 )
+from elastic_net_tool.model import _build_preprocessor
+from elastic_net_tool.plots import _resolve_level
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -411,6 +413,195 @@ class TestMultiInputVariables:
                              custom_transform=None, cap_upper=None)
         with pytest.raises(ValueError, match="custom_transform"):
             _prep(cfg, df)
+
+
+# ── Preprocessor – chained derived variables ──────────────────────────────
+
+class TestChainedDerivedVariables:
+    @staticmethod
+    def _configs():
+        return {
+            "a": VariableConfig(
+                "a", input_cols=["x"], custom_transform=lambda df: df["x"] * 2,
+                cap_upper=None, impute_strategy=None,
+            ),
+            "b": VariableConfig(
+                "b", input_cols=["a"], custom_transform=lambda df: df["a"] + 1,
+                cap_upper=None, impute_strategy=None,
+            ),
+            "c": VariableConfig(
+                "c", input_cols=["b"], custom_transform=lambda df: df["b"] * 10,
+                cap_upper=None, impute_strategy=None,
+            ),
+        }
+
+    def test_arbitrary_depth_chain_emits_only_requested_output(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        configs = self._configs()
+        prep = Preprocessor(list(configs.values()), output_cols=["c"])
+
+        out = prep.fit_transform(df)
+
+        assert out.columns == ["c"]
+        assert prep.get_feature_names() == ["c"]
+        assert set(prep._params) == {"c"}
+        np.testing.assert_allclose(out["c"].to_numpy(), [30.0, 50.0, 70.0])
+        predicted = prep.transform(pl.DataFrame({"x": [4.0, 5.0]}))
+        np.testing.assert_allclose(predicted["c"].to_numpy(), [90.0, 110.0])
+
+    def test_requested_upstream_and_downstream_are_each_emitted_once(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        prep = _build_preprocessor(["a", "b", "c"], df, self._configs())
+
+        out = prep.fit_transform(df)
+
+        assert out.columns == ["a", "b", "c"]
+        assert prep.get_feature_names() == ["a", "b", "c"]
+
+    def test_requested_order_does_not_control_dependency_resolution(self):
+        df = pl.DataFrame({"x": [1.0, 2.0, 3.0]})
+        prep = _build_preprocessor(["c", "a"], df, self._configs())
+
+        out = prep.fit_transform(df)
+
+        assert out.columns == ["c", "a"]
+        np.testing.assert_allclose(out["c"].to_numpy(), [30.0, 50.0, 70.0])
+        np.testing.assert_allclose(out["a"].to_numpy(), [2.0, 4.0, 6.0])
+
+    def test_downstream_receives_raw_upstream_value(self):
+        df = pl.DataFrame({"x": [1.0, 10.0]})
+        configs = {
+            "a": VariableConfig(
+                "a", input_cols=["x"], custom_transform=lambda df: df["x"] * 2,
+                cap_upper=5.0, impute_strategy=None,
+            ),
+            "b": VariableConfig(
+                "b", input_cols=["a"], custom_transform=lambda df: df["a"] + 1,
+                cap_upper=None, impute_strategy=None,
+            ),
+        }
+        prep = _build_preprocessor(["a", "b"], df, configs)
+
+        out = prep.fit_transform(df)
+
+        np.testing.assert_allclose(out["a"].to_numpy(), [2.0, 5.0])
+        np.testing.assert_allclose(out["b"].to_numpy(), [3.0, 21.0])
+
+    def test_dependency_only_config_does_not_fit_its_pipeline(self):
+        df = pl.DataFrame({"x": [0.0, 1.0]})
+        configs = {
+            "a": VariableConfig(
+                "a", input_cols=["x"], custom_transform=lambda d: d["x"],
+                log_transform=True, cap_upper=None, impute_strategy=None,
+            ),
+            "b": VariableConfig(
+                "b", input_cols=["a"], custom_transform=lambda d: d["a"] + 1,
+                cap_upper=None, impute_strategy=None,
+            ),
+        }
+
+        out = _build_preprocessor(["b"], df, configs).fit_transform(df)
+
+        np.testing.assert_allclose(out["b"].to_numpy(), [1.0, 2.0])
+
+    def test_shared_dependency_is_resolved_once_per_pass(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        calls = {"a": 0}
+
+        def derive_a(frame):
+            calls["a"] += 1
+            return frame["x"] * 2
+
+        configs = {
+            "a": VariableConfig("a", input_cols=["x"], custom_transform=derive_a,
+                                cap_upper=None, impute_strategy=None),
+            "b": VariableConfig("b", input_cols=["a"], custom_transform=lambda d: d["a"] + 1,
+                                cap_upper=None, impute_strategy=None),
+            "c": VariableConfig("c", input_cols=["a"], custom_transform=lambda d: d["a"] - 1,
+                                cap_upper=None, impute_strategy=None),
+            "d": VariableConfig("d", input_cols=["b", "c"],
+                                custom_transform=lambda d: d["b"] + d["c"],
+                                cap_upper=None, impute_strategy=None),
+        }
+
+        Preprocessor(list(configs.values()), output_cols=["d"]).fit_transform(df)
+
+        assert calls["a"] == 2  # once during fit and once during transform
+
+    def test_registered_transform_overrides_same_named_raw_column(self):
+        df = pl.DataFrame({"x": [1.0, 2.0], "a": [100.0, 100.0]})
+        configs = {
+            "a": VariableConfig("a", input_cols=["x"], custom_transform=lambda d: d["x"] * 2,
+                                cap_upper=None, impute_strategy=None),
+            "b": VariableConfig("b", input_cols=["a"], custom_transform=lambda d: d["a"] + 1,
+                                cap_upper=None, impute_strategy=None),
+        }
+
+        out = _build_preprocessor(["b"], df, configs).fit_transform(df)
+
+        np.testing.assert_allclose(out["b"].to_numpy(), [3.0, 5.0])
+
+    def test_cycle_raises_clear_error(self):
+        df = pl.DataFrame({"x": [1.0]})
+        configs = {
+            "a": VariableConfig("a", input_cols=["b"], custom_transform=lambda d: d["b"]),
+            "b": VariableConfig("b", input_cols=["a"], custom_transform=lambda d: d["a"]),
+        }
+
+        with pytest.raises(ValueError, match=r"a -> b -> a"):
+            _build_preprocessor(["a"], df, configs)
+
+    def test_missing_dependency_raises_clear_error(self):
+        df = pl.DataFrame({"x": [1.0]})
+        cfg = VariableConfig("a", input_cols=["missing"], custom_transform=lambda d: d["missing"])
+
+        with pytest.raises(KeyError, match="missing"):
+            _build_preprocessor(["a"], df, {"a": cfg})
+
+    def test_preprocessor_without_output_cols_attribute_remains_usable(self):
+        df = pl.DataFrame({"x": [1.0, 2.0]})
+        prep = Preprocessor([
+            VariableConfig("x", cap_upper=None, impute_strategy=None)
+        ]).fit(df)
+        del prep.output_cols  # simulate a Preprocessor restored from an older pickle
+
+        out = prep.transform(df)
+
+        assert out.columns == ["x"]
+
+    def test_plot_level_resolution_materializes_chain(self):
+        df = pl.DataFrame({"x": np.arange(1.0, 13.0)})
+        prep = _build_preprocessor(["c"], df, self._configs()).fit(df)
+
+        levels = _resolve_level("c", df, prep, n_bins=3)
+
+        assert len(levels) == len(df)
+        assert levels.n_unique() == 3
+
+        explicit_levels = _resolve_level(
+            "c", df, prep, n_bins=3, breaks=[50.0]
+        )
+        assert explicit_levels.n_unique() == 2
+
+        binned_configs = self._configs()
+        binned_configs["c"] = VariableConfig(
+            "c", input_cols=["b"], custom_transform=lambda d: d["b"] * 10,
+            bin_edges=[50.0], impute_strategy=None,
+        )
+        binned_prep = _build_preprocessor(["c"], df, binned_configs).fit(df)
+        overridden_levels = _resolve_level(
+            "c", df, binned_prep, n_bins=3, breaks=[40.0]
+        )
+        assert overridden_levels.n_unique() == 2
+
+    def test_plot_level_resolution_with_explicit_breaks_handles_missing(self):
+        df = pl.DataFrame({"x": [1.0, MISSING_SENTINEL, 3.0]})
+
+        levels = _resolve_level(
+            "x", df, preprocessor=None, n_bins=3, breaks=[2.0]
+        )
+
+        assert levels.to_list() == ["A_<2", "Missing", "B_2+"]
 
 
 # ── Preprocessor – error handling ────────────────────────────────────────────

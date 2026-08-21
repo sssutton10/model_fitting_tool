@@ -44,7 +44,10 @@ The test suite has **no known failures**. The previous Windows-era known-failure
 
 ### `Preprocessor` internals
 
-`Preprocessor.fit(X, weights)` calls `_fit_col` per variable and stores results in `_params: Dict[str, Dict]`. `Preprocessor.transform(X)` calls `_transform_num` or `_transform_cat` per column and concatenates results.
+`Preprocessor` first materializes raw derived columns recursively. `output_cols`
+controls which configs are fitted into `_params` and emitted into the design
+matrix; other configs are dependency-only. `transform(X)` rebuilds the raw
+dependency graph, then transforms only `output_cols`.
 
 Key `_params[col]` keys:
 - **Numeric binned:** `bin_edges` (break points, no outer bounds), `bin_labels` (list of strings), `dropped_bin` (int index of heaviest-weight bin), `has_sentinel_bin`
@@ -67,7 +70,7 @@ def my_transform(df: pl.DataFrame, **kwargs) -> array-like:
 ```
 
 - `df` contains only the relevant columns: `[cfg.col]` for single-column, `cfg.input_cols` for multi-input.
-- Applied once in `_resolve_raw_series`, before any cap / log / binning.
+- Applied once per fit/transform materialization pass, before any cap / log / binning.
 - For categorical remapping, the output list/array of strings becomes the category labels.
 
 ### glum dependency
@@ -78,6 +81,7 @@ def my_transform(df: pl.DataFrame, **kwargs) -> array-like:
 
 - **`ModelVersion.train_predictions`**, not `.predictions` — all model versions (including `FactorModelVersion`) store predictions in `train_predictions`. There is no `.predictions` attribute.
 - **Derived variables with `input_cols`** — when creating a variable from a different source column (e.g. "region" from "state"), use `input_cols=["state"]` not `col="state"`. The first positional arg to `add_variable()` is always the output variable name AND the `col` param. Categorical detection is automatic from the transform's output dtype (string → categorical, numeric → continuous); `is_categorical=True` is only needed to force categorical treatment when the output dtype is numeric.
+- **Chained derived variables** — `input_cols` may name other registered derived variables. Downstream transforms receive the upstream raw custom-transform result, before the upstream cap/log/bin/encoding pipeline. Only variables explicitly requested by the model are emitted as predictors.
 - **`show=False` does not mean "returns a figure"** — several `ModelingTool` methods diverge from the plots-return-figures convention:
   - `compare_models(show=False)` still *creates* the double-lift figure internally and discards it (returns only dataframes). The GUI captures it by diffing `plt.get_fignums()` before/after; any other caller must do the same or leak figures.
   - `regularization_path`, `overfitting_monitor`, `bootstrap_metrics`, `bootstrap_relativities` with `show=False` return DataFrames only — build figures via the matching `plots.py` helpers (`regularization_path_plot`, `overfitting_plot`, `bootstrap_ci_plot`, `relativities_ci_plot`).

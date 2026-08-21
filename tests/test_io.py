@@ -26,6 +26,32 @@ def _small_tool(sample_df: pl.DataFrame) -> ModelingTool:
     return tool
 
 
+def _derive_age_twice(df: pl.DataFrame) -> pl.Series:
+    return df["driver_age"] * 2
+
+
+def _derive_age_chain(df: pl.DataFrame) -> pl.Series:
+    return df["age_twice"] + 1
+
+
+def _chained_tool(sample_df: pl.DataFrame) -> ModelingTool:
+    tool = ModelingTool(sample_df, target_col="loss_ratio",
+                        weight_col="earned_premium")
+    tool.add_variable(
+        "age_twice", input_cols=["driver_age"],
+        custom_transform=_derive_age_twice,
+        cap_upper=None, impute_strategy=None,
+    )
+    tool.add_variable(
+        "age_chain", input_cols=["age_twice"],
+        custom_transform=_derive_age_chain,
+        cap_upper=None, impute_strategy=None,
+    )
+    tool.fit_model(["age_chain"], version="chain", use_cv=False,
+                   alpha=0.01, print_summary=False)
+    return tool
+
+
 # ── save ──────────────────────────────────────────────────────────────────────
 
 class TestSave:
@@ -176,3 +202,34 @@ class TestLoadFrozen:
         frozen = ModelingTool.load_frozen(path)
         frozen_preds = frozen.model_versions["v1"].predict(sample_df)
         np.testing.assert_allclose(frozen_preds, orig_preds, rtol=1e-6)
+
+
+# ── chained derived variable persistence ──────────────────────────────────────
+
+class TestChainedPersistence:
+    def test_refit_round_trip_restores_dependency_configs(self, sample_df, tmp_path):
+        tool = _chained_tool(sample_df)
+        path = tmp_path / "chain.pkl"
+        tool.save("chain", path)
+
+        loaded = ModelingTool.load(
+            path, data=sample_df, version_name="loaded_chain"
+        )
+
+        assert list(loaded.variable_configs) == ["age_twice", "age_chain"]
+        assert loaded.current_version == "loaded_chain"
+        assert loaded.model_versions["loaded_chain"].feature_names == ["age_chain"]
+        assert loaded.predict(sample_df, "loaded_chain").shape == (len(sample_df),)
+
+    def test_frozen_round_trip_predictions_match(self, sample_df, tmp_path):
+        tool = _chained_tool(sample_df)
+        expected = tool.predict(sample_df, "chain")
+        path = tmp_path / "chain.pkl"
+        tool.save("chain", path)
+
+        frozen = ModelingTool.load_frozen(path)
+        actual = frozen.predict(sample_df)
+
+        assert list(frozen.variable_configs) == ["age_twice", "age_chain"]
+        assert frozen.model_versions["v1"].feature_names == ["age_chain"]
+        np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)

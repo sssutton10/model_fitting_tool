@@ -18,7 +18,7 @@ import polars as pl
 _SNAPSHOT_FORMAT_VERSION = 2
 
 
-def _extract_import_statements(fn: Callable) -> list[str]:
+def _extract_import_statements(fn: Callable, source: str = "") -> list[str]:
     """
     Inspect the global names referenced by *fn* and return a list of import
     statements needed to re-create those bindings in a fresh namespace.
@@ -30,6 +30,9 @@ def _extract_import_statements(fn: Callable) -> list[str]:
     stmts: list[str] = []
     fn_globals = getattr(fn, "__globals__", {})
     referenced = set(getattr(fn.__code__, "co_names", []))
+    # Names used only in annotations/default expressions are absent from
+    # co_names but still must exist when the saved function source is exec'd.
+    referenced.update(re.findall(r"\b[A-Za-z_]\w*\b", source))
     # Also capture free variables' globals for nested/closure functions
     for const in fn.__code__.co_consts:
         if isinstance(const, types.CodeType):
@@ -62,8 +65,15 @@ def _serialize_custom_transform(fn: Callable) -> dict[str, Any] | None:
     except (OSError, TypeError):
         return None
 
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return None
+    freevars = getattr(code, "co_freevars", ())
+    if freevars:
+        return None
+
     name = getattr(fn, "__name__", None)
-    imports = _extract_import_statements(fn)
+    imports = _extract_import_statements(fn, source)
 
     if name == "<lambda>":
         # Extract just the lambda expression from the (possibly indented) source line
@@ -174,13 +184,28 @@ def _make_snapshot(version, tool) -> dict[str, Any]:
     """Package a ModelVersion (or FactorModelVersion) and tool settings into a serialisable dict."""
     safe_configs: dict[str, Any] = {}
     transform_sources: dict[str, Any] = {}
-    for col, cfg in tool.variable_configs.items():
-        if col not in version.variables:
-            continue
+    preprocessor = getattr(version, "preprocessor", None)
+
+    # The fitted preprocessor contains the exact dependency closure used by
+    # the model. Include every one of those configs, not just emitted model
+    # variables, so chained derived variables can be rebuilt after loading.
+    relevant_configs: dict[str, Any] = {}
+    if preprocessor is not None:
+        relevant_configs.update(preprocessor.configs)
+    for col in version.variables:
+        if col not in relevant_configs and col in tool.variable_configs:
+            relevant_configs[col] = tool.variable_configs[col]
+
+    for col, cfg in relevant_configs.items():
         if cfg.custom_transform is not None:
             src = _serialize_custom_transform(cfg.custom_transform)
-            if src is not None:
-                transform_sources[col] = src
+            if src is None:
+                raise ValueError(
+                    f"Cannot save model because custom_transform for variable '{col}' "
+                    "has no retrievable source code. Use a named function defined in "
+                    "a Python module, then refit and save again."
+                )
+            transform_sources[col] = src
             safe_configs[col] = dataclasses.replace(cfg, custom_transform=None)
         else:
             safe_configs[col] = cfg
@@ -211,6 +236,8 @@ def _make_snapshot(version, tool) -> dict[str, Any]:
             "link": version.link,
             "fit_info": version.fit_info,
             "tweedie_power": version.tweedie_power,
+            "gradient_tol": getattr(version, "gradient_tol", None),
+            "cv_stability": getattr(version, "cv_stability", None),
         }
 
     return {

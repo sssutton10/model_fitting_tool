@@ -270,62 +270,41 @@ def _build_preprocessor(
     configs: dict[str, VariableConfig] | None = None,
 ) -> Preprocessor:
     """Build (unfitted) Preprocessor, filling absent variables with defaults."""
-    import dataclasses
+    config_map = configs or {}
+    required: dict[str, VariableConfig] = {}
 
-    def _strip(cfg: VariableConfig) -> VariableConfig:
-        from .variable import MISSING_SENTINEL as _SENTINEL
-        kw: dict = {"n_bins": None, "bin_edges": None, "standardize": False, "degree": 1, "encoding": None}
-        if cfg.impute_strategy is None and (cfg.n_bins is not None or cfg.bin_edges is not None):
-            kw.update(impute_strategy="constant", impute_value=_SENTINEL)
-        return dataclasses.replace(cfg, **kw)
+    def _collect(col: str, visiting: tuple[str, ...]) -> None:
+        """Collect each requested config and its dependencies exactly once."""
+        if col in required:
+            return
+        if col in visiting:
+            cycle = " -> ".join(visiting[visiting.index(col):] + (col,))
+            raise ValueError(f"Circular dependency in derived variable chain: {cycle}.")
 
-    def _collect_deps(col: str, visited: frozenset) -> list[VariableConfig]:
-        """DFS: collect stripped configs for all upstream derived deps in topological order."""
-        cfg = (configs or {}).get(col)
-        if cfg is None or cfg.input_cols is None:
-            return []
-        result: list[VariableConfig] = []
-        seen: set[str] = set()
-        visited = visited | {col}
-        for inp in cfg.input_cols:
-            if inp in X.columns or inp in seen:
-                continue
-            if inp in visited:
-                raise ValueError(f"Circular dependency in derived variable chain involving '{inp}'.")
-            inp_cfg = (configs or {}).get(inp)
-            if inp_cfg is None:
+        cfg = config_map.get(col)
+        if cfg is None:
+            if col not in X.columns:
                 raise KeyError(
-                    f"Input column '{inp}' for derived variable '{col}' is not in "
-                    "the DataFrame and has no registered config."
+                    f"Variable '{col}' is not in the DataFrame and has no "
+                    "VariableConfig registered. Add it with tool.add_variable()."
                 )
-            for dep in _collect_deps(inp, visited):
-                if dep.col not in seen:
-                    result.append(dep)
-                    seen.add(dep.col)
-            if inp not in seen:
-                result.append(_strip(inp_cfg))
-                seen.add(inp)
-        return result
+            required[col] = default_config(col, X[col])
+            return
 
-    cfgs: list[VariableConfig] = []
-    dep_seen: set[str] = set()
+        if cfg.input_cols is not None:
+            for inp in cfg.input_cols:
+                if inp in config_map:
+                    _collect(inp, visiting + (col,))
+                elif inp not in X.columns:
+                    raise KeyError(
+                        f"Input column '{inp}' for derived variable '{col}' is not in "
+                        "the DataFrame and has no registered config."
+                    )
+        required[col] = cfg
+
     for col in variables:
-        # Prepend stripped upstream dependency configs not yet added
-        for dep_cfg in _collect_deps(col, frozenset()):
-            if dep_cfg.col not in dep_seen:
-                cfgs.append(dep_cfg)
-                dep_seen.add(dep_cfg.col)
-        # Add the variable's own config (full; overrides any stripped dep via Preprocessor dict)
-        if col in (configs or {}):
-            cfgs.append(configs[col])
-        elif col in X.columns:
-            cfgs.append(default_config(col, X[col]))
-        else:
-            raise KeyError(
-                f"Variable '{col}' is not in the DataFrame and has no "
-                "VariableConfig registered. Add it with tool.add_variable()."
-            )
-    return Preprocessor(cfgs)
+        _collect(col, ())
+    return Preprocessor(list(required.values()), output_cols=variables)
 
 
 def _extract_coefficients(
@@ -438,6 +417,12 @@ def fit_model(
     family = _resolve_family(family, tweedie_power)
 
     prep = _build_preprocessor(variables, X, configs) if preprocessor is None else preprocessor
+    emitted = prep._emitted_cols()
+    if emitted != variables:
+        raise ValueError(
+            "The supplied preprocessor must emit exactly the requested variables "
+            f"in order. Requested {variables}, but it emits {emitted}."
+        )
 
     if not prep._fitted:
         fit_weights = weights if drop_reference == "max_weight" else None

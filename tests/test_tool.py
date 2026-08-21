@@ -123,7 +123,7 @@ class TestAddVariable:
         tool.add_variable(
             "age_x_value",
             input_cols=["driver_age", "vehicle_value"],
-            custom_transform=lambda a, v: a * v / 1e6,
+            custom_transform=lambda df: df["driver_age"] * df["vehicle_value"] / 1e6,
         )
         assert "age_x_value" in tool.variable_configs
         assert tool.variable_configs["age_x_value"].input_cols == ["driver_age", "vehicle_value"]
@@ -132,6 +132,26 @@ class TestAddVariable:
         tool = ModelingTool(sample_df, target_col="loss_ratio")
         tool.add_variable("driver_age", breakpoints=[25.0, 45.0, 65.0])
         assert tool.variable_configs["driver_age"].bin_edges == [25.0, 45.0, 65.0]
+
+    def test_data_with_arbitrary_depth_derived_column(self, sample_df):
+        tool = ModelingTool(sample_df, target_col="loss_ratio")
+        tool.add_variable(
+            "age_twice", input_cols=["driver_age"],
+            custom_transform=lambda df: df["driver_age"] * 2,
+        )
+        tool.add_variable(
+            "age_plus_one", input_cols=["age_twice"],
+            custom_transform=lambda df: df["age_twice"] + 1,
+        )
+        tool.add_variable(
+            "age_chain", input_cols=["age_plus_one"],
+            custom_transform=lambda df: df["age_plus_one"] * 10,
+        )
+
+        augmented = tool._data_with_derived_col("age_chain")
+
+        expected = (sample_df["driver_age"] * 2 + 1) * 10
+        np.testing.assert_allclose(augmented["age_chain"].to_numpy(), expected.to_numpy())
 
 
 # ── fit_model ─────────────────────────────────────────────────────────────────
