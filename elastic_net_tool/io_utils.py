@@ -5,20 +5,20 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
-import pickle
 import json
+import pickle
 import re
 import textwrap
 import types
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable
 
 import polars as pl
 
 _SNAPSHOT_FORMAT_VERSION = 2
 
 
-def _extract_import_statements(fn: Callable) -> List[str]:
+def _extract_import_statements(fn: Callable) -> list[str]:
     """
     Inspect the global names referenced by *fn* and return a list of import
     statements needed to re-create those bindings in a fresh namespace.
@@ -27,7 +27,7 @@ def _extract_import_statements(fn: Callable) -> List[str]:
     patterns.  Names that cannot be resolved to an importable object are
     silently skipped.
     """
-    stmts: List[str] = []
+    stmts: list[str] = []
     fn_globals = getattr(fn, "__globals__", {})
     referenced = set(getattr(fn.__code__, "co_names", []))
     # Also capture free variables' globals for nested/closure functions
@@ -50,7 +50,7 @@ def _extract_import_statements(fn: Callable) -> List[str]:
     return stmts
 
 
-def _serialize_custom_transform(fn: Callable) -> Optional[Dict[str, Any]]:
+def _serialize_custom_transform(fn: Callable) -> dict[str, Any] | None:
     """
     Serialize a callable to a dict containing its source code so it can be
     reconstructed in a fresh Python session without the original definition.
@@ -76,11 +76,11 @@ def _serialize_custom_transform(fn: Callable) -> Optional[Dict[str, Any]]:
         return {"type": "def", "source": textwrap.dedent(source), "name": name, "imports": imports}
 
 
-def _deserialize_custom_transform(data: Optional[Dict[str, Any]]) -> Optional[Callable]:
+def _deserialize_custom_transform(data: dict[str, Any] | None) -> Callable | None:
     """Reconstruct a callable from its serialized source dict."""
     if data is None:
         return None
-    ns: Dict[str, Any] = {}
+    ns: dict[str, Any] = {}
     # Re-establish any third-party / stdlib imports the function relied on
     for stmt in data.get("imports", []):
         try:
@@ -112,7 +112,7 @@ def _clean_preprocessor(preprocessor: Any) -> Any:
     return cleaned
 
 
-def _restore_custom_transforms(snapshot: Dict[str, Any]) -> None:
+def _restore_custom_transforms(snapshot: dict[str, Any]) -> None:
     """Mutate *snapshot* in-place, injecting reconstructed custom_transform callables."""
     ts = snapshot.get("tool_settings", {})
     vs = snapshot.get("version", {})
@@ -133,13 +133,13 @@ def _restore_custom_transforms(snapshot: Dict[str, Any]) -> None:
 
 
 def _summarize_variable_transformations(
-    variable_configs: Dict[str, Any],
-    transform_sources: Dict[str, Any],
-) -> Dict[str, Any]:
+    variable_configs: dict[str, Any],
+    transform_sources: dict[str, Any],
+) -> dict[str, Any]:
     """Return a JSON-serialisable summary of every variable's transformation pipeline."""
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for col, cfg in variable_configs.items():
-        entry: Dict[str, Any] = {}
+        entry: dict[str, Any] = {}
         if cfg.input_cols:
             entry["input_cols"] = cfg.input_cols
         if cfg.cap_lower is not None:
@@ -170,12 +170,10 @@ def _summarize_variable_transformations(
     return out
 
 
-def _make_snapshot(version, tool) -> Dict[str, Any]:
-    """Package a ModelVersion and tool settings into a serialisable dict."""
-    # Separate callable sources from configs so lambdas / locally-defined
-    # functions are captured even when standard pickle cannot serialise them.
-    safe_configs: Dict[str, Any] = {}
-    transform_sources: Dict[str, Any] = {}
+def _make_snapshot(version, tool) -> dict[str, Any]:
+    """Package a ModelVersion (or FactorModelVersion) and tool settings into a serialisable dict."""
+    safe_configs: dict[str, Any] = {}
+    transform_sources: dict[str, Any] = {}
     for col, cfg in tool.variable_configs.items():
         if col not in version.variables:
             continue
@@ -187,9 +185,20 @@ def _make_snapshot(version, tool) -> Dict[str, Any]:
         else:
             safe_configs[col] = cfg
 
-    return {
-        "format_version": _SNAPSHOT_FORMAT_VERSION,
-        "version": {
+    is_factor = hasattr(version, "factor_table")
+    if is_factor:
+        cleaned_prep = _clean_preprocessor(version.preprocessor) if version.preprocessor is not None else None
+        version_dict: dict[str, Any] = {
+            "name": version.name,
+            "variables": version.variables,
+            "factor_table": version.factor_table,
+            "preprocessor": cleaned_prep,
+            "preprocessor_vars": version.preprocessor_vars,
+            "offset_col": version.offset_col,
+            "fit_info": version.fit_info,
+        }
+    else:
+        version_dict = {
             "name": version.name,
             "variables": version.variables,
             "preprocessor": _clean_preprocessor(version.preprocessor),
@@ -201,12 +210,17 @@ def _make_snapshot(version, tool) -> Dict[str, Any]:
             "family": version.family,
             "link": version.link,
             "fit_info": version.fit_info,
-            'tweedie_power': version.tweedie_power,
-        },
+            "tweedie_power": version.tweedie_power,
+        }
+
+    return {
+        "format_version": _SNAPSHOT_FORMAT_VERSION,
+        "version_type": "factor" if is_factor else "glm",
+        "version": version_dict,
         "tool_settings": {
             "target_col": tool.target_col,
             "weight_col": tool.weight_col,
-            'offset_col': getattr(tool, "offset_col", None),
+            "offset_col": getattr(tool, "offset_col", None),
             "link": tool.link,
             "drop_reference": getattr(tool, "drop_reference", "max_weight"),
             "variable_configs": safe_configs,
@@ -227,24 +241,37 @@ def save_version(version, tool, filepath: str) -> None:
         Destination ``.pkl`` file path.
     """
     snapshot = _make_snapshot(version, tool)
+    is_factor = snapshot["version_type"] == "factor"
 
-    # Human-readable version of important metadata for quick reference when browsing saved files
-    json_metadata = {
-        "name": version.name,
-        "variables": version.variables,
-        "family": version.family.__class__.__name__,
-        "link": version.link.__class__.__name__,
-        "fit_info": version.fit_info,
-        'target_col': tool.target_col,
-        'weight_col': tool.weight_col,
-        'offset_col': getattr(tool, "offset_col", None),
-        'l1_ratio': version.l1_ratio,
-        'alpha': version.alpha,
-        'variable_transformations': _summarize_variable_transformations(
-            snapshot["tool_settings"]["variable_configs"],
-            snapshot["tool_settings"]["custom_transform_sources"],
-        ),
-    }
+    # Human-readable sidecar for quick reference when browsing saved files
+    if is_factor:
+        json_metadata: dict[str, Any] = {
+            "name": version.name,
+            "version_type": "factor",
+            "variables": version.variables,
+            "fit_info": version.fit_info,
+            "target_col": tool.target_col,
+            "weight_col": tool.weight_col,
+            "offset_col": getattr(tool, "offset_col", None),
+        }
+    else:
+        json_metadata = {
+            "name": version.name,
+            "version_type": "glm",
+            "variables": version.variables,
+            "family": version.family.__class__.__name__,
+            "link": version.link.__class__.__name__,
+            "fit_info": version.fit_info,
+            "target_col": tool.target_col,
+            "weight_col": tool.weight_col,
+            "offset_col": getattr(tool, "offset_col", None),
+            "l1_ratio": version.l1_ratio,
+            "alpha": version.alpha,
+            "variable_transformations": _summarize_variable_transformations(
+                snapshot["tool_settings"]["variable_configs"],
+                snapshot["tool_settings"]["custom_transform_sources"],
+            ),
+        }
 
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,9 +287,9 @@ def save_version(version, tool, filepath: str) -> None:
 
 def load_version(
     filepath: str,
-    data: Optional[pl.DataFrame] = None,
+    data: pl.DataFrame | None = None,
     refit: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Load a saved snapshot from disk.
 
