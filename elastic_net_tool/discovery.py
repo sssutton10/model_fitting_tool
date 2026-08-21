@@ -13,17 +13,17 @@ Uses LightGBM as a *diagnostic lens* — never as the final model. Provides:
 
 from __future__ import annotations
 
+import importlib.util
 from collections import Counter, defaultdict
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable
 
+import lightgbm as lgb
 import numpy as np
 import polars as pl
-import lightgbm as lgb
 
-from .variable import _NUMERIC_DTYPES, _is_str_or_cat, MISSING_SENTINEL
 from .model import _build_preprocessor
 from .plots import _resolve_level
-
+from .variable import _NUMERIC_DTYPES, MISSING_SENTINEL, _is_str_or_cat
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ def _predict(model: Any, X: pl.DataFrame) -> np.ndarray:
         return model.predict(X.to_arrow())
 
 
-def _to_numpy(s: Union[pl.Series, np.ndarray]) -> np.ndarray:
+def _to_numpy(s: pl.Series | np.ndarray) -> np.ndarray:
     if isinstance(s, pl.Series):
         return s.to_numpy().astype(float, copy=False)
     return np.asarray(s, dtype=float)
@@ -74,10 +74,10 @@ def _subsample_rows(
 
 def _encode_features(
     df: pl.DataFrame,
-    feature_cols: List[str],
-    variable_configs: Optional[Dict[str, Any]] = {},
-    weights: Optional[np.ndarray] = None,
-) -> Tuple[pl.DataFrame, List[str], Dict[str, List[int]]]:
+    feature_cols: list[str],
+    variable_configs: dict[str, Any] | None = {},
+    weights: np.ndarray | None = None,
+) -> tuple[pl.DataFrame, list[str], dict[str, list[int]]]:
     df_enc = df.clone()
 
     calculated_columns = []
@@ -130,7 +130,7 @@ def _encode_features(
     encoded_names = list(X.columns)
 
     # Build col_index_map
-    col_index_map: Dict[str, List[int]] = {}
+    col_index_map: dict[str, list[int]] = {}
     col_pos = {name: i for i, name in enumerate(encoded_names)}
     for col in numeric_cols:
         col_index_map[col] = [col_pos[col]]
@@ -146,12 +146,12 @@ def _encode_features(
 def fit_shadow_gbm(
     df: pl.DataFrame,
     target_col: str,
-    weight_col: Optional[str] = None,
-    offset_col: Optional[str] = None,
-    feature_cols: Optional[List[str]] = None,
+    weight_col: str | None = None,
+    offset_col: str | None = None,
+    feature_cols: list[str] | None = None,
     family: str = "tweedie",
     tweedie_power: float = 1.5,
-    variable_configs: Optional[Dict[str, Any]] = None,
+    variable_configs:dict[str, Any] | None = None,
     n_estimators: int = 500,
     max_depth: int = 5,
     learning_rate: float = 0.01,
@@ -207,7 +207,7 @@ def fit_shadow_gbm(
     if offset_col is not None and w is not None:
         w = w * np.exp(df[offset_col].to_numpy().astype(float))
 
-    params: Dict[str, Any] = {
+    params: dict[str, Any] = {
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "learning_rate": learning_rate,
@@ -238,8 +238,8 @@ def fit_shadow_gbm(
 def _prepare_X(
     model: Any,
     df: pl.DataFrame,
-    feature_cols: Optional[List[str]] = None,
-) -> Tuple[pl.DataFrame, List[str], Dict[str, List[int]], List[str]]:
+    feature_cols: list[str] | None = None,
+) -> tuple[pl.DataFrame, list[str], dict[str, list[int]], list[str]]:
     """
     Build the encoded matrix for *df* using the encoding stored on *model*.
 
@@ -277,10 +277,10 @@ def permutation_importance(
     model: Any,
     df: pl.DataFrame,
     target_col: str,
-    weight_col: Optional[str] = None,
-    metric_fn: Optional[Callable] = None,
+    weight_col: str | None = None,
+    metric_fn: Callable | None = None,
     n_repeats: int = 5,
-    feature_cols: Optional[List[str]] = None,
+    feature_cols: list[str] | None = None,
     random_state: int = 42,
 ) -> pl.DataFrame:
     """
@@ -319,7 +319,6 @@ def permutation_importance(
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
 
-    rng = np.random.RandomState(random_state)
     baseline = metric_fn(y, _predict(model, X), w)
 
     results = []
@@ -371,7 +370,7 @@ def partial_dependence_2d(
     df: pl.DataFrame,
     var1: str,
     var2: str,
-    feature_cols: Optional[List[str]] = None,
+    feature_cols: list[str] | None = None,
     grid_resolution: int = 20,
     sample_size: int = 500,
     random_state: int = 42,
@@ -399,7 +398,7 @@ def partial_dependence_2d(
     pl.DataFrame
         Columns: ``var1_value``, ``var2_value``, ``pd_value``.
     """
-    X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
+    X, _encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
 
     # PDP only makes sense for single-index (numeric) columns
     if len(col_index_map[var1]) != 1:
@@ -441,7 +440,7 @@ def partial_dependence_2d(
 def interaction_ranking(
     model: Any,
     df: pl.DataFrame,
-    feature_cols: Optional[List[str]] = None,
+    feature_cols: list[str] | None = None,
     top_n: int = 20,
     grid_resolution: int = 15,
     sample_size: int = 300,
@@ -485,7 +484,7 @@ def interaction_ranking(
     except AttributeError:
         raw_importances = np.ones(len(encoded_names))
 
-    var_importance: Dict[str, float] = {}
+    var_importance: dict[str, float] = {}
     for col_name in feature_cols:
         indices = col_index_map[col_name]
         var_importance[col_name] = sum(float(raw_importances[i]) for i in indices)
@@ -496,8 +495,8 @@ def interaction_ranking(
     top_vars = numeric_vars_sorted[:top_n]
 
     # Compute 1D PDPs for each top variable
-    pdp_1d: Dict[str, np.ndarray] = {}
-    grids: Dict[str, np.ndarray] = {}
+    pdp_1d: dict[str, np.ndarray] = {}
+    grids: dict[str, np.ndarray] = {}
     for var in top_vars:
         idx = col_index_map[var][0]
         grid = np.unique(np.quantile(X_sample[:, idx], np.linspace(0, 1, grid_resolution)))
@@ -548,12 +547,12 @@ def interaction_ranking(
 
 def residual_gbm(
     df: pl.DataFrame,
-    residuals: Union[np.ndarray, pl.Series],
-    feature_cols: List[str],
-    weight_col: Optional[str] = None,
-    offset_col: Optional[str] = None,
+    residuals: np.ndarray | pl.Series,
+    feature_cols: list[str],
+    weight_col: str | None = None,
+    offset_col: str | None = None,
     top_n: int = 10,
-    variable_configs: Optional[Dict[str, Any]] = None,
+    variable_configs: dict[str, Any] | None = None,
     n_estimators: int = 100,
     max_depth: int = 3,
     **lgb_params: Any,
@@ -579,13 +578,12 @@ def residual_gbm(
         Columns: ``variable``, ``importance``, ``top_split_value``.
         One row per original column (importances summed over dummies).
     """
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
+    spec = importlib.util.find_spec("lightgbm")
+    if spec is None:
         raise ImportError(
             "LightGBM is required for residual GBM.\n"
             "Install it with:  pip install lightgbm"
-        ) from exc
+        )
 
     residuals = _to_numpy(residuals)
     
@@ -597,7 +595,7 @@ def residual_gbm(
     if offset_col is not None and w is not None:
         w = w * np.exp(df[offset_col].to_numpy().astype(float))
 
-    params: Dict[str, Any] = {
+    params: dict[str, Any] = {
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "num_leaves": max(2, 2 ** max_depth - 1),
@@ -679,7 +677,7 @@ def _normalize_shap_values(shap_values: Any) -> np.ndarray:
 def shap_importance(
     model: Any,
     df: pl.DataFrame,
-    feature_cols: Optional[List[str]] = None,
+    feature_cols: list[str] | None = None,
     sample_size: int = 500,
     random_state: int = 42,
 ) -> pl.DataFrame:
@@ -704,7 +702,7 @@ def shap_importance(
     except ImportError as exc:
         raise ImportError("shap is required: pip install shap") from exc
 
-    X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
+    X, _encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
     rng = np.random.RandomState(random_state)
     X_sample = _subsample_rows(X, sample_size, rng)
 
@@ -729,8 +727,8 @@ def shap_dependence(
     model: Any,
     df: pl.DataFrame,
     var: str,
-    color_var: Optional[str] = None,
-    feature_cols: Optional[List[str]] = None,
+    color_var: str | None = None,
+    feature_cols: list[str] | None = None,
     sample_size: int = 500,
     random_state: int = 42,
 ) -> pl.DataFrame:
@@ -763,7 +761,7 @@ def shap_dependence(
     except ImportError as exc:
         raise ImportError("shap is required: pip install shap") from exc
 
-    X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
+    X, _encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
     rng = np.random.RandomState(random_state)
     sample_idx = (
         rng.choice(len(X), sample_size, replace=False)
@@ -783,7 +781,7 @@ def shap_dependence(
         # Categorical: encode as level index (which dummy is active)
         var_vals = np.argmax(X_sample[:, indices], axis=1).astype(float)
 
-    data: Dict[str, list] = {var: var_vals.tolist(), "shap_value": var_shap.tolist()}
+    data: dict[str, list] = {var: var_vals.tolist(), "shap_value": var_shap.tolist()}
 
     if color_var is not None and color_var in col_index_map:
         c_indices = col_index_map[color_var]
@@ -796,7 +794,7 @@ def shap_dependence(
 def shap_interaction_ranking(
     model: Any,
     df: pl.DataFrame,
-    feature_cols: Optional[List[str]] = None,
+    feature_cols: list[str] | None = None,
     sample_size: int = 200,
     random_state: int = 42,
     top_n: int = 20,
@@ -822,7 +820,7 @@ def shap_interaction_ranking(
     except ImportError as exc:
         raise ImportError("shap is required: pip install shap") from exc
 
-    X, encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
+    X, _encoded_names, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
     rng = np.random.RandomState(random_state)
     X_sample = _subsample_rows(X, sample_size, rng)
 
@@ -877,18 +875,18 @@ def tree_interaction_cooccurrence(
             "Call fit_shadow_gbm() first."
         )
 
-    encoded_names: List[str] = getattr(model, "_shadow_encoded_names", [])
-    col_index_map: Dict[str, List[int]] = getattr(model, "_shadow_col_index_map", {})
+    encoded_names: list[str] = getattr(model, "_shadow_encoded_names", [])
+    col_index_map: dict[str, list[int]] = getattr(model, "_shadow_col_index_map", {})
 
     # Map encoded feature name → original variable name
-    encoded_to_orig: Dict[str, str] = {}
+    encoded_to_orig: dict[str, str] = {}
     for orig_col, idxs in col_index_map.items():
         for idx in idxs:
             if idx < len(encoded_names):
                 encoded_to_orig[encoded_names[idx]] = orig_col
 
     internal = trees_df.dropna(subset=["split_feature"])
-    pair_scores: Dict[Tuple[str, str], float] = defaultdict(float)
+    pair_scores: dict[tuple[str, str], float] = defaultdict(float)
 
     for tree_id, group in internal.groupby("tree_index"):
         orig_feats = [encoded_to_orig.get(f, f) for f in group["split_feature"].tolist()]
@@ -898,7 +896,7 @@ def tree_interaction_cooccurrence(
             else [1.0] * len(orig_feats)
         )
 
-        var_gain: Dict[str, float] = defaultdict(float)
+        var_gain: dict[str, float] = defaultdict(float)
         for f, g in zip(orig_feats, gains):
             if g is not None and not (isinstance(g, float) and g != g):
                 var_gain[f] = max(var_gain[f], float(g))
@@ -924,12 +922,12 @@ def tree_interaction_cooccurrence(
 def suggest_category_groups(
     col: str,
     df: pl.DataFrame,
-    y: Union[pl.Series, np.ndarray],
-    weights: Optional[Union[pl.Series, np.ndarray]] = None,
+    y: pl.Series | np.ndarray | None,
+    weights: pl.Series | np.ndarray | None = None,
     max_groups: int = 10,
     min_exposure_pct: float = 0.01,
     verbose: bool = True,
-) -> Tuple[Dict[str, str], pl.DataFrame]:
+) -> tuple[dict[str, str], pl.DataFrame]:
     """
     Suggest groupings for a high-cardinality categorical variable.
 
@@ -1013,7 +1011,7 @@ def suggest_category_groups(
         _merge(int(np.argmin(diffs)), int(np.argmin(diffs)) + 1)
 
     # Build output
-    level_to_group: Dict[str, str] = {}
+    level_to_group: dict[str, str] = {}
     summary_rows = []
     for gi, g in enumerate(groups, 1):
         label = f"G{gi:02d}"
@@ -1037,14 +1035,14 @@ def monotonicity_test(
     df: pl.DataFrame,
     target_col: str,
     var: str,
-    weight_col: Optional[str] = None,
-    feature_cols: Optional[List[str]] = None,
+    weight_col: str | None = None,
+    feature_cols: list[str] | None = None,
     n_estimators: int = 100,
     random_state: int = 42,
     verbose: bool = True,
-    variable_configs: Optional[Dict[str, Any]] = {},
+    variable_configs: dict[str, Any] | None = {},
     **lgb_params: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Measure the RMSE cost of enforcing a monotone constraint on ``var``.
 
@@ -1082,7 +1080,7 @@ def monotonicity_test(
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
 
-    base_params: Dict[str, Any] = {
+    base_params: dict[str, Any] = {
         "n_estimators": n_estimators, "verbose": -1, "n_jobs": -1,
         "random_state": random_state, **lgb_params,
     }
@@ -1099,7 +1097,7 @@ def monotonicity_test(
     rmse_free = _fit_and_rmse()
 
     n_features, var_indices = X.shape[1], col_index_map[var]
-    constrained_rmses: Dict[str, float] = {}
+    constrained_rmses: dict[str, float] = {}
     for direction, label in [(1, "pos"), (-1, "neg")]:
         constraints = [0] * n_features
         for idx in var_indices:
@@ -1139,13 +1137,13 @@ def monotonicity_test(
 def boruta_select(
     df: pl.DataFrame,
     target_col: str,
-    weight_col: Optional[str] = None,
-    feature_cols: Optional[List[str]] = None,
+    weight_col: str | None = None,
+    feature_cols: list[str] | None = None,
     n_estimators: int = 100,
     n_iterations: int = 20,
     threshold: float = 0.05,
     random_state: int = 42,
-    variable_configs: Optional[Dict[str, Any]] = {},
+    variable_configs: dict[str, Any] | None = {},
     **lgb_params: Any,
 ) -> pl.DataFrame:
     """
@@ -1177,10 +1175,12 @@ def boruta_select(
         Columns: ``variable``, ``pass_rate``, ``selected``.
         Sorted by ``pass_rate`` descending.
     """
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
-        raise ImportError("LightGBM is required: pip install lightgbm") from exc
+    spec = importlib.util.find_spec("lightgbm")
+    if spec is None:
+        raise ImportError(
+            "LightGBM is required for residual GBM.\n"
+            "Install it with:  pip install lightgbm"
+        )
 
     if feature_cols is None:
         exclude = {target_col}
@@ -1202,9 +1202,9 @@ def boruta_select(
     del X
 
     rng = np.random.RandomState(random_state)
-    hit_counts: Dict[str, int] = {c: 0 for c in feature_cols}
+    hit_counts: dict[str, int] = {c: 0 for c in feature_cols}
 
-    params: Dict[str, Any] = {"n_estimators": n_estimators, "verbose": -1, "n_jobs": -1, "importance_type": "gain"}
+    params: dict[str, Any] = {"n_estimators": n_estimators, "verbose": -1, "n_jobs": -1, "importance_type": "gain"}
     params.update(lgb_params)
 
     # Pre-allocate reusable buffers: shadow columns and the augmented matrix.
