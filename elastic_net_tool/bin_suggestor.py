@@ -9,7 +9,7 @@ Four strategies are available:
 * ``"equal_width"`` – equal-width splits spanning [min, max]
 * ``"optbin"``      – OptimalBinning via MILP/CP-SAT (``optbinning`` package)
 * ``"gbm"``         – Most-used split thresholds from a single-feature GBM
-                      (LightGBM when installed, sklearn GBM as fallback)
+(LightGBM when installed, sklearn GBM as fallback)
 
 None of these functions modify any variable configuration; they only print
 and return suggested breakpoints for the user to decide on.
@@ -18,7 +18,8 @@ and return suggested breakpoints for the user to decide on.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -27,14 +28,13 @@ import polars as pl
 
 from .variable import MISSING_SENTINEL
 
-
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 _COLORS = ["#e6550d", "#31a354", "#3182bd", "#756bb1"]
 _LINESTYLES = ["--", "-.", ":", "-"]
 
 
-def _drop_sentinel(*arrays: np.ndarray) -> Tuple[np.ndarray, ...]:
+def _drop_sentinel(*arrays: np.ndarray) -> tuple[np.ndarray, ...]:
     """Remove rows where the *first* array equals MISSING_SENTINEL."""
     mask = arrays[0] != MISSING_SENTINEL
     return tuple(a[mask] for a in arrays)
@@ -50,7 +50,7 @@ def _weighted_quantiles(
     return np.interp(quantiles, cum_w, arr_s)
 
 
-def _print_splits(method: str, col: str, splits: List[float]) -> None:
+def _print_splits(method: str, col: str, splits: list[float]) -> None:
     """Pretty-print a single method's splits."""
     width = 58
     print(f"\n  +- {method}")
@@ -69,9 +69,9 @@ def suggest_bins_quantile(
     col: str,
     X: pl.DataFrame,
     n_bins: int = 10,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     verbose: bool = True,
-) -> List[float]:
+) -> list[float]:
     """
     Equal-weight (exposure-weighted) quantile breakpoints.
 
@@ -99,7 +99,7 @@ def suggest_bins_quantile(
 
     # Deduplicate while preserving order
     seen: set = set()
-    splits: List[float] = []
+    splits: list[float] = []
     for v in raw:
         v = float(v)
         if v not in seen:
@@ -118,7 +118,7 @@ def suggest_bins_equal_width(
     X: pl.DataFrame,
     n_bins: int = 10,
     verbose: bool = True,
-) -> List[float]:
+) -> list[float]:
     """
     Equal-width breakpoints spanning ``[min, max]``.
 
@@ -146,10 +146,10 @@ def suggest_bins_optbin(
     col: str,
     X: pl.DataFrame,
     y: pl.Series,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     verbose: bool = True,
     **optbin_kwargs: Any,
-) -> List[float]:
+) -> list[float]:
     """
     Optimal breakpoints via ``optbinning.OptimalBinning``.
 
@@ -182,7 +182,7 @@ def suggest_bins_optbin(
     else:
         arr, y_arr = _drop_sentinel(arr, y_arr)
 
-    kwargs: Dict[str, Any] = {"name": col, "dtype": "numerical"}
+    kwargs: dict[str, Any] = {"name": col, "dtype": "numerical"}
     kwargs.update(optbin_kwargs)
 
     ob = ContinuousOptimalBinning(**kwargs)
@@ -203,13 +203,13 @@ def suggest_bins_gbm(
     col: str,
     X: pl.DataFrame,
     y: pl.Series,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     n_estimators: int = 100,
     max_depth: int = 3,
     max_splits: int = 20,
     verbose: bool = True,
     **gbm_kwargs: Any,
-) -> List[float]:
+) -> list[float]:
     """
     Breakpoints extracted from a single-feature GBM.
 
@@ -250,7 +250,7 @@ def suggest_bins_gbm(
     try:
         import lightgbm as lgb
 
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "n_estimators": n_estimators,
             "max_depth": max_depth,
             "num_leaves": max(2, 2 ** max_depth - 1),
@@ -307,13 +307,13 @@ def suggest_bins(
     col: str,
     X: pl.DataFrame,
     y: pl.Series,
-    weights: Optional[pl.Series] = None,
+    weights: pl.Series | None = None,
     methods: Sequence[str] = ("quantile", "equal_width", "optbin", "gbm"),
     n_bins: int = 10,
     max_splits: int = 20,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
     **method_kwargs: Any,
-) -> Dict[str, List[float]]:
+) -> dict[str, list[float]]:
     """
     Run multiple bin-suggestion strategies and display all results.
 
@@ -357,9 +357,9 @@ def suggest_bins(
     print(f"  Methods             : {list(methods)}")
     print(f"{'=' * 62}")
 
-    results: Dict[str, List[float]] = {}
+    results: dict[str, list[float]] = {}
 
-    _dispatch: Dict[str, Any] = {
+    _dispatch: dict[str, Any] = {
         "quantile": lambda: suggest_bins_quantile(
             col, X,
             n_bins=n_bins,
@@ -397,7 +397,7 @@ def suggest_bins(
 
     print(f"\n{'=' * 62}\n")
     
-    fig = _plot_suggestions(col, X, results, weights=weights, figsize=figsize)
+    _fig = _plot_suggestions(col, X, results, weights=weights, figsize=figsize)
 
     return results
 
@@ -407,10 +407,10 @@ def suggest_bins(
 def _plot_suggestions(
     col: str,
     X: pl.DataFrame,
-    splits_dict: Dict[str, List[float]],
-    weights: Optional[pl.Series] = None,
+    splits_dict: dict[str, list[float]],
+    weights: pl.Series | None = None,
     n_hist_bins: int = 60,
-    figsize: Optional[Tuple[int, int]] = None,
+    figsize: tuple[int, int] | None = None,
 ) -> plt.Figure:
     """
     Weighted histogram with each method's splits overlaid as vertical lines.
