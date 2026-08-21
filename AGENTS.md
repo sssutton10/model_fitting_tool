@@ -4,38 +4,75 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Commands
 
-Activate the environment first in any new shell:
+Use the UV-managed environment. `uv run` selects the project interpreter, so
+do not activate Conda or call a system Python directly.
+
+Set up or refresh the environment:
+
 ```bash
-source /c/Users/sssut/anaconda3/etc/profile.d/conda.sh && conda activate base
+uv sync --group dev --extra full
 ```
 
 Run tests:
+
 ```bash
 # Full suite
-python -m pytest tests/ -q
+uv run python -m pytest tests/ -q
 
-# Fast subset (no glum required — covers variable, metrics, bin_suggestor, discovery, bootstrap)
-python -m pytest tests/test_variable.py tests/test_metrics.py tests/test_bin_suggestor.py tests/test_discovery.py tests/test_bootstrap.py -q
+# Focused module
+uv run python -m pytest tests/test_variable.py -q
 
-# Single test file
-python -m pytest tests/test_variable.py -q
+# Focused set
+uv run python -m pytest tests/test_metrics.py tests/test_validation.py tests/test_bootstrap.py -q
 
 # Single test by name
-python -m pytest tests/test_variable.py::TestGetBinLabels::test_labels_have_letter_prefix -v
+uv run python -m pytest tests/test_variable.py::TestGetBinLabels::test_labels_have_letter_prefix -v
 ```
 
-**Known pre-existing failures (6, do not fix without asking):** `test_numeric_has_cap_upper`, `test_cap_lower_clips_low_values`, `test_log_transform_applies_log1p`, `test_impute_median_uses_correct_value`, `test_impute_mean_fills_nulls`, `test_impute_constant_fills_nulls` — all in `TestNumericTransforms` / `TestDefaultConfig`.
+Run code-quality checks:
 
-**Other known pre-existing issues (do not fix without asking):**
-- `test_bin_suggestor.py::TestOptBin` — 5 tests crash due to `optbinning` / `ortools` DLL load failure (Windows `0xc0000139`). Exclude with `-k "not TestOptBin"`.
-- `test_tool.py::TestRelativitiesTable` — 15 tests fail due to numpy truth-value ambiguity on `_weights_array or np.ones()` at `tool.py:974` (fixed to use `if ... is not None else`).
-- `test_tool.py::TestExcelVersion` — 12 tests fail due to polars `SchemaError` (join key type `str` vs `null`). Exclude with `-k "not TestExcelVersion"`.
+```bash
+uv run ruff check elastic_net_tool
+uv run ruff format --check elastic_net_tool
+```
 
-**No git repository** — this project is not git-initialized. Do not run `git` commands.
+Ruff targets Python 3.10, enforces a maximum cyclomatic complexity and branch
+count of 10, and a maximum of 50 statements per callable. `gui.py` is excluded
+from Ruff because it is outside the current refactoring scope.
+
+### Current Test Baseline
+
+As of 2026-08-21, the locked UV environment collects 348 tests and reports
+205 passed, 118 failed, and 25 errors. This is the pre-existing baseline for
+the current refactor; do not broaden a scoped change to repair these failures
+without asking. The main failure groups are:
+
+- seven numeric transformation/default-configuration expectation failures in
+  `test_variable.py`
+- one `optbinning` compatibility failure in `test_bin_suggestor.py`
+- 17 model tests and 12 metrics/validation/bootstrap tests whose expectations
+  have drifted from the current APIs or dependency behavior
+- 16 discovery tests affected by optional configuration handling
+- 65 tool and chained-IO failures, including stale method/parameter expectations
+  and current Polars schema behavior
+- 25 GUI setup errors because GUI construction passes a constructor argument
+  that `ModelingTool` does not accept
+
+For refactors, compare the relevant focused-test result with this baseline and
+require both Ruff commands to pass. Do not silently treat unrelated baseline
+failures as regressions or fix them as part of cleanup.
+
+Do not run `git` commands in this workspace.
 
 ## Architecture
 
-`ModelingTool` in `tool.py` is the user-facing orchestration class. It delegates everything to the other modules:
+`ModelingTool` in `tool.py` is the user-facing orchestration class. Its public
+methods retain workflow and version-management responsibilities, while short
+same-file private helpers handle validation, factor-table loading, summary-row
+construction, comparison inputs, monitoring, and bootstrap aggregation. Keep
+those helpers in `tool.py` unless the user first approves a file split.
+
+Lower-level work is delegated to the other modules:
 
 - **`variable.py`** — `VariableConfig` (dataclass config per variable) + `Preprocessor` (fit/transform pipeline). The only stateful object users need to understand.
 - **`model.py`** — Wraps `glum` for elastic net GLMs. Produces `ModelVersion` (fitted weights model) or `FactorModelVersion` (Excel-loaded factor table).
@@ -45,6 +82,11 @@ python -m pytest tests/test_variable.py::TestGetBinLabels::test_labels_have_lett
 - **`bin_suggestor.py`** — Stateless breakpoint suggestion (quantile, equal-width, optbinning, GBM). Never modifies `VariableConfig`; only returns suggested break lists.
 - **`discovery.py`** — Shadow GBM diagnostics: `fit_shadow_gbm`, `permutation_importance`, `interaction_ranking` (Friedman H-statistic), `partial_dependence_2d`, `residual_gbm`. Categoricals are one-hot encoded automatically; importance is reported per original variable, not per dummy. All functions are also exposed as `ModelingTool` methods.
 - **`io_utils.py`** — Pickle-based `save_version` / `load_version`.
+
+All non-GUI modules follow the same internal pattern: small private helpers
+separate validation, data preparation, computation, and result assembly. Avoid
+recombining these stages into long methods or adding abstraction that is used
+only once and does not clarify the flow.
 
 ### `Preprocessor` internals
 
@@ -81,11 +123,20 @@ The `VariableConfig` docstring and package quick-start use this DataFrame API.
 
 ### glum dependency
 
-`model.py` hard-imports glum at the top level. `conftest.py` inserts a `MagicMock` into `sys.modules["glum"]` before importing `elastic_net_tool` so that the five glum-free test modules can run without glum installed. Tests requiring a real glum are marked `@pytest.mark.requires_glum` and auto-skipped when the mock is active.
+`model.py` hard-imports glum at the top level. When glum is unavailable,
+`conftest.py` inserts a `MagicMock` into `sys.modules["glum"]` before importing
+`elastic_net_tool`, allowing independent module tests to load. Tests requiring
+a real glum are marked `@pytest.mark.requires_glum` and auto-skipped when the
+mock is active. Normal development should use the fully synced UV environment.
 
 ### Gotchas
 
 - **`ModelVersion.train_predictions`**, not `.predictions` — all model versions (including `FactorModelVersion`) store predictions in `train_predictions`. There is no `.predictions` attribute.
+- **`ModelingTool.fit_model` is side-effect oriented** — it stores the fitted
+  version and updates `current_version`. Despite its current return annotation,
+  the wrapper returns `None`; the module-level `model.fit_model` returns a
+  `ModelVersion`. Preserve that behavior unless an API change is explicitly
+  requested.
 - **Derived variables with `input_cols`** — when creating a variable from a different source column (e.g. "region" from "state"), use `input_cols=["state"]` not `col="state"`. The first positional arg to `add_variable()` is always the output variable name AND the `col` param. Categorical detection is automatic from the transform's output dtype (string → categorical, numeric → continuous); `is_categorical=True` is only needed to force categorical treatment when the output dtype is numeric.
 - **Chained derived variables** — `input_cols` may name other registered derived variables. Downstream transforms receive the upstream raw custom-transform result, before the upstream cap/log/bin/encoding pipeline. Only variables explicitly requested by the model are emitted as predictors.
 - **`log_transform=True` and sentinels** — `_apply_num_transforms` checks `np.min(out) > 0` which includes sentinel values (`-999_999_999`). This means `log_transform=True` will always fail on columns with sentinel-encoded missings. Also fails if the column can contain 0.

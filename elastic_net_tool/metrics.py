@@ -10,11 +10,15 @@ import polars as pl
 
 
 # ── Validation ───────────────────────────────────────────────────────────
-def _validate_arrays(*arrays: np.ndarray, names: Sequence[str] = ()) -> tuple[np.ndarray, ...]:
+def _validate_arrays(
+    *arrays: np.ndarray, names: Sequence[str] = ()
+) -> tuple[np.ndarray, ...]:
     converted = tuple(np.asarray(value, dtype=float) for value in arrays)
     if not converted or any(value.ndim != 1 for value in converted):
         raise ValueError("Metric inputs must be one-dimensional arrays.")
-    if not len(converted[0]) or any(len(value) != len(converted[0]) for value in converted[1:]):
+    if not len(converted[0]) or any(
+        len(value) != len(converted[0]) for value in converted[1:]
+    ):
         raise ValueError("Metric inputs must be non-empty and have matching lengths.")
     for i, value in enumerate(converted):
         if not np.all(np.isfinite(value)):
@@ -24,22 +28,54 @@ def _validate_arrays(*arrays: np.ndarray, names: Sequence[str] = ()) -> tuple[np
 
 
 def _validate_weights(weights: np.ndarray | None, n: int) -> np.ndarray:
-    values = np.ones(n, dtype=float) if weights is None else np.asarray(weights, dtype=float)
+    values = (
+        np.ones(n, dtype=float) if weights is None else np.asarray(weights, dtype=float)
+    )
     if values.ndim != 1 or len(values) != n:
         raise ValueError(f"weights must be one-dimensional with length {n}.")
     if not np.all(np.isfinite(values)) or np.any(values < 0) or values.sum() <= 0:
-        raise ValueError("weights must be finite, non-negative, and have a positive total.")
+        raise ValueError(
+            "weights must be finite, non-negative, and have a positive total."
+        )
     return values
 
 
 def _validate_bucket_count(n_buckets: int, n: int) -> None:
-    if not isinstance(n_buckets, int) or isinstance(n_buckets, bool) or n_buckets < 2 or n_buckets > n:
+    if (
+        not isinstance(n_buckets, int)
+        or isinstance(n_buckets, bool)
+        or n_buckets < 2
+        or n_buckets > n
+    ):
         raise ValueError(f"n_buckets must be an integer from 2 through {n}.")
-    
+
+
+def _equal_weight_buckets(
+    sort_values: np.ndarray,
+    weights: np.ndarray,
+    n_buckets: int,
+) -> np.ndarray:
+    """Assign stable, sequential buckets with approximately equal weight."""
+    _validate_bucket_count(n_buckets, len(sort_values))
+    order = np.argsort(sort_values, kind="stable")
+    sorted_weights = weights[order]
+    midpoints = np.cumsum(sorted_weights) - sorted_weights / 2.0
+    sorted_buckets = np.floor(midpoints / weights.sum() * n_buckets).astype(int) + 1
+    sorted_buckets = np.clip(sorted_buckets, 1, n_buckets)
+    buckets = np.empty(len(order), dtype=np.int64)
+    buckets[order] = sorted_buckets
+    return buckets
+
+
 # ── Off Balance by State ───────────────────────────────────────────────────────────
 
+
 def _off_balance_by_state(values, weights, states):
-    values, weights, states = np.asarray(values, dtype=float), np.asarray(weights, dtype=float), np.asarray(states)
+    values, weights, states = (
+        np.asarray(values, dtype=float),
+        np.asarray(weights, dtype=float),
+        np.asarray(states),
+    )
 
     # Unique states and mapping from each row to its state index
     _unique_states, inverse = np.unique(states, return_inverse=True)
@@ -57,7 +93,9 @@ def _off_balance_by_state(values, weights, states):
     # Off-balance values
     return values / row_avgs
 
+
 # ── Gini coefficient ──────────────────────────────────────────────────────────
+
 
 def _gini(y_pred: np.ndarray, y_true: np.ndarray, w: np.ndarray) -> float:
     idx = np.argsort(-y_pred)
@@ -68,6 +106,7 @@ def _gini(y_pred: np.ndarray, y_true: np.ndarray, w: np.ndarray) -> float:
         return 0.0
     cum_loss = np.concatenate([[0.0], np.cumsum(ys * ws) / total_loss])
     return float(2.0 * np.trapezoid(cum_loss, cum_w) - 1.0)
+
 
 def gini_coefficient(
     y_true: np.ndarray,
@@ -95,28 +134,39 @@ def gini_coefficient(
 
     return model_gini / perfect if perfect > 1e-12 else 0.0
 
+
 # ── Lift table ────────────────────────────────────────────────────────────────
 
-def _weighted_relativity(vals1: pl.Series, weights: pl.Series, vals2: pl.Series | None = None) -> pl.Series:
+
+def _weighted_relativity(
+    vals1: pl.Series, weights: pl.Series, vals2: pl.Series | None = None
+) -> pl.Series:
     """
     Compute relativity to the weighted mean for one or two columns in a summary DataFrame.
     """
     vals1_mean = vals1.sum() / weights.sum()
-    rels1 = (vals1 / weights) / vals1_mean if vals1_mean > 1e-12 else pl.zeroes(vals1.len())
+    rels1 = (
+        (vals1 / weights) / vals1_mean if vals1_mean > 1e-12 else pl.zeroes(vals1.len())
+    )
 
     rels2 = None
     if vals2 is not None:
         vals2_mean = vals2.sum() / weights.sum()
-        rels2 = (vals2 / weights) / vals2_mean if vals2_mean > 1e-12 else pl.zeroes(vals2.len())
+        rels2 = (
+            (vals2 / weights) / vals2_mean
+            if vals2_mean > 1e-12
+            else pl.zeroes(vals2.len())
+        )
 
     return rels1, rels2
+
 
 def lift_table(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     weights: np.ndarray | None = None,
     n_buckets: int = 10,
-    states: np.array | None = None
+    states: np.array | None = None,
 ) -> pl.DataFrame:
     """
     Build a lift table with equal-weight buckets sorted by ``y_pred``.
@@ -134,29 +184,33 @@ def lift_table(
     if states is not None:
         y_pred = _off_balance_by_state(y_pred, w, states)
 
-    bks = np.quantile(y_pred, q=np.linspace(0, 1, n_buckets + 1), weights=w, method='inverted_cdf')
-    bks = sorted(set(dict.fromkeys(bks)))[1:-1]  # Exclude min and max
-
+    bucket = _equal_weight_buckets(y_pred, w, n_buckets)
     lift_tab = pl.DataFrame(
         {
-            "predicted_ratio": y_pred,
+            "bucket": bucket,
             "exposure": w,
-            'actual': y_true * w,
-            'predicted': y_pred * w
+            "actual_loss": y_true * w,
+            "predicted_loss": y_pred * w,
         }
     )
-    lift_tab = lift_tab.with_columns([
-        pl.col('predicted_ratio').cut(bks, labels=[str(x) for x in range(1, n_buckets + 1)], left_closed=True).cast(pl.String).cast(pl.Int8).alias("bucket")
-    ])
+    lift_tab_agg = (
+        lift_tab.group_by("bucket")
+        .agg(
+            pl.col("exposure").sum(),
+            pl.col("actual_loss").sum(),
+            pl.col("predicted_loss").sum(),
+        )
+        .sort("bucket")
+        .with_columns(
+            (pl.col("actual_loss") / pl.col("exposure")).alias("actual"),
+            (pl.col("predicted_loss") / pl.col("exposure")).alias("predicted"),
+        )
+    )
+    overall = float(np.average(y_true, weights=w))
+    return lift_tab_agg.with_columns((pl.col("actual") / overall).alias("lift")).select(
+        "bucket", "actual", "predicted", "exposure", "lift"
+    )
 
-    
-    lift_tab_agg = lift_tab.group_by('bucket').agg(pl.exclude('predicted_ratio').sum()).filter(pl.col('bucket').is_not_null()).sort("bucket", descending=False)
-
-    pred_rels, act_rels = _weighted_relativity(lift_tab_agg['predicted'], lift_tab_agg['exposure'], lift_tab_agg['actual'])
-
-    lift_tab_agg = lift_tab_agg.with_columns(pred_rels.alias("predicted"), act_rels.alias("actual"))
-
-    return lift_tab_agg.select(pl.col('bucket', 'actual', 'predicted', 'exposure'))
 
 def lift_rmse(lift_tab: pl.DataFrame) -> float:
     """
@@ -168,8 +222,9 @@ def lift_rmse(lift_tab: pl.DataFrame) -> float:
     total_loss_ratio = np.average(lift_tab["actual"], weights=lift_tab["exposure"])
     preds_for_rmse = lift_tab["predicted"] * total_loss_ratio * lift_tab["exposure"]
 
-    residuals = preds_for_rmse - (lift_tab["actual"] * lift_tab["exposure"]) 
-    return float(np.sqrt(np.average(residuals ** 2, weights=lift_tab["exposure"])))
+    residuals = preds_for_rmse - (lift_tab["actual"] * lift_tab["exposure"])
+    return float(np.sqrt(np.average(residuals**2, weights=lift_tab["exposure"])))
+
 
 def lift_range(lift_tab: pl.DataFrame) -> float:
     """
@@ -179,9 +234,14 @@ def lift_range(lift_tab: pl.DataFrame) -> float:
     across the distribution of predictions.  A higher range indicates better
     discrimination.
     """
-    return float(lift_tab['actual'][lift_tab['bucket'].arg_max()] / lift_tab['predicted'][lift_tab['bucket'].arg_max()])
+    return float(
+        lift_tab["actual"][lift_tab["bucket"].arg_max()]
+        / lift_tab["predicted"][lift_tab["bucket"].arg_max()]
+    )
+
 
 # ── Double lift table ─────────────────────────────────────────────────────────
+
 
 def double_lift_table(
     y_true: np.ndarray,
@@ -189,7 +249,7 @@ def double_lift_table(
     pred2: np.ndarray,
     weights: np.ndarray | None = None,
     n_buckets: int = 10,
-    states: np.array | None = None
+    states: np.array | None = None,
 ) -> pl.DataFrame:
     """
     Build a double-lift table comparing two models using equal-weight buckets.
@@ -203,53 +263,59 @@ def double_lift_table(
         Columns: ``bucket``, ``actual``, ``model1``, ``model2``,
         ``ratio_mean``, ``exposure``.
     """
-    y_true, pred1, pred2 = _validate_arrays(y_true, pred1, pred2, names=("y_true", "pred1", "pred2"))
+    y_true, pred1, pred2 = _validate_arrays(
+        y_true, pred1, pred2, names=("y_true", "pred1", "pred2")
+    )
     w = _validate_weights(weights, len(y_true))
 
     if states is not None:
         pred1 = _off_balance_by_state(pred1, w, states)
         pred2 = _off_balance_by_state(pred2, w, states)
 
-    pred_ratio = pred2 / pred1  # Sort ratio
-    bks = np.quantile(pred_ratio, q=np.linspace(0, 1, n_buckets + 1), weights=w, method='inverted_cdf')
-
-    # Remove duplicates while preserving order of breaks
-    bks = sorted(set(dict.fromkeys(bks)))[1:-1]  # Exclude min and max
-
+    if np.any(np.isclose(pred1, 0.0)):
+        raise ValueError("pred1 must not contain zero values.")
+    pred_ratio = pred2 / pred1
+    bucket = _equal_weight_buckets(pred_ratio, w, n_buckets)
     dl_tab = pl.DataFrame(
         {
-            "Actual_Loss": y_true * w,
-            "Pred1_Loss": pred1 * w,
-            "Pred2_Loss": pred2 * w,
-            "Ratio": pred_ratio,
-            "weight": w,
+            "bucket": bucket,
+            "actual_loss": y_true * w,
+            "pred1_loss": pred1 * w,
+            "pred2_loss": pred2 * w,
+            "ratio_loss": pred_ratio * w,
+            "exposure": w,
         }
     )
-    dl_tab = dl_tab.with_columns([
-        pl.col('Ratio').cut(bks, labels=[str(x) for x in range(1, n_buckets + 1)], left_closed=True).cast(pl.String).cast(pl.Int8).alias("bucket")
-    ])
+    dl_agg = dl_tab.group_by("bucket").agg(pl.exclude("bucket").sum()).sort("bucket")
 
-    dl_agg = (dl_tab.group_by("bucket").agg(pl.exclude('Ratio').sum())).filter(pl.col('bucket').is_not_null()).sort("bucket", descending=False)
+    pred1_rels, pred2_rels = _weighted_relativity(
+        dl_agg["pred1_loss"], dl_agg["exposure"], dl_agg["pred2_loss"]
+    )
+    act_rels, _ = _weighted_relativity(dl_agg["actual_loss"], dl_agg["exposure"])
 
-    pred1_rels, pred2_rels = _weighted_relativity(dl_agg["Pred1_Loss"], dl_agg["weight"], dl_agg["Pred2_Loss"])
-    act_rels, _ = _weighted_relativity(dl_agg["Actual_Loss"], dl_agg["weight"])
+    dl_agg = dl_agg.with_columns(
+        [
+            pred1_rels.alias("model1"),
+            pred2_rels.alias("model2"),
+            act_rels.alias("actual"),
+            (pl.col("ratio_loss") / pl.col("exposure")).alias("ratio_mean"),
+        ]
+    )
 
-    dl_agg = dl_agg.with_columns([
-        pred1_rels.alias('model1'),
-        pred2_rels.alias('model2'),
-        act_rels.alias("actual"),
-    ])
+    return dl_agg.select(
+        "bucket", "actual", "model1", "model2", "ratio_mean", "exposure"
+    )
 
-    return dl_agg.select(pl.col('bucket', 'weight', 'actual', 'model1', 'model2'))
 
 # ── Summary metrics ───────────────────────────────────────────────────────────
+
 
 def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     weights: np.ndarray | None = None,
     version_name: str = "model",
-    states: np.array | None = None
+    states: np.array | None = None,
 ) -> pl.DataFrame:
     """
     Compute MSE, RMSE, MAE, Gini (raw and normalised).
@@ -259,32 +325,41 @@ def compute_metrics(
     pl.DataFrame
         Columns: ``metric``, ``<version_name>``.
     """
-    if not isinstance(version_name, str) or not version_name: raise ValueError("version_name must be a non-empty string.")
+    if not isinstance(version_name, str) or not version_name:
+        raise ValueError("version_name must be a non-empty string.")
     y_true, y_pred = _validate_arrays(y_true, y_pred, names=("y_true", "y_pred"))
     w = _validate_weights(weights, len(y_true))
     if len(y_true) < 2:
-        raise ValueError("compute_metrics requires at least two observations to compute lift metrics.")
-
+        raise ValueError(
+            "compute_metrics requires at least two observations to compute lift metrics."
+        )
     if states is not None:
         y_pred = _off_balance_by_state(y_pred, w, states)
 
     resid = w * (y_true - y_pred)
-    mse = np.average(resid ** 2, weights=w)
+    mse = np.average(resid**2, weights=w)
 
-    lift_tab = lift_table(y_true, y_pred, weights, n_buckets=20)
+    lift_tab = lift_table(
+        y_true,
+        y_pred,
+        weights,
+        n_buckets=min(20, len(y_true)),
+    )
     lift_range_val = lift_range(lift_tab)
     lift_rmse_val = lift_rmse(lift_tab)
 
     metrics = {
         "mse": mse,
-        "rmse": mse ** 0.5,
+        "rmse": mse**0.5,
         "mae": np.average(np.abs(resid), weights=w),
         "gini": gini_coefficient(y_true, y_pred, w, normalize=False),
         "gini_norm": gini_coefficient(y_true, y_pred, w, normalize=True),
-        'lift_range': lift_range_val,
-        'lift_rmse': lift_rmse_val
+        "lift_range": lift_range_val,
+        "lift_rmse": lift_rmse_val,
     }
-    return pl.DataFrame({"metric": list(metrics.keys()), version_name: list(metrics.values())})
+    return pl.DataFrame(
+        {"metric": list(metrics.keys()), version_name: list(metrics.values())}
+    )
 
 
 def double_lift_score(
@@ -321,6 +396,42 @@ def double_lift_score(
     return float((np.abs(m1 - a) - np.abs(m2 - a)).sum())
 
 
+def _metric_winner(
+    metric: str,
+    first_value: float,
+    second_value: float,
+    first_name: str,
+    second_name: str,
+) -> str:
+    """Choose the winning model for one summary metric."""
+    if metric in {"mse", "rmse", "mae", "lift_rmse"}:
+        if first_value < second_value:
+            return first_name
+        return second_name if second_value < first_value else "tie"
+    if metric in {"gini", "gini_norm", "lift_range"}:
+        if first_value > second_value:
+            return first_name
+        return second_name if second_value > first_value else "tie"
+    return ""
+
+
+def _double_lift_metric_row(
+    score: float,
+    first_name: str,
+    second_name: str,
+) -> pl.DataFrame:
+    """Build the optional single-row double-lift comparison result."""
+    winner = first_name if score < 0 else (second_name if score > 0 else "tie")
+    return pl.DataFrame(
+        {
+            "metric": ["double_lift_score"],
+            first_name: [score],
+            second_name: [score],
+            "winner": [winner],
+        }
+    )
+
+
 def compare_metrics(
     y_true: np.ndarray,
     pred1: np.ndarray,
@@ -330,7 +441,7 @@ def compare_metrics(
     name2: str = "model2",
     dl_score: float | None = None,
     deviation: str = "absolute",
-    states: np.array | None = None
+    states: np.array | None = None,
 ) -> pl.DataFrame:
     """
     Return side-by-side metrics for two model versions with a ``winner`` column.
@@ -345,7 +456,12 @@ def compare_metrics(
     deviation : {'absolute', 'relative'}
         Forwarded to :func:`double_lift_score` when computing winner annotation.
     """
-    if not all(isinstance(name, str) and name for name in (name1, name2)) or name1 == name2: raise ValueError("Model names must be distinct non-empty strings.")
+    invalid_names = (
+        not all(isinstance(name, str) and name for name in (name1, name2))
+        or name1 == name2
+    )
+    if invalid_names:
+        raise ValueError("Model names must be distinct non-empty strings.")
     if states is not None:
         pred1 = _off_balance_by_state(pred1, weights, states)
         pred2 = _off_balance_by_state(pred2, weights, states)
@@ -355,37 +471,22 @@ def compare_metrics(
     merged = m1.join(m2, on="metric")
 
     # ── winner annotation ────────────────────────────────────────────────────
-    _lower_better = {"mse", "rmse", "mae", 'lift_rmse'}
-    _higher_better = {"gini", "gini_norm", 'lift_range'}
-
-    winners: list[str] = []
-    for row in merged.iter_rows(named=True):
-        metric = row["metric"]
-        v1, v2 = row[name1], row[name2]
-        if metric in _lower_better:
-            winners.append(name1 if v1 < v2 else (name2 if v2 < v1 else "tie"))
-        elif metric in _higher_better:
-            winners.append(name1 if v1 > v2 else (name2 if v2 > v1 else "tie"))
-        else:
-            winners.append("")
+    winners = [
+        _metric_winner(row["metric"], row[name1], row[name2], name1, name2)
+        for row in merged.iter_rows(named=True)
+    ]
 
     merged = merged.with_columns(pl.Series("winner", winners))
 
     # ── optional double-lift score row ───────────────────────────────────────
     if dl_score is not None:
-        dl_winner = name1 if dl_score < 0 else (name2 if dl_score > 0 else "tie")
-        dl_row = pl.DataFrame({
-            "metric": ["double_lift_score"],
-            name1: [dl_score],
-            name2: [dl_score],
-            "winner": [dl_winner],
-        })
-        merged = pl.concat([merged, dl_row])
+        merged = pl.concat([merged, _double_lift_metric_row(dl_score, name1, name2)])
 
     return merged
 
 
 # ── Variance Inflation Factor ────────────────────────────────────────────────
+
 
 def vif_table(design_matrix: pl.DataFrame) -> pl.DataFrame:
     """
@@ -431,6 +532,7 @@ def vif_table(design_matrix: pl.DataFrame) -> pl.DataFrame:
 
 # ── Bootstrap confidence intervals ──────────────────────────────────────────
 
+
 def bootstrap_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -464,7 +566,9 @@ def bootstrap_metrics(
 
     if metric_fns is None:
         metric_fns = {
-            "gini_norm": lambda yt, yp, wt: gini_coefficient(yt, yp, wt, normalize=True),
+            "gini_norm": lambda yt, yp, wt: gini_coefficient(
+                yt, yp, wt, normalize=True
+            ),
             "mse": lambda yt, yp, wt: -np.average((yt - yp) ** 2, weights=wt),
         }
 
@@ -485,22 +589,25 @@ def bootstrap_metrics(
     rows = []
     for name in metric_fns:
         samples = np.array(boot_results[name])
-        rows.append({
-            "metric": name,
-            "point_estimate": points[name],
-            "ci_lower": float(np.quantile(samples, alpha)),
-            "ci_upper": float(np.quantile(samples, 1 - alpha)),
-            "std_error": float(np.std(samples)),
-        })
+        rows.append(
+            {
+                "metric": name,
+                "point_estimate": points[name],
+                "ci_lower": float(np.quantile(samples, alpha)),
+                "ci_upper": float(np.quantile(samples, 1 - alpha)),
+                "std_error": float(np.std(samples)),
+            }
+        )
 
     return pl.DataFrame(rows)
 
+
 def _compute_mors(
-        pred: np.ndarray,
-        state: pl.Series,
-        expense_values: dict[str, float],
-        rate_adequacy_factors: pl.DataFrame
-    ) -> np.ndarray:
+    pred: np.ndarray,
+    state: pl.Series,
+    expense_values: dict[str, float],
+    rate_adequacy_factors: pl.DataFrame,
+) -> np.ndarray:
     """
     Compute the MORS (Middle of Ranges) for a set of predictions.
 
@@ -513,7 +620,7 @@ def _compute_mors(
     expense_values : dict
         Dictionary of expense values. Need CWR_FIXED_EXP_RATIO, CWR_ULAE_RATIO, and CWR_LOSS_PLUS_ALAE_RATIO.
     rate_adequacy_factors : pl.DataFrame
-        DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code) 
+        DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code)
         and rate adequacy factor column should be named 'RATE_ADEQUACY_FACTOR'.
 
     Returns
@@ -521,8 +628,14 @@ def _compute_mors(
     np.ndarray
         Array of MORS values for each observation.
     """
-    fer, ulae, llae = expense_values["CWR_FIXED_EXP_RATIO"], expense_values["CWR_ULAE_RATIO"], expense_values["CWR_LOSS_PLUS_ALAE_RATIO"]
-    rafs = state.replace_strict(dict(rate_adequacy_factors.iter_rows()), default=1.0).to_numpy()
+    fer, ulae, llae = (
+        expense_values["CWR_FIXED_EXP_RATIO"],
+        expense_values["CWR_ULAE_RATIO"],
+        expense_values["CWR_LOSS_PLUS_ALAE_RATIO"],
+    )
+    rafs = state.replace_strict(
+        dict(rate_adequacy_factors.iter_rows()), default=1.0
+    ).to_numpy()
     pricing_rels = (pred * llae + ulae + fer) / (llae + ulae + fer)
     return pricing_rels * (1 + rafs)
 
@@ -552,7 +665,7 @@ def compute_midpoint_movement(
     expense_values : dict
         Dictionary of expense values. Need CWR_FIXED_EXP_RATIO, CWR_ULAE_RATIO, and CWR_LOSS_PLUS_ALAE_RATIO
     rate_adequacy_factors : pl.DataFrame
-        DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code) 
+        DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code)
         and rate adequacy factor column should be named 'RATE_ADEQUACY_FACTOR'.
     name1 : str
         Name of the first model version (for labeling in the output).
@@ -567,25 +680,35 @@ def compute_midpoint_movement(
     pl.DataFrame
         All columns from ``policy_info`` plus ``weight``, ``name1``, ``name2``, and ``midpoint_movement``.
     """
-    if any(col not in policy_info.columns for col in ['POLICY_NUM', 'POLICY_EFF_DT']):
-        raise ValueError("policy_info must contain columns: 'POLICY_NUM', 'POLICY_EFF_DT'.")
-    
+    if any(col not in policy_info.columns for col in ["POLICY_NUM", "POLICY_EFF_DT"]):
+        raise ValueError(
+            "policy_info must contain columns: 'POLICY_NUM', 'POLICY_EFF_DT'."
+        )
+
     pred1, pred2 = np.asarray(pred1, dtype=float), np.asarray(pred2, dtype=float)
     if not (len(pred1) == len(pred2) == len(policy_info)):
         raise ValueError("pred1, pred2, and policy_info must have the same length.")
 
-    state_col = [col for col in policy_info.columns if 'state' in col.lower()]
+    state_col = [col for col in policy_info.columns if "state" in col.lower()]
     if not state_col or len(state_col) > 1:
-        raise ValueError("policy_info must contain one column for state (two letter code).")
+        raise ValueError(
+            "policy_info must contain one column for state (two letter code)."
+        )
     if policy_info[state_col[0]].str.len_chars().max() > 2:
-        raise ValueError("State column in policy_info must contain two-letter state codes.")
+        raise ValueError(
+            "State column in policy_info must contain two-letter state codes."
+        )
     state_col = state_col[0]
 
     if weights is None:
         weights = np.ones(len(pred1), dtype=float)
 
-    mor1 = _compute_mors(pred1, policy_info[state_col], expense_values, rate_adequacy_factors)
-    mor2 = _compute_mors(pred2, policy_info[state_col], expense_values, rate_adequacy_factors)
+    mor1 = _compute_mors(
+        pred1, policy_info[state_col], expense_values, rate_adequacy_factors
+    )
+    mor2 = _compute_mors(
+        pred2, policy_info[state_col], expense_values, rate_adequacy_factors
+    )
 
     movements = mor2 / mor1 - 1
 
@@ -593,5 +716,5 @@ def compute_midpoint_movement(
         pl.Series(weights).alias("weight"),
         pl.Series(mor1).alias(name1),
         pl.Series(mor2).alias(name2),
-        pl.Series(movements).alias("midpoint_movement")
+        pl.Series(movements).alias("midpoint_movement"),
     )

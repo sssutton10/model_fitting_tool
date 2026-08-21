@@ -147,8 +147,9 @@ def fitted_tool(sample_df: pl.DataFrame):
         sample_df,
         target_col="loss_ratio",
         weight_col="earned_premium",
+        cv_column="cv_fold",
     )
-    tool.add_variable("driver_age", cap_upper=0.99)
+    tool.add_variable("driver_age", cap_upper=70.0)
     tool.add_variable("state", encoding="onehot")
 
     tool.fit_model(["driver_age"], version="v1",

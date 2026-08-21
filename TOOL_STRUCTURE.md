@@ -42,7 +42,7 @@ workflow, but it does not do most of the low-level work itself. It delegates:
 ```text
 elastic_net_tool/
   __init__.py        Public package exports and quick-start example.
-  tool.py            ModelingTool facade and user workflow orchestration.
+  tool.py            ModelingTool facade, same-file helpers, and orchestration.
   variable.py        VariableConfig and Preprocessor.
   model.py           glum model fitting plus ModelVersion and FactorModelVersion.
   metrics.py         Stateless model metrics and lift/double-lift tables.
@@ -50,12 +50,14 @@ elastic_net_tool/
   bin_suggestor.py   Breakpoint suggestion methods for numeric variables.
   discovery.py       LightGBM/SHAP diagnostics and feature discovery helpers.
   io_utils.py        Save/load helpers for fitted versions.
-  gui.py             Panel GUI support.
+  gui.py             Panel GUI support; excluded from the current refactor/lint scope.
 
 example_usage.py     End-to-end synthetic insurance modeling example.
 run_gui.py           GUI entry point.
 tests/               Unit tests for preprocessing, metrics, discovery, IO, etc.
-pyproject.toml       Package metadata and dependencies.
+pyproject.toml       Package metadata, dependencies, pytest settings, and Ruff rules.
+uv.lock              Locked UV dependency environment.
+AGENTS.md            Development commands, constraints, and current test baseline.
 ```
 
 `example_usage.py` is the best runnable walkthrough. This document is meant to
@@ -115,6 +117,32 @@ fold assignments must be stable or come from an external split.
 
 The default is `"max_weight"` because the most common exposure group is often
 the clearest reference level for interpreting rating relativities.
+
+### Internal Organization of `tool.py`
+
+The public `ModelingTool` methods remain in `tool.py`; the refactor deliberately
+does not introduce more modules. The file uses small private helpers to keep
+each workflow readable while preserving the public API and execution order.
+The main helper groups are:
+
+- request, column, and factor-table validation
+- variable-config construction and CV resolution
+- Excel factor loading and prediction initialization
+- model-summary, encoded-level, and extra-variable row construction
+- prediction-source resolution and A/V/E level aggregation
+- overfitting-monitor baseline and metric selection
+- bootstrap coefficient fitting and relativity-table assembly
+
+The other package modules follow the same pattern internally. For example,
+`variable.py` separates configuration validation, recursive raw-column
+materialization, and numeric/categorical fitting; `model.py` separates
+preprocessor construction from estimator fitting and stability aggregation;
+and `discovery.py` separates feature encoding from each diagnostic calculation.
+
+Private helpers should remain close to the workflow they support. A helper is
+worth adding when it isolates a coherent validation, preparation, calculation,
+or result-assembly step. Do not create a new module or move helpers to another
+file without first presenting the proposed boundary and receiving approval.
 
 ## Modeling Workflow Through `ModelingTool`
 
@@ -213,6 +241,10 @@ in `tool.model_versions`, and records the version as current.
 The `ModelingTool` wrapper is normally used for its side effect of storing the
 named version. Retrieve fitted versions later through `tool.model_versions`,
 `tool._get_version(...)`, or the public inspection/prediction methods.
+The wrapper currently returns `None` despite its `ModelVersion` return
+annotation; the lower-level `model.fit_model` function is the function that
+returns the fitted `ModelVersion`. This is existing behavior, not an invitation
+to change the public API during a refactor.
 
 When `alpha` is supplied, `use_cv` is turned off and the model is fit with that
 fixed regularization strength. Passing `alpha=0.0` fits an unpenalized GLM.
@@ -770,8 +802,9 @@ touch `VariableConfig`, `Preprocessor._fit_col`, `_transform_num` or
 `_transform_cat`, and `_compute_feature_names`.
 
 To add a new model diagnostic that needs fitted model context, add a method to
-`ModelingTool` and delegate computation to a stateless helper module when
-possible.
+`ModelingTool` and delegate computation to the appropriate existing stateless
+module when possible. If no existing module is a clear fit, present a proposed
+file split and obtain approval before creating one.
 
 To add a new metric, prefer adding a stateless function to `metrics.py`, then
 wire it into `ModelingTool` only if it needs version lookup or model comparison
@@ -784,12 +817,22 @@ columns, or fitted preprocessors.
 To add a new discovery routine, keep the core implementation in `discovery.py`
 and expose a light wrapper on `ModelingTool`.
 
+Keep public methods focused on orchestration. Validation, data preparation,
+calculation, and output construction should be distinct steps when combining
+them would make a callable difficult to scan. Ruff enforces a maximum
+cyclomatic complexity and branch count of 10 and a maximum of 50 statements per
+callable across the non-GUI package.
+
 ## Important Gotchas
 
 All user-facing DataFrames are expected to be `polars.DataFrame` objects.
 
 `ModelVersion.train_predictions` is the stored training prediction array. There
 is no `.predictions` attribute.
+
+`ModelingTool.fit_model` stores a version and returns `None`; use
+`tool.model_versions[version]` to access the fitted container. The module-level
+`elastic_net_tool.model.fit_model` returns a `ModelVersion`.
 
 Custom transforms use the DataFrame-based signature
 `custom_transform(df: pl.DataFrame, **kwargs)`. Some older comments or examples
@@ -815,6 +858,29 @@ relative to the dropped level.
 Discovery helpers may require optional dependencies such as `lightgbm`, `shap`,
 `openpyxl`, or `optbinning`. The core package dependencies are listed in
 `pyproject.toml`; optional extras are under the `full` extra.
+
+## Development Workflow
+
+Use UV for dependency management and every Python invocation:
+
+```bash
+uv sync --group dev --extra full
+uv run python -m pytest tests/ -q
+uv run ruff check elastic_net_tool
+uv run ruff format --check elastic_net_tool
+```
+
+Ruff targets Python 3.10 with an 88-character line length. It checks import
+ordering, selected correctness rules, complexity, branch count, and statement
+count. `elastic_net_tool/gui.py` is intentionally excluded; the current
+refactoring and formatting scope is every other package script.
+
+As of 2026-08-21, the full locked-environment baseline is 348 collected,
+205 passed, 118 failed, and 25 errors. Those failures span older test/API
+expectations, current dependency behavior, optional discovery configuration,
+and GUI constructor drift. See `AGENTS.md` for the categorized baseline. A
+scoped refactor should preserve its relevant focused-test result and leave both
+Ruff checks green; unrelated baseline repairs require separate approval.
 
 ## Minimal End-to-End Example
 

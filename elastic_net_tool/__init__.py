@@ -45,15 +45,28 @@ Quick start
 >>> predictions = frozen.predict(df)
 """
 
-from .variable import (
-    MISSING_SENTINEL,
-    Preprocessor,
-    VariableConfig,
-    compute_quantile_bin_edges,
-    default_config,
-    make_bin_labels,
+from .bin_suggestor import (
+    suggest_bins,
+    suggest_bins_equal_width,
+    suggest_bins_gbm,
+    suggest_bins_optbin,
+    suggest_bins_quantile,
 )
-from .model import FactorModelVersion, ModelVersion, fit_cv_stability, fit_model
+from .discovery import (
+    boruta_select,
+    fit_shadow_gbm,
+    interaction_ranking,
+    monotonicity_test,
+    partial_dependence_2d,
+    permutation_importance,
+    residual_gbm,
+    shap_dependence,
+    shap_importance,
+    shap_interaction_ranking,
+    suggest_category_groups,
+    tree_interaction_cooccurrence,
+)
+from .io_utils import load_version, save_version
 from .metrics import (
     bootstrap_metrics,
     compare_metrics,
@@ -64,6 +77,7 @@ from .metrics import (
     lift_table,
     vif_table,
 )
+from .model import FactorModelVersion, ModelVersion, fit_cv_stability, fit_model
 from .plots import (
     ae_chart,
     bootstrap_ci_plot,
@@ -82,29 +96,17 @@ from .plots import (
     residual_heatmap,
     univariate_plot,
 )
-from .discovery import (
-    boruta_select,
-    fit_shadow_gbm,
-    interaction_ranking,
-    monotonicity_test,
-    partial_dependence_2d,
-    permutation_importance,
-    residual_gbm,
-    shap_dependence,
-    shap_importance,
-    shap_interaction_ranking,
-    suggest_category_groups,
-    tree_interaction_cooccurrence,
-)
-from .io_utils import load_version, save_version
-from .bin_suggestor import (
-    suggest_bins,
-    suggest_bins_equal_width,
-    suggest_bins_gbm,
-    suggest_bins_optbin,
-    suggest_bins_quantile,
-)
 from .tool import ModelingTool
+from .variable import (
+    MISSING_SENTINEL,
+    Preprocessor,
+    VariableConfig,
+    compute_quantile_bin_edges,
+    default_config,
+)
+from .variable import (
+    make_bin_labels as make_bin_labels,
+)
 
 __all__ = [
     # Main interface

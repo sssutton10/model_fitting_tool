@@ -223,7 +223,15 @@ class TestComputeMetrics:
         y = np.array([1.0, 2.0, 3.0])
         pred = np.array([1.1, 1.9, 3.1])
         result = compute_metrics(y, pred)
-        assert set(result["metric"].to_list()) == {"mse", "rmse", "mae", "gini", "gini_norm"}
+        assert set(result["metric"].to_list()) == {
+            "mse",
+            "rmse",
+            "mae",
+            "gini",
+            "gini_norm",
+            "lift_range",
+            "lift_rmse",
+        }
 
     def test_rmse_equals_sqrt_mse(self):
         rng = np.random.default_rng(30)

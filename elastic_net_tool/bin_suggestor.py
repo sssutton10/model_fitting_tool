@@ -65,6 +65,7 @@ def _print_splits(method: str, col: str, splits: list[float]) -> None:
 
 # ── Method 1: Equal-weight quantile ──────────────────────────────────────────
 
+
 def suggest_bins_quantile(
     col: str,
     X: pl.DataFrame,
@@ -87,11 +88,7 @@ def suggest_bins_quantile(
         Exposure or frequency weight for each row.
     """
     arr = X[col].to_numpy().astype(float)
-    w = (
-        weights.to_numpy().astype(float)
-        if weights is not None
-        else np.ones(len(arr))
-    )
+    w = weights.to_numpy().astype(float) if weights is not None else np.ones(len(arr))
     arr, w = _drop_sentinel(arr, w)
 
     quantiles = np.linspace(0.0, 1.0, n_bins + 1)[1:-1]
@@ -112,6 +109,7 @@ def suggest_bins_quantile(
 
 
 # ── Method 2: Equal-width ────────────────────────────────────────────────────
+
 
 def suggest_bins_equal_width(
     col: str,
@@ -141,6 +139,7 @@ def suggest_bins_equal_width(
 
 
 # ── Method 3: OptimalBinning ─────────────────────────────────────────────────
+
 
 def suggest_bins_optbin(
     col: str,
@@ -188,9 +187,7 @@ def suggest_bins_optbin(
     ob = ContinuousOptimalBinning(**kwargs)
     ob.fit(arr, y_arr, sample_weight=w)
 
-    splits = sorted(
-        float(s) for s in ob.splits if np.isfinite(float(s))
-    )
+    splits = sorted(float(s) for s in ob.splits if np.isfinite(float(s)))
 
     if verbose:
         _print_splits("OptimalBinning (optbinning)", col, splits)
@@ -198,6 +195,7 @@ def suggest_bins_optbin(
 
 
 # ── Method 4: GBM splits ─────────────────────────────────────────────────────
+
 
 def suggest_bins_gbm(
     col: str,
@@ -253,7 +251,7 @@ def suggest_bins_gbm(
         params: dict[str, Any] = {
             "n_estimators": n_estimators,
             "max_depth": max_depth,
-            "num_leaves": max(2, 2 ** max_depth - 1),
+            "num_leaves": max(2, 2**max_depth - 1),
             "verbose": -1,
             "n_jobs": 1,
         }
@@ -287,7 +285,7 @@ def suggest_bins_gbm(
             for est in stage:
                 t = est.tree_
                 for i in range(t.node_count):
-                    if t.children_left[i] != -1:        # internal node
+                    if t.children_left[i] != -1:  # internal node
                         counter[float(t.threshold[i])] += 1
 
         backend = "sklearn GBM"
@@ -302,6 +300,7 @@ def suggest_bins_gbm(
 
 
 # ── Combined entry point ──────────────────────────────────────────────────────
+
 
 def suggest_bins(
     col: str,
@@ -352,6 +351,7 @@ def suggest_bins(
     dict[str, list[float]]
         Maps method name → sorted list of split points.
     """
+    show_plot = bool(method_kwargs.pop("show_plot", False))
     print(f"\n{'=' * 62}")
     print(f"  Bin suggestions for : '{col}'")
     print(f"  Methods             : {list(methods)}")
@@ -361,23 +361,29 @@ def suggest_bins(
 
     _dispatch: dict[str, Any] = {
         "quantile": lambda: suggest_bins_quantile(
-            col, X,
+            col,
+            X,
             n_bins=n_bins,
             weights=weights,
             **method_kwargs.get("quantile_kwargs", {}),
         ),
         "equal_width": lambda: suggest_bins_equal_width(
-            col, X,
+            col,
+            X,
             n_bins=n_bins,
             **method_kwargs.get("equal_width_kwargs", {}),
         ),
         "optbin": lambda: suggest_bins_optbin(
-            col, X, y,
+            col,
+            X,
+            y,
             weights=weights,
             **method_kwargs.get("optbin_kwargs", {}),
         ),
         "gbm": lambda: suggest_bins_gbm(
-            col, X, y,
+            col,
+            X,
+            y,
             weights=weights,
             max_splits=max_splits,
             **method_kwargs.get("gbm_kwargs", {}),
@@ -396,13 +402,16 @@ def suggest_bins(
             print(f"\n  [ERROR] {method}: {exc}")
 
     print(f"\n{'=' * 62}\n")
-    
+
     _fig = _plot_suggestions(col, X, results, weights=weights, figsize=figsize)
+    if show_plot:
+        plt.show()
 
     return results
 
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
+
 
 def _plot_suggestions(
     col: str,
@@ -424,20 +433,26 @@ def _plot_suggestions(
     fig, ax = plt.subplots(figsize=figsize or (13, 5))
     ax.set_title(
         f"Bin suggestions — '{col}'",
-        fontsize=12, fontweight="bold",
+        fontsize=12,
+        fontweight="bold",
     )
 
     # Weighted histogram
     counts, edges = np.histogram(arr, bins=n_hist_bins, weights=w)
     centers = (edges[:-1] + edges[1:]) / 2
     bar_w = edges[1] - edges[0]
-    ax.bar(centers, counts, width=bar_w, color="#9ecae1", alpha=0.55,
-           label="Exposure", zorder=1)
+    ax.bar(
+        centers,
+        counts,
+        width=bar_w,
+        color="#9ecae1",
+        alpha=0.55,
+        label="Exposure",
+        zorder=1,
+    )
     ax.set_ylabel("Exposure", fontsize=9)
     ax.set_xlabel(col, fontsize=9)
-    ax.yaxis.set_major_formatter(
-        mticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
-    )
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
 
     # One set of vertical lines per method, colour-coded
     for i, (method, splits) in enumerate(splits_dict.items()):

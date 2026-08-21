@@ -27,9 +27,9 @@ from .variable import _NUMERIC_DTYPES, MISSING_SENTINEL, _is_str_or_cat
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+
 # Modified LGBMRegressor that can be used with polars dataframes, to be consistent with the rest of the codebase
 class LGBRegressorPolars(lgb.LGBMRegressor):
-
     @property
     def feature_names_in_(self):
         return self._feature_name
@@ -37,6 +37,7 @@ class LGBRegressorPolars(lgb.LGBMRegressor):
     @feature_names_in_.setter
     def feature_names_in_(self, x):
         self._feature_name = x
+
 
 def _predict(model: Any, X: pl.DataFrame) -> np.ndarray:
     """
@@ -72,76 +73,125 @@ def _subsample_rows(
 
 # ── One-hot encoding helper ─────────────────────────────────────────────────
 
+
+def _materialize_discovery_columns(
+    data: pl.DataFrame,
+    feature_columns: list[str],
+    variable_configs: dict[str, Any] | None,
+    weights: np.ndarray | None,
+) -> pl.DataFrame:
+    """Materialize configured derived variables for discovery models."""
+    variable_configs = variable_configs or {}
+    calculated_columns = []
+    materialized = data.clone()
+    for col in feature_columns:
+        assert col in materialized.columns or col in variable_configs, (
+            f"Feature column '{col}' not found in DataFrame or variable_configs."
+        )
+        if col in variable_configs and col not in materialized.columns:
+            calculated_columns.append(col)
+    if calculated_columns:
+        preprocessor = _build_preprocessor(
+            calculated_columns,
+            materialized,
+            variable_configs,
+        )
+        preprocessor.fit(materialized, weights=weights)
+        for col in calculated_columns:
+            values = _resolve_level(col, materialized, preprocessor, 10)
+            materialized = materialized.with_columns(pl.Series(col, values))
+    return materialized
+
+
+def _encoded_discovery_data(
+    data: pl.DataFrame,
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> pl.DataFrame:
+    """Encode numeric and categorical discovery features."""
+    numeric_data = {
+        column: data[column]
+        .cast(pl.Float32, strict=False)
+        .fill_null(0.0)
+        .shrink_dtype()
+        for column in numeric_columns
+    }
+    dummy_data: dict[str, pl.Series] = {}
+    if categorical_columns:
+        categorical = data.select(categorical_columns).with_columns(
+            [
+                pl.col(column)
+                .cast(pl.Utf8, strict=False)
+                .fill_null("__MISSING__")
+                .alias(column)
+                for column in categorical_columns
+            ]
+        )
+        dummies = categorical.to_dummies()
+        dummy_data = {name: dummies[name] for name in dummies.columns}
+    all_data = {**numeric_data, **dummy_data}
+    return pl.DataFrame(all_data) if all_data else pl.DataFrame()
+
+
+def _sanitize_discovery_columns(data: pl.DataFrame) -> pl.DataFrame:
+    """Remove JSON-special characters rejected by LightGBM."""
+    translation = str.maketrans({character: "_" for character in r'[]{}":,\/'})
+    raw_columns = list(data.columns)
+    clean_columns = [column.translate(translation) for column in raw_columns]
+    if clean_columns == raw_columns:
+        return data
+    return data.rename(dict(zip(raw_columns, clean_columns)))
+
+
+def _discovery_column_indices(
+    encoded_names: list[str],
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> dict[str, list[int]]:
+    """Map original variables to positions in the encoded feature matrix."""
+    positions = {name: index for index, name in enumerate(encoded_names)}
+    mapping = {column: [positions[column]] for column in numeric_columns}
+    for column in categorical_columns:
+        mapping[column] = [
+            positions[name] for name in encoded_names if name.startswith(f"{column}_")
+        ]
+    return mapping
+
+
 def _encode_features(
     df: pl.DataFrame,
     feature_cols: list[str],
     variable_configs: dict[str, Any] | None = {},
     weights: np.ndarray | None = None,
 ) -> tuple[pl.DataFrame, list[str], dict[str, list[int]]]:
-    df_enc = df.clone()
+    df_enc = _materialize_discovery_columns(
+        df,
+        feature_cols,
+        variable_configs,
+        weights,
+    )
 
-    calculated_columns = []
-    for col in feature_cols:
-        assert col in df_enc.columns or col in variable_configs, f"Feature column '{col}' not found in DataFrame or variable_configs."
-
-        if col in variable_configs and col not in df_enc.columns:
-            calculated_columns.append(col)
-    
-    if calculated_columns:
-        preprocessor = _build_preprocessor(calculated_columns, df_enc, variable_configs)
-        preprocessor.fit(df_enc, weights=weights)
-        
-        for col in calculated_columns:
-            vals = _resolve_level(col, df_enc, preprocessor, 10)
-            df_enc = df_enc.with_columns(pl.Series(col, vals))
-        
-    # Separate numeric and categorical columns
-    numeric_cols = [col for col in feature_cols if not _is_str_or_cat(df_enc[col].dtype)]
+    numeric_cols = [
+        col for col in feature_cols if not _is_str_or_cat(df_enc[col].dtype)
+    ]
     cat_cols = [col for col in feature_cols if _is_str_or_cat(df_enc[col].dtype)]
-
-    # Process numeric columns
-    numeric_data = {}
-    for col in numeric_cols:
-        arr = df_enc[col].cast(pl.Float32, strict=False).fill_null(0.0).shrink_dtype()
-        numeric_data[col] = arr
-
-    # Process categorical columns using get_dummies
-    if cat_cols:
-        cat_df = df_enc.select(cat_cols).with_columns([
-            pl.col(c).cast(pl.Utf8, strict=False).fill_null("__MISSING__").alias(c) for c in cat_cols
-        ])
-        dummies = cat_df.to_dummies()
-        dummy_names = dummies.columns
-        dummy_data = {name: dummies[name] for name in dummy_names}
-    else:
-        dummy_data = {}
-        dummy_names = []
-
-    # Combine all columns (numeric already shrunk per-series; dummies are UInt8 from to_dummies)
-    all_data = {**numeric_data, **dummy_data}
-    X = pl.DataFrame(all_data) if all_data else pl.DataFrame()
-
-    # Sanitize column names: LightGBM rejects special JSON characters
-    _json_special = str.maketrans({c: "_" for c in r'[]{}":,\/'})
-    raw_cols = list(X.columns)
-    clean_cols = [c.translate(_json_special) for c in raw_cols]
-    if clean_cols != raw_cols:
-        X = X.rename(dict(zip(raw_cols, clean_cols)))
+    X = _sanitize_discovery_columns(
+        _encoded_discovery_data(df_enc, numeric_cols, cat_cols)
+    )
     encoded_names = list(X.columns)
-
-    # Build col_index_map
-    col_index_map: dict[str, list[int]] = {}
-    col_pos = {name: i for i, name in enumerate(encoded_names)}
-    for col in numeric_cols:
-        col_index_map[col] = [col_pos[col]]
-    for col in cat_cols:
-        indices = [col_pos[name] for name in encoded_names if name.startswith(f"{col}_")]
-        col_index_map[col] = indices
-
-    return X, encoded_names, col_index_map
+    return (
+        X,
+        encoded_names,
+        _discovery_column_indices(
+            encoded_names,
+            numeric_cols,
+            cat_cols,
+        ),
+    )
 
 
 # ── Shadow GBM fitting ────────────────────────────────────────────────────────
+
 
 def fit_shadow_gbm(
     df: pl.DataFrame,
@@ -151,7 +201,7 @@ def fit_shadow_gbm(
     feature_cols: list[str] | None = None,
     family: str = "tweedie",
     tweedie_power: float = 1.5,
-    variable_configs:dict[str, Any] | None = None,
+    variable_configs: dict[str, Any] | None = None,
     n_estimators: int = 500,
     max_depth: int = 5,
     learning_rate: float = 0.01,
@@ -192,15 +242,31 @@ def fit_shadow_gbm(
         if weight_col:
             exclude.add(weight_col)
         feature_cols = [
-            c for c in df.columns
+            c
+            for c in df.columns
             if c not in exclude
             and (df[c].dtype in _NUMERIC_DTYPES or _is_str_or_cat(df[c].dtype))
         ]
 
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
+    X, encoded_names, col_index_map = _encode_features(
+        df, feature_cols, variable_configs
+    )
 
-    X = X.with_columns(pl.col(pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64).cast(pl.Float64))
-    X = X.with_columns(pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan")))
+    X = X.with_columns(
+        pl.col(
+            pl.Int8,
+            pl.Int16,
+            pl.Int32,
+            pl.Int64,
+            pl.UInt8,
+            pl.UInt16,
+            pl.UInt32,
+            pl.UInt64,
+        ).cast(pl.Float64)
+    )
+    X = X.with_columns(
+        pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan"))
+    )
 
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
@@ -211,7 +277,7 @@ def fit_shadow_gbm(
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "learning_rate": learning_rate,
-        "num_leaves": max(2, 2 ** max_depth - 1),
+        "num_leaves": max(2, 2**max_depth - 1),
         "verbose": -1,
         "n_jobs": -1,
     }
@@ -235,6 +301,7 @@ def fit_shadow_gbm(
 
 # ── Prepare matrix helper (reused by downstream functions) ───────────────────
 
+
 def _prepare_X(
     model: Any,
     df: pl.DataFrame,
@@ -248,7 +315,9 @@ def _prepare_X(
     if feature_cols is None:
         feature_cols = getattr(model, "_shadow_feature_cols", None)
     if feature_cols is None:
-        raise ValueError("feature_cols must be provided or model must have _shadow_feature_cols")
+        raise ValueError(
+            "feature_cols must be provided or model must have _shadow_feature_cols"
+        )
 
     col_index_map = getattr(model, "_shadow_col_index_map", None)
     encoded_names = getattr(model, "_shadow_encoded_names", None)
@@ -272,6 +341,7 @@ def _prepare_X(
 
 
 # ── Permutation importance ────────────────────────────────────────────────────
+
 
 def permutation_importance(
     model: Any,
@@ -310,11 +380,12 @@ def permutation_importance(
     X, _, col_index_map, feature_cols = _prepare_X(model, df, feature_cols)
 
     if metric_fn is None:
+
         def metric_fn(y_true, y_pred, w):
             resid = y_true - y_pred
             if w is not None:
-                return -float(np.average(resid ** 2, weights=w))
-            return -float(np.mean(resid ** 2))
+                return -float(np.average(resid**2, weights=w))
+            return -float(np.mean(resid**2))
 
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
@@ -336,16 +407,19 @@ def permutation_importance(
             scores.append(baseline - score)
             for idx, orig in orig_cols.items():
                 X = X.with_columns(orig.alias(X.columns[idx]))
-        results.append({
-            "variable": col_name,
-            "importance_mean": float(np.mean(scores)),
-            "importance_std": float(np.std(scores)),
-        })
+        results.append(
+            {
+                "variable": col_name,
+                "importance_mean": float(np.mean(scores)),
+                "importance_std": float(np.std(scores)),
+            }
+        )
 
     return pl.DataFrame(results).sort("importance_mean", descending=True)
 
 
 # ── 1D Partial dependence (internal helper) ──────────────────────────────────
+
 
 def _partial_dependence_1d(
     model: Any,
@@ -357,13 +431,14 @@ def _partial_dependence_1d(
     pd_values = np.zeros(len(grid))
     orig = X[:, feature_idx].clone()
     for i, val in enumerate(grid):
-        X = X.with_columns(pl.lit(val).alias(X.columns[feature_idx])) 
+        X = X.with_columns(pl.lit(val).alias(X.columns[feature_idx]))
         pd_values[i] = _predict(model, X).mean()
     X = X.with_columns(orig.alias(X.columns[feature_idx]))
     return pd_values
 
 
 # ── 2D Partial dependence ────────────────────────────────────────────────────
+
 
 def partial_dependence_2d(
     model: Any,
@@ -414,8 +489,12 @@ def partial_dependence_2d(
     X_sample = _subsample_rows(X, sample_size, rng)
 
     # Grid at quantiles for better coverage
-    grid1 = np.unique(np.quantile(X_sample[:, idx1], np.linspace(0, 1, grid_resolution)))
-    grid2 = np.unique(np.quantile(X_sample[:, idx2], np.linspace(0, 1, grid_resolution)))
+    grid1 = np.unique(
+        np.quantile(X_sample[:, idx1], np.linspace(0, 1, grid_resolution))
+    )
+    grid2 = np.unique(
+        np.quantile(X_sample[:, idx2], np.linspace(0, 1, grid_resolution))
+    )
 
     orig1 = X_sample[:, idx1].clone()
     orig2 = X_sample[:, idx2].clone()
@@ -424,11 +503,13 @@ def partial_dependence_2d(
         X_sample = X_sample.with_columns(pl.lit(v1).alias(X_sample.columns[idx1]))
         for v2 in grid2:
             X_sample = X_sample.with_columns(pl.lit(v2).alias(X_sample.columns[idx2]))
-            rows.append({
-                "var1_value": float(v1),
-                "var2_value": float(v2),
-                "pd_value": float(_predict(model, X_sample).mean()),
-            })
+            rows.append(
+                {
+                    "var1_value": float(v1),
+                    "var2_value": float(v2),
+                    "pd_value": float(_predict(model, X_sample).mean()),
+                }
+            )
     X_sample = X_sample.with_columns(orig1.alias(X_sample.columns[idx1]))
     X_sample = X_sample.with_columns(orig2.alias(X_sample.columns[idx2]))
 
@@ -436,6 +517,7 @@ def partial_dependence_2d(
 
 
 # ── Interaction ranking (H-statistic) ────────────────────────────────────────
+
 
 def interaction_ranking(
     model: Any,
@@ -491,7 +573,9 @@ def interaction_ranking(
 
     # Only keep numeric variables for H-statistic (single-index in col_index_map)
     numeric_vars = [c for c in feature_cols if len(col_index_map[c]) == 1]
-    numeric_vars_sorted = sorted(numeric_vars, key=lambda c: var_importance.get(c, 0), reverse=True)
+    numeric_vars_sorted = sorted(
+        numeric_vars, key=lambda c: var_importance.get(c, 0), reverse=True
+    )
     top_vars = numeric_vars_sorted[:top_n]
 
     # Compute 1D PDPs for each top variable
@@ -499,7 +583,9 @@ def interaction_ranking(
     grids: dict[str, np.ndarray] = {}
     for var in top_vars:
         idx = col_index_map[var][0]
-        grid = np.unique(np.quantile(X_sample[:, idx], np.linspace(0, 1, grid_resolution)))
+        grid = np.unique(
+            np.quantile(X_sample[:, idx], np.linspace(0, 1, grid_resolution))
+        )
         grids[var] = grid
         pdp_1d[var] = _partial_dependence_1d(model, X_sample, idx, grid)
 
@@ -517,9 +603,13 @@ def interaction_ranking(
             orig_j = X_sample[:, idx_j].clone()
             joint_pd = np.zeros((len(grid_i), len(grid_j)))
             for gi, vi in enumerate(grid_i):
-                X_sample = X_sample.with_columns(pl.lit(vi).alias(X_sample.columns[idx_i]))
+                X_sample = X_sample.with_columns(
+                    pl.lit(vi).alias(X_sample.columns[idx_i])
+                )
                 for gj, vj in enumerate(grid_j):
-                    X_sample = X_sample.with_columns(pl.lit(vj).alias(X_sample.columns[idx_j]))
+                    X_sample = X_sample.with_columns(
+                        pl.lit(vj).alias(X_sample.columns[idx_j])
+                    )
                     joint_pd[gi, gj] = _predict(model, X_sample).mean()
             X_sample = X_sample.with_columns(orig_i.alias(X_sample.columns[idx_i]))
             X_sample = X_sample.with_columns(orig_j.alias(X_sample.columns[idx_j]))
@@ -534,16 +624,19 @@ def interaction_ranking(
 
             h_stat = var_interaction / var_joint if var_joint > 1e-12 else 0.0
 
-            rows.append({
-                "var1": var_i,
-                "var2": var_j,
-                "h_statistic": h_stat,
-            })
+            rows.append(
+                {
+                    "var1": var_i,
+                    "var2": var_j,
+                    "h_statistic": h_stat,
+                }
+            )
 
     return pl.DataFrame(rows).sort("h_statistic", descending=True)
 
 
 # ── Residual GBM ─────────────────────────────────────────────────────────────
+
 
 def residual_gbm(
     df: pl.DataFrame,
@@ -586,10 +679,25 @@ def residual_gbm(
         )
 
     residuals = _to_numpy(residuals)
-    
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
-    X = X.with_columns(pl.col(pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64).cast(pl.Float64))
-    X = X.with_columns(pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan")))
+
+    X, encoded_names, col_index_map = _encode_features(
+        df, feature_cols, variable_configs
+    )
+    X = X.with_columns(
+        pl.col(
+            pl.Int8,
+            pl.Int16,
+            pl.Int32,
+            pl.Int64,
+            pl.UInt8,
+            pl.UInt16,
+            pl.UInt32,
+            pl.UInt64,
+        ).cast(pl.Float64)
+    )
+    X = X.with_columns(
+        pl.col(pl.Float32, pl.Float64).replace(MISSING_SENTINEL, float("nan"))
+    )
 
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
     if offset_col is not None and w is not None:
@@ -598,7 +706,7 @@ def residual_gbm(
     params: dict[str, Any] = {
         "n_estimators": n_estimators,
         "max_depth": max_depth,
-        "num_leaves": max(2, 2 ** max_depth - 1),
+        "num_leaves": max(2, 2**max_depth - 1),
         "verbose": -1,
         "n_jobs": -1,
     }
@@ -626,21 +734,27 @@ def residual_gbm(
         # Find top split: only meaningful for numeric (single-index) columns
         top_split = float("nan")
         if len(indices) == 1:
-            use_name = col_name if col_name in model.feature_name_ else f"Column_{indices[0]}"
+            use_name = (
+                col_name if col_name in model.feature_name_ else f"Column_{indices[0]}"
+            )
             thresholds = split_groups.get(use_name, [])
             if thresholds:
                 top_split = float(Counter(thresholds).most_common(1)[0][0])
 
-        rows.append({
-            "variable": col_name,
-            "importance": total_importance,
-            "top_split_value": round(top_split, 3),
-        })
+        rows.append(
+            {
+                "variable": col_name,
+                "importance": total_importance,
+                "top_split_value": round(top_split, 3),
+            }
+        )
 
     result = pl.DataFrame(rows).sort("importance", descending=True).head(top_n)
     return result
 
+
 # ── SHAP-based discovery ──────────────────────────────────────────────────────
+
 
 def _normalize_shap_values(shap_values: Any) -> np.ndarray:
     """
@@ -673,6 +787,7 @@ def _normalize_shap_values(shap_values: Any) -> np.ndarray:
         # (n, n_features, n_outputs) — take the first output.
         shap_values = shap_values[:, :, 0]
     return shap_values
+
 
 def shap_importance(
     model: Any,
@@ -707,18 +822,22 @@ def shap_importance(
     X_sample = _subsample_rows(X, sample_size, rng)
 
     explainer = shap.TreeExplainer(model)
-    shap_values = _normalize_shap_values(explainer.shap_values(X_sample.to_numpy()))  # (n, n_features)
+    shap_values = _normalize_shap_values(
+        explainer.shap_values(X_sample.to_numpy())
+    )  # (n, n_features)
 
     rows = []
     for col_name in feature_cols:
         indices = col_index_map[col_name]
         # Sum |SHAP| over all dummy columns for this variable, per row
         col_shap = np.abs(shap_values[:, indices]).sum(axis=1)
-        rows.append({
-            "variable": col_name,
-            "importance_mean": float(col_shap.mean()),
-            "importance_std": float(col_shap.std()),
-        })
+        rows.append(
+            {
+                "variable": col_name,
+                "importance_mean": float(col_shap.mean()),
+                "importance_std": float(col_shap.std()),
+            }
+        )
 
     return pl.DataFrame(rows).sort("importance_mean", descending=True)
 
@@ -765,7 +884,8 @@ def shap_dependence(
     rng = np.random.RandomState(random_state)
     sample_idx = (
         rng.choice(len(X), sample_size, replace=False)
-        if len(X) > sample_size else np.arange(len(X))
+        if len(X) > sample_size
+        else np.arange(len(X))
     )
     X_sample = X[sample_idx]
 
@@ -838,16 +958,68 @@ def shap_interaction_ranking(
             for ii in idx_i:
                 for jj in idx_j:
                     strength += float(np.abs(interaction_values[:, ii, jj]).mean())
-            rows.append({
-                "var1": var_i,
-                "var2": var_j,
-                "interaction_strength": strength,
-            })
+            rows.append(
+                {
+                    "var1": var_i,
+                    "var2": var_j,
+                    "interaction_strength": strength,
+                }
+            )
 
     return pl.DataFrame(rows).sort("interaction_strength", descending=True).head(top_n)
 
 
 # ── Tree co-occurrence interaction ranking ────────────────────────────────────
+
+
+def _encoded_to_original_map(model: Any) -> dict[str, str]:
+    """Map encoded feature names back to original variables."""
+    encoded_names: list[str] = getattr(model, "_shadow_encoded_names", [])
+    column_indices: dict[str, list[int]] = getattr(
+        model,
+        "_shadow_col_index_map",
+        {},
+    )
+    return {
+        encoded_names[index]: original
+        for original, indices in column_indices.items()
+        for index in indices
+        if index < len(encoded_names)
+    }
+
+
+def _tree_variable_gains(
+    tree: Any,
+    encoded_to_original: dict[str, str],
+) -> dict[str, float]:
+    """Return the maximum split gain for each original variable in one tree."""
+    features = [
+        encoded_to_original.get(feature, feature)
+        for feature in tree["split_feature"].tolist()
+    ]
+    gains = (
+        tree["split_gain"].tolist()
+        if "split_gain" in tree.columns
+        else [1.0] * len(features)
+    )
+    variable_gains: dict[str, float] = defaultdict(float)
+    for feature, gain in zip(features, gains):
+        if gain is not None and not (isinstance(gain, float) and gain != gain):
+            variable_gains[feature] = max(variable_gains[feature], float(gain))
+    return variable_gains
+
+
+def _add_tree_pair_scores(
+    pair_scores: dict[tuple[str, str], float],
+    variable_gains: dict[str, float],
+) -> None:
+    """Accumulate geometric split-gain scores for every pair in one tree."""
+    variables = list(variable_gains)
+    for first_index, first in enumerate(variables):
+        for second in variables[first_index + 1 :]:
+            pair = (min(first, second), max(first, second))
+            pair_scores[pair] += (variable_gains[first] * variable_gains[second]) ** 0.5
+
 
 def tree_interaction_cooccurrence(
     model: Any,
@@ -875,38 +1047,14 @@ def tree_interaction_cooccurrence(
             "Call fit_shadow_gbm() first."
         )
 
-    encoded_names: list[str] = getattr(model, "_shadow_encoded_names", [])
-    col_index_map: dict[str, list[int]] = getattr(model, "_shadow_col_index_map", {})
-
-    # Map encoded feature name → original variable name
-    encoded_to_orig: dict[str, str] = {}
-    for orig_col, idxs in col_index_map.items():
-        for idx in idxs:
-            if idx < len(encoded_names):
-                encoded_to_orig[encoded_names[idx]] = orig_col
-
     internal = trees_df.dropna(subset=["split_feature"])
+    encoded_to_original = _encoded_to_original_map(model)
     pair_scores: dict[tuple[str, str], float] = defaultdict(float)
-
-    for tree_id, group in internal.groupby("tree_index"):
-        orig_feats = [encoded_to_orig.get(f, f) for f in group["split_feature"].tolist()]
-        gains = (
-            group["split_gain"].tolist()
-            if "split_gain" in group.columns
-            else [1.0] * len(orig_feats)
+    for _tree_id, tree in internal.groupby("tree_index"):
+        _add_tree_pair_scores(
+            pair_scores,
+            _tree_variable_gains(tree, encoded_to_original),
         )
-
-        var_gain: dict[str, float] = defaultdict(float)
-        for f, g in zip(orig_feats, gains):
-            if g is not None and not (isinstance(g, float) and g != g):
-                var_gain[f] = max(var_gain[f], float(g))
-
-        unique_vars = list(var_gain.keys())
-        for i in range(len(unique_vars)):
-            for j in range(i + 1, len(unique_vars)):
-                vi, vj = unique_vars[i], unique_vars[j]
-                key = (min(vi, vj), max(vi, vj))
-                pair_scores[key] += (var_gain[vi] * var_gain[vj]) ** 0.5
 
     rows = [
         {"var1": k[0], "var2": k[1], "cooccurrence_score": float(v)}
@@ -918,6 +1066,120 @@ def tree_interaction_cooccurrence(
 
 
 # ── Categorical level grouping ────────────────────────────────────────────────
+
+
+def _initial_category_groups(
+    levels: pl.Series,
+    target: np.ndarray,
+    weights: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Build one exposure/target record per original category."""
+    groups = []
+    for level in levels.unique().to_list():
+        mask = (levels == level).to_numpy()
+        level_weights = weights[mask]
+        weight_sum = float(level_weights.sum())
+        groups.append(
+            {
+                "levels": [level],
+                "mean": (
+                    float(np.average(target[mask], weights=level_weights))
+                    if weight_sum > 0
+                    else 0.0
+                ),
+                "exposure": weight_sum,
+            }
+        )
+    return sorted(groups, key=lambda group: group["mean"])
+
+
+def _merge_category_groups(
+    groups: list[dict[str, Any]],
+    first_index: int,
+    second_index: int,
+) -> None:
+    """Merge two category groups in place using their exposure-weighted mean."""
+    first, second = groups[first_index], groups[second_index]
+    exposure = first["exposure"] + second["exposure"]
+    mean = (
+        (first["mean"] * first["exposure"] + second["mean"] * second["exposure"])
+        / exposure
+        if exposure > 0
+        else 0.0
+    )
+    lower, higher = min(first_index, second_index), max(first_index, second_index)
+    groups.pop(higher)
+    groups.pop(lower)
+    groups.insert(
+        lower,
+        {
+            "levels": first["levels"] + second["levels"],
+            "mean": mean,
+            "exposure": exposure,
+        },
+    )
+
+
+def _merge_small_category_groups(
+    groups: list[dict[str, Any]],
+    total_exposure: float,
+    minimum_exposure_percent: float,
+) -> None:
+    """Merge low-exposure categories with their nearest mean neighbor."""
+    changed = True
+    while changed and len(groups) > 1:
+        changed = False
+        for index, group in enumerate(groups):
+            if group["exposure"] / total_exposure >= minimum_exposure_percent:
+                continue
+            neighbors = [
+                neighbor
+                for neighbor in (index - 1, index + 1)
+                if 0 <= neighbor < len(groups)
+            ]
+            nearest = min(
+                neighbors,
+                key=lambda neighbor: abs(groups[neighbor]["mean"] - group["mean"]),
+            )
+            _merge_category_groups(groups, index, nearest)
+            groups.sort(key=lambda candidate: candidate["mean"])
+            changed = True
+            break
+
+
+def _limit_category_groups(
+    groups: list[dict[str, Any]],
+    maximum_groups: int,
+) -> None:
+    """Merge the closest adjacent groups until the requested limit is met."""
+    while len(groups) > maximum_groups:
+        differences = [
+            abs(groups[index + 1]["mean"] - groups[index]["mean"])
+            for index in range(len(groups) - 1)
+        ]
+        closest = int(np.argmin(differences))
+        _merge_category_groups(groups, closest, closest + 1)
+
+
+def _category_group_outputs(
+    groups: list[dict[str, Any]],
+) -> tuple[dict[str, str], pl.DataFrame]:
+    """Build the public category mapping and summary table."""
+    mapping: dict[str, str] = {}
+    rows = []
+    for index, group in enumerate(groups, 1):
+        label = f"G{index:02d}"
+        mapping.update((level, label) for level in group["levels"])
+        rows.append(
+            {
+                "group": label,
+                "levels": str(group["levels"]),
+                "exposure": group["exposure"],
+                "mean_target": group["mean"],
+            }
+        )
+    return mapping, pl.DataFrame(rows).sort("mean_target")
+
 
 def suggest_category_groups(
     col: str,
@@ -966,70 +1228,76 @@ def suggest_category_groups(
     y_arr = _to_numpy(y)
     w_arr = _to_numpy(weights) if weights is not None else np.ones(len(df))
     total_w = max(float(w_arr.sum()), 1.0)
-
-    # Build initial groups sorted by weighted mean target
-    groups = []
-    for lvl in s.unique().to_list():
-        mask = (s == lvl).to_numpy()
-        lw, ly = w_arr[mask], y_arr[mask]
-        w_sum = float(lw.sum())
-        groups.append({
-            "levels": [lvl],
-            "mean": float(np.average(ly, weights=lw)) if w_sum > 0 else 0.0,
-            "exposure": w_sum,
-        })
-    groups.sort(key=lambda g: g["mean"])
-
-    def _merge(i: int, j: int) -> None:
-        gi, gj = groups[i], groups[j]
-        merged_exp = gi["exposure"] + gj["exposure"]
-        merged_mean = (
-            (gi["mean"] * gi["exposure"] + gj["mean"] * gj["exposure"]) / merged_exp
-            if merged_exp > 0 else 0.0
-        )
-        lo, hi = min(i, j), max(i, j)
-        groups.pop(hi)
-        groups.pop(lo)
-        groups.insert(lo, {"levels": gi["levels"] + gj["levels"], "mean": merged_mean, "exposure": merged_exp})
-
-    # Phase 1: merge tiny levels
-    changed = True
-    while changed and len(groups) > 1:
-        changed = False
-        for i, g in enumerate(groups):
-            if g["exposure"] / total_w < min_exposure_pct:
-                neighbors = [j for j in (i - 1, i + 1) if 0 <= j < len(groups)]
-                neighbor = min(neighbors, key=lambda j: abs(groups[j]["mean"] - g["mean"]))
-                _merge(i, neighbor)
-                groups.sort(key=lambda g2: g2["mean"])
-                changed = True
-                break
-
-    # Phase 2: merge to max_groups
-    while len(groups) > max_groups:
-        diffs = [abs(groups[k + 1]["mean"] - groups[k]["mean"]) for k in range(len(groups) - 1)]
-        _merge(int(np.argmin(diffs)), int(np.argmin(diffs)) + 1)
-
-    # Build output
-    level_to_group: dict[str, str] = {}
-    summary_rows = []
-    for gi, g in enumerate(groups, 1):
-        label = f"G{gi:02d}"
-        for lvl in g["levels"]:
-            level_to_group[lvl] = label
-        summary_rows.append({"group": label, "levels": str(g["levels"]), "exposure": g["exposure"], "mean_target": g["mean"]})
-
-    summary = pl.DataFrame(summary_rows).sort("mean_target")
+    groups = _initial_category_groups(s, y_arr, w_arr)
+    _merge_small_category_groups(groups, total_w, min_exposure_pct)
+    _limit_category_groups(groups, max_groups)
+    level_to_group, summary = _category_group_outputs(groups)
 
     if verbose:
         print(f"\n  Category groups for '{col}' ({len(groups)} groups):")
         for row in summary.iter_rows(named=True):
-            print(f"    {row['group']}: mean={row['mean_target']:.4f}  exp={row['exposure']:,.0f}  levels={row['levels']}")
+            print(
+                f"    {row['group']}: mean={row['mean_target']:.4f}  exp={row['exposure']:,.0f}  levels={row['levels']}"
+            )
 
     return level_to_group, summary
 
 
 # ── Monotonicity cost test ────────────────────────────────────────────────────
+
+
+def _default_feature_columns(
+    data: pl.DataFrame,
+    target_column: str,
+    weight_column: str | None,
+) -> list[str]:
+    """Select numeric and categorical modeling columns, excluding target/weight."""
+    excluded = {target_column, weight_column} if weight_column else {target_column}
+    return [
+        column
+        for column in data.columns
+        if column not in excluded
+        and (
+            data[column].dtype in _NUMERIC_DTYPES or _is_str_or_cat(data[column].dtype)
+        )
+    ]
+
+
+def _fit_lgb_rmse(
+    data: pl.DataFrame,
+    target: np.ndarray,
+    weights: np.ndarray | None,
+    feature_names: list[str],
+    parameters: dict[str, Any],
+    constraints: list[int] | None = None,
+) -> float:
+    """Fit one LightGBM model and return its in-sample weighted RMSE."""
+    resolved_parameters = dict(parameters)
+    if constraints is not None:
+        resolved_parameters["monotone_constraints"] = constraints
+    model = LGBRegressorPolars(**resolved_parameters)
+    model.fit(data, target, sample_weight=weights, feature_name=feature_names)
+    residuals = target - model.predict(data)
+    mean_squared_error = (
+        np.average(residuals**2, weights=weights)
+        if weights is not None
+        else np.mean(residuals**2)
+    )
+    return float(np.sqrt(mean_squared_error))
+
+
+def _monotonicity_recommendation(
+    positive_cost: float,
+    negative_cost: float,
+    threshold: float,
+) -> str:
+    """Choose the lowest-cost viable monotonic direction."""
+    if positive_cost <= negative_cost and positive_cost <= threshold:
+        return "increasing"
+    if negative_cost < positive_cost and negative_cost <= threshold:
+        return "decreasing"
+    return "no_constraint"
+
 
 def monotonicity_test(
     df: pl.DataFrame,
@@ -1066,35 +1334,26 @@ def monotonicity_test(
         or 'no_constraint').
     """
     if feature_cols is None:
-        exclude = {target_col, weight_col} if weight_col else {target_col}
-        feature_cols = [
-            c for c in df.columns
-            if c not in exclude
-            and (df[c].dtype in _NUMERIC_DTYPES or _is_str_or_cat(df[c].dtype))
-        ]
+        feature_cols = _default_feature_columns(df, target_col, weight_col)
 
     if var not in feature_cols:
         raise ValueError(f"'{var}' not in feature_cols.")
 
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
+    X, encoded_names, col_index_map = _encode_features(
+        df, feature_cols, variable_configs
+    )
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
 
     base_params: dict[str, Any] = {
-        "n_estimators": n_estimators, "verbose": -1, "n_jobs": -1,
-        "random_state": random_state, **lgb_params,
+        "n_estimators": n_estimators,
+        "verbose": -1,
+        "n_jobs": -1,
+        "random_state": random_state,
+        **lgb_params,
     }
 
-    def _fit_and_rmse(constraints=None) -> float:
-        params = dict(base_params)
-        if constraints is not None:
-            params["monotone_constraints"] = constraints
-        mdl = LGBRegressorPolars(**params)
-        mdl.fit(X, y, sample_weight=w, feature_name=encoded_names)
-        r = y - mdl.predict(X)
-        return float(np.sqrt(np.average(r ** 2, weights=w) if w is not None else np.mean(r ** 2)))
-
-    rmse_free = _fit_and_rmse()
+    rmse_free = _fit_lgb_rmse(X, y, w, encoded_names, base_params)
 
     n_features, var_indices = X.shape[1], col_index_map[var]
     constrained_rmses: dict[str, float] = {}
@@ -1102,24 +1361,30 @@ def monotonicity_test(
         constraints = [0] * n_features
         for idx in var_indices:
             constraints[idx] = direction
-        constrained_rmses[label] = _fit_and_rmse(constraints)
+        constrained_rmses[label] = _fit_lgb_rmse(
+            X,
+            y,
+            w,
+            encoded_names,
+            base_params,
+            constraints,
+        )
 
     cost_pos = constrained_rmses["pos"] - rmse_free
     cost_neg = constrained_rmses["neg"] - rmse_free
-    threshold = rmse_free * 0.01   # 1% RMSE increase is "trivial"
+    threshold = rmse_free * 0.01  # 1% RMSE increase is "trivial"
 
-    if cost_pos <= cost_neg and cost_pos <= threshold:
-        recommended = "increasing"
-    elif cost_neg < cost_pos and cost_neg <= threshold:
-        recommended = "decreasing"
-    else:
-        recommended = "no_constraint"
+    recommended = _monotonicity_recommendation(cost_pos, cost_neg, threshold)
 
     if verbose:
         print(f"\n  Monotonicity test — '{var}'")
         print(f"    Unconstrained RMSE : {rmse_free:.6f}")
-        print(f"    Monotone (+1) RMSE : {constrained_rmses['pos']:.6f}  cost = {cost_pos / rmse_free:+.2%}")
-        print(f"    Monotone (-1) RMSE : {constrained_rmses['neg']:.6f}  cost = {cost_neg / rmse_free:+.2%}")
+        print(
+            f"    Monotone (+1) RMSE : {constrained_rmses['pos']:.6f}  cost = {cost_pos / rmse_free:+.2%}"
+        )
+        print(
+            f"    Monotone (-1) RMSE : {constrained_rmses['neg']:.6f}  cost = {cost_neg / rmse_free:+.2%}"
+        )
         print(f"    Recommendation     : {recommended}")
 
     return {
@@ -1133,6 +1398,52 @@ def monotonicity_test(
 
 
 # ── Boruta-style feature selection ────────────────────────────────────────────
+
+
+def _boruta_hit_counts(
+    features: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray | None,
+    encoded_names: list[str],
+    feature_columns: list[str],
+    column_indices: dict[str, list[int]],
+    parameters: dict[str, Any],
+    iterations: int,
+    random_state: int,
+) -> dict[str, int]:
+    """Run repeated shadow-feature fits and count wins per original variable."""
+    real_feature_count = features.shape[1]
+    random = np.random.RandomState(random_state)
+    hit_counts = {column: 0 for column in feature_columns}
+    shadow = np.empty_like(features)
+    augmented = np.empty(
+        (features.shape[0], real_feature_count * 2),
+        dtype=features.dtype,
+    )
+    augmented[:, :real_feature_count] = features
+    augmented_names = encoded_names + [f"_shadow_{name}" for name in encoded_names]
+    for _ in range(iterations):
+        for index in range(real_feature_count):
+            shadow[:, index] = random.permutation(features[:, index])
+        augmented[:, real_feature_count:] = shadow
+        model = LGBRegressorPolars(**parameters)
+        model.fit(
+            augmented,
+            target,
+            sample_weight=weights,
+            feature_name=augmented_names,
+        )
+        importance = model.feature_importances_
+        real_importance = importance[:real_feature_count]
+        maximum_shadow = np.percentile(importance[real_feature_count:], 95)
+        for column in feature_columns:
+            column_importance = sum(
+                float(real_importance[index]) for index in column_indices[column]
+            )
+            if column_importance > maximum_shadow:
+                hit_counts[column] += 1
+    return hit_counts
+
 
 def boruta_select(
     df: pl.DataFrame,
@@ -1183,55 +1494,32 @@ def boruta_select(
         )
 
     if feature_cols is None:
-        exclude = {target_col}
-        if weight_col:
-            exclude.add(weight_col)
-        feature_cols = [
-            c for c in df.columns
-            if c not in exclude
-            and (df[c].dtype in _NUMERIC_DTYPES or _is_str_or_cat(df[c].dtype))
-        ]
+        feature_cols = _default_feature_columns(df, target_col, weight_col)
 
-    X, encoded_names, col_index_map = _encode_features(df, feature_cols, variable_configs)
+    X, encoded_names, col_index_map = _encode_features(
+        df, feature_cols, variable_configs
+    )
     y = df[target_col].to_numpy().astype(float)
     w = df[weight_col].to_numpy().astype(float) if weight_col else None
-    n_real = X.shape[1]
-
-    # Convert to numpy once and release the Polars frame to save memory.
     X_np = X.to_numpy()
-    del X
-
-    rng = np.random.RandomState(random_state)
-    hit_counts: dict[str, int] = {c: 0 for c in feature_cols}
-
-    params: dict[str, Any] = {"n_estimators": n_estimators, "verbose": -1, "n_jobs": -1, "importance_type": "gain"}
+    params: dict[str, Any] = {
+        "n_estimators": n_estimators,
+        "verbose": -1,
+        "n_jobs": -1,
+        "importance_type": "gain",
+    }
     params.update(lgb_params)
-
-    # Pre-allocate reusable buffers: shadow columns and the augmented matrix.
-    shadow = np.empty_like(X_np)
-    X_aug = np.empty((X_np.shape[0], n_real * 2), dtype=X_np.dtype)
-    X_aug[:, :n_real] = X_np  # left half is constant across iterations
-
-    shadow_names = [f"_shadow_{n}" for n in encoded_names]
-    aug_names = encoded_names + shadow_names
-
-    for _ in range(n_iterations):
-        for j in range(n_real):
-            shadow[:, j] = rng.permutation(X_np[:, j])
-        X_aug[:, n_real:] = shadow
-
-        mdl = LGBRegressorPolars(**params)
-        mdl.fit(X_aug, y, sample_weight=w, feature_name=aug_names)
-
-        imp = mdl.feature_importances_
-        real_imp = imp[:n_real]
-        max_shadow = np.percentile(imp[n_real:], 95)
-
-        for col_name in feature_cols:
-            indices = col_index_map[col_name]
-            col_imp = sum(float(real_imp[i]) for i in indices)
-            if col_imp > max_shadow:
-                hit_counts[col_name] += 1
+    hit_counts = _boruta_hit_counts(
+        X_np,
+        y,
+        w,
+        encoded_names,
+        feature_cols,
+        col_index_map,
+        params,
+        n_iterations,
+        random_state,
+    )
 
     rows = [
         {

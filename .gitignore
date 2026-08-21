@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+elastic_net_tool/gui.py
 
 # Virtual environments
 .venv/

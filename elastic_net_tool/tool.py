@@ -43,11 +43,140 @@ from .plots import (
 from .variable import (
     FittedBinnedNumericParams,
     FittedCategoricalParams,
+    Preprocessor,
     VariableConfig,
     default_config,
 )
 
 # ── Module-level helpers for relativities_table ───────────────────────────────
+
+
+def _validate_numeric_column(
+    data: pl.DataFrame,
+    argument_name: str,
+    column: str | None,
+) -> None:
+    """Validate an optional numeric column argument."""
+    if column is None:
+        return
+    if column not in data.columns:
+        raise ValueError(f"{argument_name} '{column}' not found in data.")
+    if not data[column].dtype.is_numeric():
+        raise ValueError(
+            f"{argument_name} '{column}' must be numeric, got {data[column].dtype}."
+        )
+
+
+def _validate_fit_request(variables: list[str], version: str) -> None:
+    """Validate the public variable-list and version arguments."""
+    invalid_variables = (
+        not isinstance(variables, list)
+        or not variables
+        or any(not isinstance(variable, str) or not variable for variable in variables)
+    )
+    if invalid_variables:
+        raise ValueError("variables must be a non-empty list of variable names.")
+    if len(set(variables)) != len(variables):
+        raise ValueError("variables must not contain duplicates.")
+    if not isinstance(version, str) or not version:
+        raise ValueError("version must be a non-empty string.")
+
+
+def _create_variable_config(
+    data: pl.DataFrame,
+    column: str,
+    input_columns: list[str] | None,
+    custom_transform: Callable | None,
+    options: dict[str, Any],
+) -> VariableConfig:
+    """Build a variable config from the keyword-oriented public API."""
+    if "breakpoints" in options:
+        options["bin_edges"] = options.pop("breakpoints")
+    if input_columns is not None:
+        options["input_cols"] = input_columns
+    if custom_transform is not None:
+        options["custom_transform"] = custom_transform
+    if options:
+        return VariableConfig(col=column, **options)
+    if column in data.columns:
+        return default_config(column, data[column])
+    return VariableConfig(col=column)
+
+
+def _select_factor_variables(
+    factor_table: pl.DataFrame,
+    include_variables: list[str] | None,
+    exclude_variables: list[str] | None,
+) -> list[str]:
+    """Select factor-table variables while preserving their sheet order."""
+    all_variables = [
+        variable
+        for variable in factor_table["Variable"].unique()
+        if variable != "intercept"
+    ]
+    if include_variables is not None:
+        unknown = [
+            variable for variable in include_variables if variable not in all_variables
+        ]
+        if unknown:
+            raise ValueError(
+                f"include_variables contains names not found in the sheet: {unknown}"
+            )
+        return [variable for variable in all_variables if variable in include_variables]
+    if exclude_variables is not None:
+        return [
+            variable for variable in all_variables if variable not in exclude_variables
+        ]
+    return all_variables
+
+
+def _read_factor_table(filepath: str | Path, sheet_name: str) -> pl.DataFrame:
+    """Read and normalize an Excel factor table."""
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "openpyxl is required to read Excel files.\n"
+            "Install it with:  pip install openpyxl"
+        ) from exc
+
+    factor_table = pl.read_excel(filepath, sheet_name=sheet_name, engine="openpyxl")
+    missing_columns = {"Variable", "Level", "Factor"} - set(factor_table.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Excel sheet '{sheet_name}' is missing required columns: "
+            f"{sorted(missing_columns)}.  Found: {factor_table.columns}"
+        )
+    return factor_table.with_columns(
+        pl.col("Variable").cast(pl.String),
+        pl.col("Level").cast(pl.String),
+        pl.col("Factor").cast(pl.Float64),
+    )
+
+
+def _weighted_decile_levels(
+    values: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Return the weighted decile labels used by AvE tables."""
+    breaks = np.quantile(
+        values,
+        q=np.linspace(0, 1, 11),
+        weights=weights,
+        method="inverted_cdf",
+    )
+    breaks = sorted(set(dict.fromkeys(breaks)))[1:-1]
+    return (
+        pl.Series(values)
+        .cut(
+            breaks,
+            labels=[str(index) for index in range(1, 11)],
+            left_closed=True,
+        )
+        .cast(pl.String)
+        .to_numpy()
+    )
+
 
 def _weighted_feat_map(
     Xt_df: pl.DataFrame,
@@ -86,18 +215,31 @@ def _make_row(
         row[fn] = fold_coef_map[fn].get(feat, 0.0) if feat is not None else 0.0
     return row
 
+
 def _validate_training_inputs(y, weights, offset) -> None:
     """Validate target, exposure, and offset arrays before model fitting."""
     y = y.to_numpy()
     if len(y) == 0 or not np.all(np.isfinite(y)):
         raise ValueError("target_col must contain at least one finite numeric value.")
-    weights = weights.to_numpy()
-    if weights is not None and (not np.all(np.isfinite(weights)) or np.any(weights < 0) or weights.sum() <= 0):
-        raise ValueError("weight_col must contain finite non-negative values with a positive total.")
+    if weights is not None:
+        weights = weights.to_numpy()
+        if (
+            not np.all(np.isfinite(weights))
+            or np.any(weights < 0)
+            or weights.sum() <= 0
+        ):
+            raise ValueError(
+                "weight_col must contain finite non-negative values with a positive total."
+            )
     if offset is not None:
         offset = offset.to_numpy()
-        if offset is not None and (not np.all(np.isfinite(offset)) or len(offset) != len(y)):
-            raise ValueError("offset_col must contain finite values aligned with target_col.")
+        if offset is not None and (
+            not np.all(np.isfinite(offset)) or len(offset) != len(y)
+        ):
+            raise ValueError(
+                "offset_col must contain finite values aligned with target_col."
+            )
+
 
 class ModelingTool:
     """
@@ -152,22 +294,24 @@ class ModelingTool:
         weight_col: str | None = None,
         offset_col: str | None = None,
         link: Any = None,
+        tweedie_power: float = 1.5,
         drop_reference: str = "max_weight",
         cv_column: str | None = None,
         current_version: str | None = None,
-        base_version: str | None = None
+        base_version: str | None = None,
     ):
         if not isinstance(data, pl.DataFrame):
-            raise TypeError(f"data must be a polars DataFrame, got {type(data).__name__}.")
+            raise TypeError(
+                f"data must be a polars DataFrame, got {type(data).__name__}."
+            )
         if not isinstance(target_col, str) or target_col not in data.columns:
             raise ValueError(f"target_col '{target_col}' not found in data.")
-        for name, col in (("weight_col", weight_col), ("offset_col", offset_col)):
-            if col is not None and col not in data.columns:
-                raise ValueError(f"{name} '{col}' not found in data.")
-            if col is not None and not data[col].dtype.is_numeric():
-                raise ValueError(f"{name} '{col}' must be numeric, got {data[col].dtype}.")
+        _validate_numeric_column(data, "weight_col", weight_col)
+        _validate_numeric_column(data, "offset_col", offset_col)
         if not data[target_col].dtype.is_numeric():
-            raise ValueError(f"target_col '{target_col}' must be numeric, got {data[target_col].dtype}.")
+            raise ValueError(
+                f"target_col '{target_col}' must be numeric, got {data[target_col].dtype}."
+            )
         if drop_reference not in {"max_weight", "first"}:
             raise ValueError("drop_reference must be 'max_weight' or 'first'.")
         if cv_column is not None and cv_column not in data.columns:
@@ -175,8 +319,12 @@ class ModelingTool:
                 f"cv_column '{cv_column}' not found in data.  "
                 f"Available columns: {data.columns}"
             )
-        
-        _validate_training_inputs(data[target_col], data[weight_col], data[offset_col] if offset_col else None)
+
+        _validate_training_inputs(
+            data[target_col],
+            data[weight_col] if weight_col else None,
+            data[offset_col] if offset_col else None,
+        )
 
         self.data = data
         self.target_col = target_col
@@ -185,6 +333,7 @@ class ModelingTool:
         self.drop_reference = drop_reference
         self.cv_column = cv_column
         self.link = link
+        self.tweedie_power = tweedie_power
         self.current_version = current_version
         self.base_version = base_version
         self.variable_configs: dict[str, VariableConfig] = {}
@@ -195,7 +344,7 @@ class ModelingTool:
     @property
     def _y(self) -> pl.Series:
         return self.data[self.target_col]
-    
+
     @property
     def _y_array(self) -> np.ndarray:
         """Target values as a float64 numpy array."""
@@ -208,12 +357,20 @@ class ModelingTool:
     @property
     def _weights_array(self) -> np.ndarray | None:
         """Exposure weights as a float64 numpy array, or None if no weight column."""
-        return self._weights.to_numpy().astype(float) if self._weights is not None else None
-    
+        return (
+            self._weights.to_numpy().astype(float)
+            if self._weights is not None
+            else None
+        )
+
     @property
     def _offset_array(self) -> np.ndarray | None:
         """Offset values as a float64 numpy array, or None if no offset column."""
-        return self.data[self.offset_col].to_numpy().astype(float) if self.offset_col is not None else None
+        return (
+            self.data[self.offset_col].to_numpy().astype(float)
+            if self.offset_col is not None
+            else None
+        )
 
     # ── Variable management ───────────────────────────────────────────────────
 
@@ -288,27 +445,19 @@ class ModelingTool:
             if config.col != col:
                 raise ValueError("config.col must match the add_variable output name.")
             if kwargs or input_cols is not None or custom_transform is not None:
-                raise ValueError("Pass either config or individual variable options, not both.")
+                raise ValueError(
+                    "Pass either config or individual variable options, not both."
+                )
             self.variable_configs[col] = config
             return self
 
-        # breakpoints is a user-friendly alias for bin_edges
-        if "breakpoints" in kwargs:
-            kwargs["bin_edges"] = kwargs.pop("breakpoints")
-
-        if input_cols is not None:
-            kwargs["input_cols"] = input_cols
-        if custom_transform is not None:
-            kwargs["custom_transform"] = custom_transform
-
-        if kwargs:
-            self.variable_configs[col] = VariableConfig(col=col, **kwargs)
-        else:
-            # Auto-detect: col must be in data for dtype detection
-            if col in self.data.columns:
-                self.variable_configs[col] = default_config(col, self.data[col])
-            else:
-                self.variable_configs[col] = VariableConfig(col=col)
+        self.variable_configs[col] = _create_variable_config(
+            self.data,
+            col,
+            input_cols,
+            custom_transform,
+            kwargs,
+        )
         return self
 
     def get_variable_config(self, col: str) -> VariableConfig | None:
@@ -319,20 +468,22 @@ class ModelingTool:
         """Summary table of all registered variable configs."""
         rows = []
         for col, cfg in self.variable_configs.items():
-            rows.append({
-                "col": col,
-                "input_cols": str(cfg.input_cols) if cfg.input_cols else None,
-                "is_categorical": cfg.is_categorical,
-                "cap_lower": cfg.cap_lower,
-                "cap_upper": cfg.cap_upper,
-                "log_transform": cfg.log_transform,
-                "n_bins": cfg.n_bins,
-                "bin_edges": str(cfg.bin_edges) if cfg.bin_edges else None,
-                "standardize": cfg.standardize,
-                "encoding": cfg.encoding,
-                "impute_strategy": cfg.impute_strategy,
-                "custom_transform": cfg.custom_transform is not None,
-            })
+            rows.append(
+                {
+                    "col": col,
+                    "input_cols": str(cfg.input_cols) if cfg.input_cols else None,
+                    "is_categorical": cfg.is_categorical,
+                    "cap_lower": cfg.cap_lower,
+                    "cap_upper": cfg.cap_upper,
+                    "log_transform": cfg.log_transform,
+                    "n_bins": cfg.n_bins,
+                    "bin_edges": str(cfg.bin_edges) if cfg.bin_edges else None,
+                    "standardize": cfg.standardize,
+                    "encoding": cfg.encoding,
+                    "impute_strategy": cfg.impute_strategy,
+                    "custom_transform": cfg.custom_transform is not None,
+                }
+            )
         return pl.DataFrame(rows) if rows else pl.DataFrame()
 
     # ── Exploration ───────────────────────────────────────────────────────────
@@ -344,6 +495,7 @@ class ModelingTool:
         breaks: list[float] | None = None,
         figsize: tuple[int, int] | None = None,
         version: str | None = None,
+        show: bool = True,
     ) -> plt.Figure:
         """
         Weighted mean target vs each level (or quantile bin) of *col*.
@@ -378,17 +530,22 @@ class ModelingTool:
                 )
                 preprocessor.fit(self.data, weights=self._weights_array)
         elif col in self.variable_configs:
-            preprocessor = _build_preprocessor(
-                [col], self.data, self.variable_configs
-            )
+            preprocessor = _build_preprocessor([col], self.data, self.variable_configs)
             preprocessor.fit(self.data, weights=self._weights_array)
-        
+
         fig = univariate_plot(
-            self.data, self._y, col=col,
-            weights=self._weights, n_bins=n_bins, breaks=breaks, figsize=figsize,
+            self.data,
+            self._y,
+            col=col,
+            weights=self._weights,
+            n_bins=n_bins,
+            breaks=breaks,
+            figsize=figsize,
             preprocessor=preprocessor,
         )
 
+        if show:
+            plt.show()
         return fig
 
     # ── Bin suggestion ────────────────────────────────────────────────────────
@@ -419,8 +576,15 @@ class ModelingTool:
     ) -> list[float]:
         """Equal-weight quantile breakpoints for *col*. Shortcut for ``suggest_bins(methods=['quantile'])[...]``."""
         from .bin_suggestor import suggest_bins_quantile as _fn
-        return _fn(col, self._data_with_derived_col(col), n_bins=n_bins, weights=self._weights,
-                   verbose=verbose, **kwargs)
+
+        return _fn(
+            col,
+            self._data_with_derived_col(col),
+            n_bins=n_bins,
+            weights=self._weights,
+            verbose=verbose,
+            **kwargs,
+        )
 
     def suggest_bins_equal_width(
         self,
@@ -431,7 +595,14 @@ class ModelingTool:
     ) -> list[float]:
         """Equal-width breakpoints for *col*. Shortcut for ``suggest_bins(methods=['equal_width'])[...]``."""
         from .bin_suggestor import suggest_bins_equal_width as _fn
-        return _fn(col, self._data_with_derived_col(col), n_bins=n_bins, verbose=verbose, **kwargs)
+
+        return _fn(
+            col,
+            self._data_with_derived_col(col),
+            n_bins=n_bins,
+            verbose=verbose,
+            **kwargs,
+        )
 
     def suggest_bins_gbm(
         self,
@@ -442,8 +613,16 @@ class ModelingTool:
     ) -> list[float]:
         """GBM-derived breakpoints for *col*. Shortcut for ``suggest_bins(methods=['gbm'])[...]``."""
         from .bin_suggestor import suggest_bins_gbm as _fn
-        return _fn(col, self._data_with_derived_col(col), self._y, weights=self._weights,
-                   max_splits=max_splits, verbose=verbose, **kwargs)
+
+        return _fn(
+            col,
+            self._data_with_derived_col(col),
+            self._y,
+            weights=self._weights,
+            max_splits=max_splits,
+            verbose=verbose,
+            **kwargs,
+        )
 
     def suggest_bins_optbin(
         self,
@@ -455,9 +634,17 @@ class ModelingTool:
     ) -> list[float]:
         """Optimal binning breakpoints for *col*. Shortcut for ``suggest_bins(methods=['optbin'])[...]``."""
         from .bin_suggestor import suggest_bins_optbin as _fn
-        return _fn(col, self._data_with_derived_col(col), self._y, weights=self._weights,
-                   max_n_bins=max_n_bins, monotonic_trend=monotonic_trend,
-                   verbose=verbose, **kwargs)
+
+        return _fn(
+            col,
+            self._data_with_derived_col(col),
+            self._y,
+            weights=self._weights,
+            max_n_bins=max_n_bins,
+            monotonic_trend=monotonic_trend,
+            verbose=verbose,
+            **kwargs,
+        )
 
     def suggest_bins(
         self,
@@ -530,6 +717,28 @@ class ModelingTool:
 
     # ── Model fitting ─────────────────────────────────────────────────────────
 
+    def _resolve_cv(
+        self,
+        alpha: float | None,
+        cv: int | None,
+        use_cv: bool,
+    ) -> tuple[bool, Any]:
+        """Resolve fixed-alpha and predefined cross-validation behavior."""
+        if alpha is not None:
+            return False, None
+        if cv is not None:
+            return use_cv, cv
+        if self.cv_column is None:
+            return use_cv, 5
+
+        from sklearn.model_selection import PredefinedSplit
+
+        fold_values = self.data[self.cv_column]
+        unique_folds = sorted(set(fold_values))
+        fold_map = {fold: index for index, fold in enumerate(unique_folds)}
+        test_fold = [fold_map[fold] for fold in fold_values]
+        return use_cv, PredefinedSplit(test_fold)
+
     def fit_model(
         self,
         variables: list[str],
@@ -546,7 +755,8 @@ class ModelingTool:
         gradient_tol: float | None = None,
         fit_intercept: bool = True,
         print_summary: bool = True,
-        n_jobs: int | None = None
+        n_jobs: int | None = None,
+        alphas: np.ndarray | None = None,
     ) -> ModelVersion:
         """
         Fit an elastic net GLM and store it as a named version.
@@ -600,33 +810,10 @@ class ModelingTool:
         n_jobs : int, optional
             Number of parallel jobs for CV.  Defaults to ``None`` (1 job).
         """
-        if not isinstance(variables, list) or not variables or any(not isinstance(v, str) or not v for v in variables):
-            raise ValueError("variables must be a non-empty list of variable names.")
-        if len(set(variables)) != len(variables):
-            raise ValueError("variables must not contain duplicates.")
-        if not isinstance(version, str) or not version:
-            raise ValueError("version must be a non-empty string.")
-        # if version in self.model_versions:
-        #     raise ValueError(f"Version '{version}' already exists; choose a new version name.")
-        
-        if alpha is not None: 
-            use_cv = False # No regularization, so no need for CV; ignore any cv argument passed
-            resolved_cv = None
-        elif cv is not None:
-            resolved_cv: Any = cv
-        elif self.cv_column is not None:
-            from sklearn.model_selection import PredefinedSplit
-
-            fold_values = self.data[self.cv_column]
-            # Map arbitrary fold labels to contiguous integers (required by PredefinedSplit)
-            unique_folds = sorted(set(fold_values))
-            fold_map = {f: i for i, f in enumerate(unique_folds)}
-            test_fold = [fold_map[f] for f in fold_values]
-            resolved_cv = PredefinedSplit(test_fold)
-        else:
-            resolved_cv = 5  # sklearn default
-
-
+        _validate_fit_request(variables, version)
+        use_cv, resolved_cv = self._resolve_cv(alpha, cv, use_cv)
+        if type(resolved_cv).__name__ == "PredefinedSplit":
+            print("Using PredefinedSplit from cv_column.")
         mv = fit_model(
             X=self.data,
             y=self._y_array,
@@ -637,7 +824,9 @@ class ModelingTool:
             offset=self._offset_array,
             family=family,
             link=link or self.link,
-            tweedie_power=tweedie_power,
+            tweedie_power=self.tweedie_power
+            if tweedie_power is None
+            else tweedie_power,
             preprocessor=preprocessor,
             alpha=alpha,
             l1_ratio=l1_ratio,
@@ -647,7 +836,8 @@ class ModelingTool:
             gradient_tol=gradient_tol,
             fit_intercept=fit_intercept,
             drop_reference=self.drop_reference,
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
+            alphas=alphas,
         )
         self.model_versions[version] = mv
         self.current_version = version
@@ -698,10 +888,14 @@ class ModelingTool:
         if version is not None and version in self.model_versions:
             mv = self.model_versions[version]
         elif version is None:
-            print("Using current version since none was specified or specified version does not exist.")
+            print(
+                "Using current version since none was specified or specified version does not exist."
+            )
             mv = self.model_versions[self.current_version]
         else:
-            raise AttributeError('No model has yet been fit, please fit a model first and then specify a version.')
+            raise AttributeError(
+                "No model has yet been fit, please fit a model first and then specify a version."
+            )
 
         resolved_alpha = mv.alpha
         resolved_l1 = mv.l1_ratio
@@ -744,12 +938,20 @@ class ModelingTool:
             containing pre-computed baseline predictions.
         """
         if version not in self.model_versions and version not in self.data.columns:
-            raise ValueError(f"Version '{version}' not found and not in data columns. Available versions: {list(self.model_versions.keys())}")
-        
+            raise ValueError(
+                f"Version '{version}' not found and not in data columns. Available versions: {list(self.model_versions.keys())}"
+            )
+
         self.base_version = version
         return self
 
-    def predict(self, data: pl.DataFrame, version: str | None = None, missing_factor: float = 1.0, offset: np.ndarray | None = None) -> np.ndarray:
+    def predict(
+        self,
+        data: pl.DataFrame,
+        version: str | None = None,
+        missing_factor: float = 1.0,
+        offset: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Generate predictions for *data* using the specified model version.
 
         Parameters
@@ -776,7 +978,9 @@ class ModelingTool:
         """
         if not isinstance(data, pl.DataFrame):
             raise TypeError("data must be a polars DataFrame.")
-        if not isinstance(missing_factor, (int, float)) or not np.isfinite(missing_factor):
+        if not isinstance(missing_factor, (int, float)) or not np.isfinite(
+            missing_factor
+        ):
             raise ValueError("missing_factor must be finite.")
         mv = self._get_version(version or self.current_version)
         if offset is None:
@@ -791,15 +995,76 @@ class ModelingTool:
             or len(offset) != len(data)
             or not np.all(np.isfinite(offset))
         ):
-            raise ValueError("offset must be a finite one-dimensional array aligned with data.")
+            raise ValueError(
+                "offset must be a finite one-dimensional array aligned with data."
+            )
 
         if isinstance(mv, FactorModelVersion):
-            if mv.offset_col and mv.offset_col in data.columns and mv.offset_col != self.offset_col:
+            if (
+                mv.offset_col
+                and mv.offset_col in data.columns
+                and mv.offset_col != self.offset_col
+            ):
                 offset = data[mv.offset_col].to_numpy().astype(float)
             return mv.predict(data, missing_factor=missing_factor, offset=offset)
         else:
             return mv.predict(data, offset=offset)
+
     # ── Excel factor version ──────────────────────────────────────────────────
+
+    def _excel_preprocessor(
+        self,
+        variables: list[str],
+        base_version: str | None,
+    ) -> Preprocessor | None:
+        """Resolve the preprocessor used by an Excel factor model."""
+        if base_version is not None:
+            base_model = self._get_version(base_version)
+            return getattr(base_model, "preprocessor", None)
+        preprocessor = _build_preprocessor(
+            variables,
+            self.data,
+            self.variable_configs,
+        )
+        preprocessor.fit(self.data, self._y_array, weights=self._weights_array)
+        return preprocessor
+
+    def _validate_direct_factor_variables(
+        self,
+        direct_variables: list[str],
+    ) -> None:
+        """Ensure direct-lookup factors exist in non-empty training data."""
+        if not len(self.data):
+            return
+        missing = [
+            variable
+            for variable in direct_variables
+            if variable not in self.data.columns
+        ]
+        if missing:
+            raise ValueError(
+                f"Variables {missing} are not covered by any preprocessor "
+                "and are not found in the data columns. "
+                "Ensure these columns exist or specify base_version."
+            )
+
+    def _initialize_factor_predictions(
+        self,
+        model: FactorModelVersion,
+        missing_factor: float,
+    ) -> None:
+        """Populate in-sample predictions for an Excel factor model."""
+        if not len(self.data):
+            model.train_predictions = np.array([])
+            return
+        offset = None
+        if model.offset_col and model.offset_col in self.data.columns:
+            offset = self.data[model.offset_col].to_numpy().astype(float)
+        model.train_predictions = model.predict(
+            self.data,
+            missing_factor=missing_factor,
+            offset=offset,
+        )
 
     def add_excel_version(
         self,
@@ -859,75 +1124,29 @@ class ModelingTool:
             Returns ``self`` to support method chaining.
         """
         if include_variables is not None and exclude_variables is not None:
-            raise ValueError("Specify only one of include_variables or exclude_variables, not both.")
-
-        try:
-            import openpyxl  # noqa: F401  — existence check only
-        except ImportError as exc:
-            raise ImportError(
-                "openpyxl is required to read Excel files.\n"
-                "Install it with:  pip install openpyxl"
-            ) from exc
-
-        factor_table = pl.read_excel(filepath, sheet_name=sheet_name, engine="openpyxl")
-
-        missing_cols = {"Variable", "Level", "Factor"} - set(factor_table.columns)
-        if missing_cols:
             raise ValueError(
-                f"Excel sheet '{sheet_name}' is missing required columns: "
-                f"{sorted(missing_cols)}.  Found: {factor_table.columns}"
+                "Specify only one of include_variables or exclude_variables, not both."
             )
 
-        factor_table = factor_table.with_columns(
-            pl.col("Variable").cast(pl.String),
-            pl.col("Level").cast(pl.String),
-            pl.col("Factor").cast(pl.Float64),
+        factor_table = _read_factor_table(filepath, sheet_name)
+        variables = _select_factor_variables(
+            factor_table,
+            include_variables,
+            exclude_variables,
         )
-
-        all_excel_vars = [
-            v for v in factor_table["Variable"].unique()
-            if v != "intercept"
-        ]
-
-        if include_variables is not None:
-            unknown = [v for v in include_variables if v not in all_excel_vars]
-            if unknown:
-                raise ValueError(f"include_variables contains names not found in the sheet: {unknown}")
-            variables = [v for v in all_excel_vars if v in include_variables]
-        elif exclude_variables is not None:
-            variables = [v for v in all_excel_vars if v not in exclude_variables]
-        else:
-            variables = all_excel_vars
-
-        # Keep only rows for selected variables (and intercept)
         factor_table = factor_table.filter(
             pl.col("Variable").is_in(variables) | (pl.col("Variable") == "intercept")
         )
-
-        if base_version is not None:
-            mv_base = self._get_version(base_version)
-            prep = getattr(mv_base, "preprocessor", None)
-        else:
-            # Pick the fitted GLM preprocessor that covers the most excel variables
-            prep = _build_preprocessor(variables, self.data, self.variable_configs)
-            prep.fit(self.data, self._y_array, weights=self._weights_array)
-
+        prep = self._excel_preprocessor(variables, base_version)
         preprocessor_vars = (
-            [v for v in variables if v in prep.configs]
-            if prep is not None else []
+            [variable for variable in variables if variable in prep.configs]
+            if prep is not None
+            else []
         )
-
-        # Variables not covered by preprocessor → direct lookup; validate present in data
-        direct_vars = [v for v in variables if v not in preprocessor_vars]
-        if len(self.data) > 0:
-            missing_direct = [v for v in direct_vars if v not in self.data.columns]
-            if missing_direct:
-                raise ValueError(
-                    f"Variables {missing_direct} are not covered by any preprocessor "
-                    f"and are not found in the data columns. "
-                    f"Ensure these columns exist or specify base_version."
-                )
-
+        direct_vars = [
+            variable for variable in variables if variable not in preprocessor_vars
+        ]
+        self._validate_direct_factor_variables(direct_vars)
         fmv = FactorModelVersion(
             name=version,
             variables=variables,
@@ -935,27 +1154,15 @@ class ModelingTool:
             preprocessor=prep,
             preprocessor_vars=preprocessor_vars,
             train_predictions=np.array([]),
-            offset_col=offset_col
+            offset_col=offset_col,
         )
-
-        if len(self.data) > 0:
-            offset_array = None
-            if fmv.offset_col and fmv.offset_col in self.data.columns:
-                offset_array = self.data[fmv.offset_col].to_numpy().astype(float)
-            # elif self.offset_col is not None:
-            #     offset_array = self._offset_array
-            fmv.train_predictions = fmv.predict(self.data, missing_factor=missing_factor, offset=offset_array)
-        else:
-            fmv.train_predictions = np.array([])
-
+        self._initialize_factor_predictions(fmv, missing_factor)
         self.model_versions[version] = fmv
-
-        n_prep = len(preprocessor_vars)
-        n_direct = len(direct_vars)
         print(
             f"  [Excel] Version '{version}' registered — "
             f"{len(variables)} variable(s): "
-            f"{n_prep} preprocessor-resolved, {n_direct} direct-lookup."
+            f"{len(preprocessor_vars)} preprocessor-resolved, "
+            f"{len(direct_vars)} direct-lookup."
         )
         return self
 
@@ -975,29 +1182,36 @@ class ModelingTool:
                 f"Version '{version}' is an Excel factor model; "
                 "model_summary is not applicable."
             )
-        nonzero = int((mv.coefficients["coefficient"] != 0).sum()) - 1  # exclude intercept
+        nonzero = (
+            int((mv.coefficients["coefficient"] != 0).sum()) - 1
+        )  # exclude intercept
 
         top_data = [
             ("Model Version:", mv.name),
             ("Dep. Variable:", self.target_col),
-            ("Model:", f"GLM, Penalty Weight = {np.round(mv.alpha, 3)}, L1 Ratio = {np.round(mv.l1_ratio, 3)}"),
+            (
+                "Model:",
+                f"GLM, Penalty Weight = {np.round(mv.alpha, 3)}, L1 Ratio = {np.round(mv.l1_ratio, 3)}",
+            ),
             ("Model Family:", mv.family.__class__.__name__),
             ("Link Function:", mv.link.__class__.__name__),
             ("Offset Column:", self.offset_col),
             ("Method:", "IRLS-CD"),
-            ("Fit Date:", mv.fit_info['Fit_Time']),
+            ("Fit Date:", mv.fit_info.get("Fit_Time", "N/A")),
             ("No. Iterations:", len(mv.glm.diagnostics_)),
             ("No. Observations:", len(self.data)),
-            ('# Features:', len(mv.feature_names)),
-            ('# Nonzero Coefs:', nonzero)
+            ("# Features:", len(mv.feature_names)),
+            ("# Nonzero Coefs:", nonzero),
         ]
         top_part = tabulate(top_data, tablefmt="plain")
 
-        coef_table = tabulate(mv.coefficients.with_columns(pl.col('coefficient').exp()).to_dict())
+        coef_table = tabulate(
+            mv.coefficients.with_columns(pl.col("coefficient").exp()).to_dict()
+        )
 
-        print('='*80)
+        print("=" * 80)
         print(top_part)
-        print('='*80)
+        print("=" * 80)
         print(coef_table)
 
         return None
@@ -1028,8 +1242,9 @@ class ModelingTool:
                 f"Version '{version}' is an Excel factor model; "
                 "coefficient_plot is not applicable."
             )
-        fig = coefficient_plot(mv.coefficients, version_name=version,
-                               top_n=top_n, figsize=figsize)
+        fig = coefficient_plot(
+            mv.coefficients, version_name=version, top_n=top_n, figsize=figsize
+        )
         if show:
             plt.show()
         return fig
@@ -1037,8 +1252,7 @@ class ModelingTool:
     # ── Private helpers for relativities_table ───────────────────────────────
 
     def _get_fold_info(
-        self,
-        mv: ModelVersion
+        self, mv: ModelVersion
     ) -> tuple[list[str], dict[str, dict[str, float]]]:
         """Refit on each fold; return (fold_names, fold_label -> {feat: coef})."""
         if mv.cv_stability is None:
@@ -1063,10 +1277,11 @@ class ModelingTool:
         fold_rows = stability.filter(
             ~pl.col("fold").is_in(["geomean", "std", "cv_pct"])
         )
-        fold_names = fold_rows["fold"].to_list()
+        raw_fold_names = fold_rows["fold"].to_list()
+        fold_names = [f"fold_{name}" for name in raw_fold_names]
         fold_coef_map: dict[str, dict[str, float]] = {
-            fn: {k: v for k, v in row_d.items() if k != "fold"}
-            for fn, row_d in zip(fold_names, fold_rows.to_dicts())
+            display_name: {k: v for k, v in row_d.items() if k != "fold"}
+            for display_name, row_d in zip(fold_names, fold_rows.to_dicts())
         }
         return fold_names, fold_coef_map
 
@@ -1112,8 +1327,7 @@ class ModelingTool:
         other_w = sum(train_fw.values())
 
         calib_fw = (
-            _weighted_feat_map(Xt_calib, feats, w_calib)
-            if Xt_calib is not None else {}
+            _weighted_feat_map(Xt_calib, feats, w_calib) if Xt_calib is not None else {}
         )
         base_cw: float | None = (
             total_calib_w - sum(calib_fw.values()) if Xt_calib is not None else None
@@ -1121,17 +1335,33 @@ class ModelingTool:
 
         rows: list[dict[str, Any]] = []
         if dropped is not None:
-            rows.append(_make_row(
-                var_col, dropped, total_w - other_w, 0.0,
-                fold_names, fold_coef_map, None, calib_weight=base_cw,
-            ))
+            rows.append(
+                _make_row(
+                    var_col,
+                    f"{dropped} (base)",
+                    total_w - other_w,
+                    0.0,
+                    fold_names,
+                    fold_coef_map,
+                    None,
+                    calib_weight=base_cw,
+                )
+            )
         for cat, feat in zip(categories, feats):
-            rows.append(_make_row(
-                var_col, str(cat),
-                train_fw.get(feat, 0.0), coef_map.get(feat, 0.0),
-                fold_names, fold_coef_map, feat,
-                calib_weight=calib_fw.get(feat, 0.0) if Xt_calib is not None else None,
-            ))
+            rows.append(
+                _make_row(
+                    var_col,
+                    str(cat),
+                    train_fw.get(feat, 0.0),
+                    coef_map.get(feat, 0.0),
+                    fold_names,
+                    fold_coef_map,
+                    feat,
+                    calib_weight=calib_fw.get(feat, 0.0)
+                    if Xt_calib is not None
+                    else None,
+                )
+            )
         return rows
 
     def _binned_var_rows(
@@ -1161,15 +1391,16 @@ class ModelingTool:
             if i != dropped_bin
         ]
         all_feats = (
-            ([missing_feat] if missing_feat in Xt_df.columns else []) + bin_feats
-        )
+            [missing_feat] if missing_feat in Xt_df.columns else []
+        ) + bin_feats
 
         train_fw = _weighted_feat_map(Xt_df, all_feats, w_arr)
         other_w = sum(train_fw.values())
 
         calib_fw = (
             _weighted_feat_map(Xt_calib, all_feats, w_calib)
-            if Xt_calib is not None else {}
+            if Xt_calib is not None
+            else {}
         )
         base_cw: float | None = (
             total_calib_w - sum(calib_fw.values()) if Xt_calib is not None else None
@@ -1178,28 +1409,243 @@ class ModelingTool:
         base_label = all_labels[dropped_bin]
         rows: list[dict[str, Any]] = [
             _make_row(
-                var_col, f"{base_label} (base)", total_w - other_w, 0.0,
-                fold_names, fold_coef_map, None, calib_weight=base_cw,
+                var_col,
+                f"{base_label} (base)",
+                total_w - other_w,
+                0.0,
+                fold_names,
+                fold_coef_map,
+                None,
+                calib_weight=base_cw,
             )
         ]
         if missing_feat in Xt_df.columns:
-            rows.append(_make_row(
-                var_col, "Missing",
-                train_fw.get(missing_feat, 0.0), coef_map.get(missing_feat, 0.0),
-                fold_names, fold_coef_map, missing_feat,
-                calib_weight=calib_fw.get(missing_feat, 0.0) if Xt_calib is not None else None,
-            ))
+            rows.append(
+                _make_row(
+                    var_col,
+                    "Missing",
+                    train_fw.get(missing_feat, 0.0),
+                    coef_map.get(missing_feat, 0.0),
+                    fold_names,
+                    fold_coef_map,
+                    missing_feat,
+                    calib_weight=calib_fw.get(missing_feat, 0.0)
+                    if Xt_calib is not None
+                    else None,
+                )
+            )
         for i, label in enumerate(all_labels):
             if i == dropped_bin:
                 continue
             feat = f"{var_col}_{label}"
-            rows.append(_make_row(
-                var_col, label,
-                train_fw.get(feat, 0.0), coef_map.get(feat, 0.0),
-                fold_names, fold_coef_map, feat,
-                calib_weight=calib_fw.get(feat, 0.0) if Xt_calib is not None else None,
-            ))
+            rows.append(
+                _make_row(
+                    var_col,
+                    label,
+                    train_fw.get(feat, 0.0),
+                    coef_map.get(feat, 0.0),
+                    fold_names,
+                    fold_coef_map,
+                    feat,
+                    calib_weight=calib_fw.get(feat, 0.0)
+                    if Xt_calib is not None
+                    else None,
+                )
+            )
         return rows
+
+    def _encoded_variable_rows(
+        self,
+        variable: str,
+        params: Any,
+        config: VariableConfig,
+        design: pl.DataFrame,
+        weights: np.ndarray,
+        total_weight: float,
+        coefficients: dict[str, float],
+        fold_names: list[str],
+        fold_coefficients: dict[str, dict[str, float]],
+        calibration_design: pl.DataFrame | None,
+        calibration_weights: np.ndarray | None,
+        total_calibration_weight: float,
+    ) -> list[dict[str, Any]] | None:
+        """Build summary rows for one encoded variable."""
+        shared = (
+            variable,
+            params,
+            design,
+            weights,
+            total_weight,
+            coefficients,
+            fold_names,
+            fold_coefficients,
+            calibration_design,
+            calibration_weights,
+            total_calibration_weight,
+        )
+        if isinstance(params, FittedCategoricalParams) and params.encoding == "onehot":
+            return self._cat_var_rows(*shared)
+        if isinstance(params, FittedBinnedNumericParams):
+            return self._binned_var_rows(
+                variable,
+                params,
+                config,
+                *shared[2:],
+            )
+        return None
+
+    def _model_summary_rows(
+        self,
+        model: ModelVersion,
+        design: pl.DataFrame,
+        weights: np.ndarray,
+        total_weight: float,
+        coefficients: dict[str, float],
+        fold_names: list[str],
+        fold_coefficients: dict[str, dict[str, float]],
+        calibration_design: pl.DataFrame | None,
+        calibration_weights: np.ndarray | None,
+        total_calibration_weight: float,
+    ) -> list[dict[str, Any]]:
+        """Build summary rows for the model's discrete variables."""
+        rows: list[dict[str, Any]] = []
+        preprocessor = model.preprocessor
+        for variable in model.variables:
+            if variable not in preprocessor.configs:
+                continue
+            variable_rows = self._encoded_variable_rows(
+                variable,
+                preprocessor._params.get(variable),
+                preprocessor.configs[variable],
+                design,
+                weights,
+                total_weight,
+                coefficients,
+                fold_names,
+                fold_coefficients,
+                calibration_design,
+                calibration_weights,
+                total_calibration_weight,
+            )
+            rows.extend(variable_rows or [])
+        return rows
+
+    def _raw_extra_variable_rows(
+        self,
+        variable: str,
+        weights: np.ndarray,
+        calibration_data: pl.DataFrame | None,
+        calibration_weights: np.ndarray | None,
+    ) -> list[dict[str, Any]]:
+        """Build zero-coefficient summary rows from raw resolved levels."""
+        levels = _resolve_level(variable, self.data, preprocessor=None, n_bins=10)
+        level_weights = (
+            pl.DataFrame({"_level": levels, "_w": weights})
+            .group_by("_level")
+            .agg(pl.col("_w").sum())
+        )
+        calibration_level_weights: dict[str, float] = {}
+        if (
+            calibration_data is not None
+            and variable in calibration_data.columns
+            and calibration_weights is not None
+        ):
+            calibration_levels = _resolve_level(
+                variable,
+                calibration_data,
+                preprocessor=None,
+                n_bins=10,
+            )
+            grouped = (
+                pl.DataFrame({"_level": calibration_levels, "_w": calibration_weights})
+                .group_by("_level")
+                .agg(pl.col("_w").sum())
+            )
+            calibration_level_weights = {
+                row["_level"]: row["_w"] for row in grouped.iter_rows(named=True)
+            }
+
+        rows = []
+        for label in _sort_labels(level_weights["_level"].to_list()):
+            weight = float(level_weights.filter(pl.col("_level") == label)["_w"][0])
+            calibration_weight = (
+                calibration_level_weights.get(label, 0.0)
+                if calibration_data is not None
+                else None
+            )
+            rows.append(
+                _make_row(
+                    variable,
+                    label,
+                    weight,
+                    0.0,
+                    [],
+                    {},
+                    None,
+                    calib_weight=calibration_weight,
+                )
+            )
+        return rows
+
+    def _extra_variable_rows(
+        self,
+        variable: str,
+        weights: np.ndarray,
+        total_weight: float,
+        calibration_data: pl.DataFrame | None,
+        calibration_weights: np.ndarray | None,
+        total_calibration_weight: float,
+    ) -> list[dict[str, Any]]:
+        """Build summary rows for an extra configured or raw variable."""
+        config = self.variable_configs.get(variable)
+        is_derived = config is not None and (
+            config.input_cols is not None or config.custom_transform is not None
+        )
+        if variable not in self.data.columns and not is_derived:
+            raise ValueError(
+                f"extra_vars column '{variable}' not found in data.  "
+                "Register a config with input_cols or custom_transform to derive it."
+            )
+
+        if config is not None:
+            preprocessor = _build_preprocessor(
+                [variable], self.data, self.variable_configs
+            )
+            preprocessor.fit(self.data, weights=self._weights_array)
+            calibration_design = (
+                preprocessor.transform(calibration_data, strict=False)
+                if calibration_data is not None
+                else None
+            )
+            rows = self._encoded_variable_rows(
+                variable,
+                preprocessor._params.get(variable),
+                config,
+                preprocessor.transform(self.data),
+                weights,
+                total_weight,
+                {},
+                [],
+                {},
+                calibration_design,
+                calibration_weights,
+                total_calibration_weight,
+            )
+            if rows is not None:
+                return rows
+
+        if variable not in self.data.columns:
+            raise ValueError(
+                f"extra_vars variable '{variable}' has no binned or categorical "
+                "encoding; add n_bins or encoding='onehot' to its config to "
+                "resolve levels."
+            )
+        return self._raw_extra_variable_rows(
+            variable,
+            weights,
+            calibration_data,
+            calibration_weights,
+        )
 
     def summary_table(
         self,
@@ -1250,115 +1696,50 @@ class ModelingTool:
                 f"Version '{version}' is an Excel factor model; "
                 "summary_table is not applicable (the factor table IS the relativity table)."
             )
-        prep = mv.preprocessor
-
-        w_arr = self._weights_array
-        if w_arr is None:
-            w_arr = np.ones(len(self.data))
-        total_w = float(w_arr.sum())
-        Xt_df = prep.transform(self.data)
-
-        coef_map: dict[str, float] = {
-            r["feature"]: r["coefficient"]
-            for r in mv.coefficients.to_dicts()
-            if r["feature"] != "intercept"
+        preprocessor = mv.preprocessor
+        weights = self._weights_array
+        if weights is None:
+            weights = np.ones(len(self.data))
+        total_weight = float(weights.sum())
+        coefficients = {
+            row["feature"]: row["coefficient"]
+            for row in mv.coefficients.to_dicts()
+            if row["feature"] != "intercept"
         }
-
-        fold_names, fold_coef_map = (
+        fold_names, fold_coefficients = (
             self._get_fold_info(mv) if self.cv_column is not None else ([], {})
         )
-        Xt_calib, w_calib, total_calib_w = self._get_calib_arrays(prep, calib_df)
-
-        rows: list[dict[str, Any]] = []
-        for var_col in mv.variables:
-            if var_col not in prep.configs:
+        calibration = self._get_calib_arrays(preprocessor, calib_df)
+        rows = self._model_summary_rows(
+            mv,
+            preprocessor.transform(self.data),
+            weights,
+            total_weight,
+            coefficients,
+            fold_names,
+            fold_coefficients,
+            *calibration,
+        )
+        for variable in extra_vars or []:
+            if variable in set(mv.variables):
                 continue
-            p = prep._params.get(var_col)
-            cfg = prep.configs[var_col]
-
-            if isinstance(p, FittedCategoricalParams) and p.encoding == "onehot":
-                rows.extend(self._cat_var_rows(
-                    var_col, p, Xt_df, w_arr, total_w, coef_map,
-                    fold_names, fold_coef_map, Xt_calib, w_calib, total_calib_w,
-                ))
-            elif isinstance(p, FittedBinnedNumericParams):
-                rows.extend(self._binned_var_rows(
-                    var_col, p, cfg, Xt_df, w_arr, total_w, coef_map,
-                    fold_names, fold_coef_map, Xt_calib, w_calib, total_calib_w,
-                ))
-            # else: pure continuous variable — excluded
-
-        model_var_set = set(mv.variables)
-        for var in (extra_vars or []):
-            cfg = self.variable_configs.get(var)
-            # Derived variables (input_cols/custom_transform) may not exist as raw columns
-            is_derived = cfg is not None and (cfg.input_cols is not None or cfg.custom_transform is not None)
-            if var not in self.data.columns and not is_derived:
-                raise ValueError(
-                    f"extra_vars column '{var}' not found in data.  "
-                    "Register a config with input_cols or custom_transform to derive it."
+            rows.extend(
+                self._extra_variable_rows(
+                    variable,
+                    weights,
+                    total_weight,
+                    calib_df,
+                    calibration[1],
+                    calibration[2],
                 )
-            if var in model_var_set:
-                continue
-
-            if cfg is not None:
-                temp_prep = _build_preprocessor(
-                    [var], self.data, self.variable_configs
-                )
-                temp_prep.fit(self.data, weights=self._weights_array)
-                Xt_temp = temp_prep.transform(self.data)
-                p_temp = temp_prep._params.get(var)
-                Xt_calib_temp = (
-                    temp_prep.transform(calib_df, strict=False)
-                    if calib_df is not None else None
-                )
-                if isinstance(p_temp, FittedCategoricalParams) and p_temp.encoding == "onehot":
-                    rows.extend(self._cat_var_rows(
-                        var, p_temp, Xt_temp, w_arr, total_w, {},
-                        [], {}, Xt_calib_temp, w_calib, total_calib_w,
-                    ))
-                    continue
-                elif isinstance(p_temp, FittedBinnedNumericParams):
-                    rows.extend(self._binned_var_rows(
-                        var, p_temp, cfg, Xt_temp, w_arr, total_w, {},
-                        [], {}, Xt_calib_temp, w_calib, total_calib_w,
-                    ))
-                    continue
-                # else: plain continuous config — fall through to raw level resolution
-
-            # No config or plain continuous: resolve levels from the raw column
-            if var not in self.data.columns:
-                raise ValueError(
-                    f"extra_vars variable '{var}' has no binned or categorical encoding; "
-                    "add n_bins or encoding='onehot' to its config to resolve levels."
-                )
-            level_ser = _resolve_level(var, self.data, preprocessor=None, n_bins=10)
-            lw_df = (
-                pl.DataFrame({"_level": level_ser, "_w": w_arr})
-                .group_by("_level").agg(pl.col("_w").sum())
             )
-            calib_lw: dict[str, float] = {}
-            if calib_df is not None and var in calib_df.columns and w_calib is not None:
-                calib_level_ser = _resolve_level(var, calib_df, preprocessor=None, n_bins=10)
-                calib_lw = {
-                    r["_level"]: r["_w"]
-                    for r in (
-                        pl.DataFrame({"_level": calib_level_ser, "_w": w_calib})
-                        .group_by("_level").agg(pl.col("_w").sum())
-                        .iter_rows(named=True)
-                    )
-                }
-            for label in _sort_labels(lw_df["_level"].to_list()):
-                w_val = float(lw_df.filter(pl.col("_level") == label)["_w"][0])
-                cw = calib_lw.get(label, 0.0) if calib_df is not None else None
-                rows.append(_make_row(var, label, w_val, 0.0, [], {}, None, calib_weight=cw))
-
         return pl.DataFrame(rows) if rows else pl.DataFrame()
 
     # ── AvE data table ───────────────────────────────────────────────────────
 
     def _glm_factor_arrays(
-        self, mv: ModelVersion,
+        self,
+        mv: ModelVersion,
     ) -> dict[str, np.ndarray]:
         """Per-row factor array for each variable in a fitted GLM."""
         prep = mv.preprocessor
@@ -1404,7 +1785,8 @@ class ModelingTool:
         return result
 
     def _factor_model_factor_arrays(
-        self, mv: FactorModelVersion,
+        self,
+        mv: FactorModelVersion,
     ) -> dict[str, np.ndarray]:
         """Per-row factor array for each variable in a factor-table model."""
         prep = mv.preprocessor
@@ -1415,7 +1797,7 @@ class ModelingTool:
         n = len(self.data)
         factor_by_var = {
             grp: df.select(["Level", "Factor"])
-            for (grp, ), df in mv.factor_table.group_by("Variable")
+            for (grp,), df in mv.factor_table.group_by("Variable")
         }
         result: dict[str, np.ndarray] = {}
 
@@ -1452,7 +1834,9 @@ class ModelingTool:
             if isinstance(p, FittedBinnedNumericParams):
                 dropped_bin = p.dropped_bin
                 all_labels = p.bin_labels
-                level_arr = np.full(n, f"{all_labels[dropped_bin]} (base)", dtype=object)
+                level_arr = np.full(
+                    n, f"{all_labels[dropped_bin]} (base)", dtype=object
+                )
                 missing_feat = f"{V}_missing"
                 if missing_feat in Xt.columns:
                     level_arr[Xt[missing_feat].to_numpy().astype(bool)] = "Missing"
@@ -1471,7 +1855,7 @@ class ModelingTool:
         self,
         version: str | None = None,
         n_bins: int = 10,
-        state_column: str | None = None
+        state_column: str | None = None,
     ) -> plt.Figure:
         """
         Decile lift chart for *version*.
@@ -1506,13 +1890,107 @@ class ModelingTool:
 
         return fig
 
+    def _prediction_source(self, source: str) -> np.ndarray:
+        """Resolve predictions from a registered version or numeric data column."""
+        if source in self.model_versions:
+            return self._get_version(source).train_predictions
+        if source in self.data.columns:
+            series = self.data[source]
+            if not series.dtype.is_numeric():
+                raise ValueError(
+                    f"Column '{source}' has dtype {series.dtype}; "
+                    "predictions must be numeric."
+                )
+            return series.cast(pl.Float64).to_numpy()
+        self._get_version(source)
+        return np.array([])
+
+    def _comparison_predictions(
+        self,
+        source: str | None,
+        state_column: str | None,
+        weights: np.ndarray,
+    ) -> np.ndarray | None:
+        """Resolve and optionally off-balance comparison predictions."""
+        resolved_source = source if source is not None else self.base_version
+        if resolved_source is None:
+            return None
+        try:
+            predictions = self._prediction_source(resolved_source)
+        except KeyError as exc:
+            raise ValueError(
+                f"compare_version '{resolved_source}' not found in model versions "
+                "or data columns."
+            ) from exc
+        if state_column is not None:
+            return _off_balance_by_state(
+                predictions,
+                weights,
+                self.data[state_column],
+            )
+        return predictions
+
+    def _ave_levels(
+        self,
+        variable: str,
+        synthetic_levels: dict[str, np.ndarray],
+        preprocessor: Preprocessor | None,
+        n_bins: int,
+    ) -> np.ndarray:
+        """Resolve one analysis variable into AvE level labels."""
+        if variable in synthetic_levels:
+            return synthetic_levels[variable]
+        if variable not in self.data.columns and variable in self.variable_configs:
+            config = self.variable_configs[variable]
+            if config.input_cols is None and config.custom_transform is None:
+                raise ValueError(
+                    f"Variable '{variable}' is not a data column and has no "
+                    "input_cols or custom_transform; cannot resolve levels."
+                )
+            variable_preprocessor = _build_preprocessor(
+                [variable], self.data, self.variable_configs
+            )
+            variable_preprocessor.fit(self.data, weights=self._weights_array)
+            return _resolve_level(
+                variable,
+                self.data,
+                variable_preprocessor,
+                n_bins,
+            )
+        return _resolve_level(variable, self.data, preprocessor, n_bins)
+
+    @staticmethod
+    def _aggregate_ave_levels(
+        variable: str,
+        levels: np.ndarray,
+        data: dict[str, Any],
+        aggregations: list[pl.Expr],
+        column_order: list[str],
+    ) -> pl.DataFrame:
+        """Aggregate and naturally order one AvE table section."""
+        summary = (
+            pl.DataFrame({"_level": levels, **data})
+            .group_by("_level")
+            .agg(aggregations)
+        )
+        labels = _sort_labels(summary["_level"].to_list())
+        order = pl.DataFrame({"_level": labels, "_order": range(len(labels))})
+        return (
+            summary.join(order, on="_level")
+            .sort("_order")
+            .drop("_order")
+            .with_columns(pl.lit(variable).alias("variable"))
+            .rename({"_level": "level"})
+            .select(column_order)
+        )
+
     def ave_table(
         self,
         variables: list[str],
         version: str | None = None,
         n_bins: int = 10,
         state_column: str | None = None,
-        compare_version: str | None = None
+        compare_version: str | None = None,
     ) -> pl.DataFrame:
         """
         Actual-vs-Expected breakdown table for a list of analysis variables.
@@ -1552,101 +2030,87 @@ class ModelingTool:
             ``prediction``, then ``{model_var}_factor`` for each model
             variable.
         """
-        mv = self._get_version(version or self.current_version)
-        prep = getattr(mv, "preprocessor", None)
-        w_arr = self._weights_array if self._weights_array is not None else np.ones(len(self.data))
-        pred_arr = mv.train_predictions
-
-        if state_column is not None:
-            pred_arr = _off_balance_by_state(pred_arr, w_arr, self.data[state_column])
-
-        resolved_compare = compare_version if compare_version is not None else self.base_version
-        compare_pred_arr = None
-        if resolved_compare is not None:
-            if resolved_compare in self.model_versions:
-                compare_pred_arr = self.model_versions[resolved_compare].train_predictions
-            elif resolved_compare in self.data.columns:
-                col_s = self.data[resolved_compare]
-                if not col_s.dtype.is_numeric():
-                    raise ValueError(f"Column '{resolved_compare}' has dtype {col_s.dtype}; predictions must be numeric.")
-                compare_pred_arr = col_s.cast(pl.Float64).to_numpy()
-            else:
-                raise ValueError(f"compare_version '{resolved_compare}' not found in model versions or data columns.")
-            if state_column is not None:
-                compare_pred_arr = _off_balance_by_state(compare_pred_arr, w_arr, self.data[state_column])
-
-        factor_arrays = (
-            self._factor_model_factor_arrays(mv) if isinstance(mv, FactorModelVersion)
-            else self._glm_factor_arrays(mv)
+        model = self._get_version(version or self.current_version)
+        preprocessor = getattr(model, "preprocessor", None)
+        weights = (
+            self._weights_array
+            if self._weights_array is not None
+            else np.ones(len(self.data))
         )
-        model_vars = [v for v in mv.variables if v in factor_arrays]
+        predictions = model.train_predictions
+        if state_column is not None:
+            predictions = _off_balance_by_state(
+                predictions,
+                weights,
+                self.data[state_column],
+            )
+        comparison = self._comparison_predictions(
+            compare_version,
+            state_column,
+            weights,
+        )
+        factor_arrays = (
+            self._factor_model_factor_arrays(model)
+            if isinstance(model, FactorModelVersion)
+            else self._glm_factor_arrays(model)
+        )
+        model_variables = [
+            variable for variable in model.variables if variable in factor_arrays
+        ]
+        weighted_data: dict[str, Any] = {
+            "_w": weights,
+            "_yw": self._y_array * weights,
+            "_pw": predictions * weights,
+            **{
+                f"_f_{variable}": factor_arrays[variable] * weights
+                for variable in model_variables
+            },
+        }
+        if comparison is not None:
+            weighted_data["_cpw"] = comparison * weights
 
-        # Precompute weighted arrays once, reused across all analysis variables
-        y_arr = self._y_array
-        yw, pw = y_arr * w_arr, pred_arr * w_arr
-        cpw = compare_pred_arr * w_arr if compare_pred_arr is not None else None
-        weighted_factors = {v: factor_arrays[v] * w_arr for v in model_vars}
-
-        def _decile_levels(arr: np.ndarray) -> np.ndarray:
-            bks = np.quantile(arr, q=np.linspace(0, 1, 11), weights=w_arr, method='inverted_cdf')
-            bks = sorted(set(dict.fromkeys(bks)))[1:-1]
-            return pl.Series(arr).cut(bks, labels=[str(x) for x in range(1, 11)], left_closed=True).cast(pl.String).to_numpy()
-
-        # Weighted decile buckets (1=lowest risk, 10=highest) — same logic as lift_table
-        synthetic_levels: dict[str, np.ndarray] = {"prediction_decile": _decile_levels(pred_arr)}
-        if compare_pred_arr is not None:
-            synthetic_levels["compare_prediction_decile"] = _decile_levels(compare_pred_arr)
-
-        col_order = ["variable", "level", "weight", "loss", "prediction"]
-        if compare_pred_arr is not None:
-            col_order.append("compare_prediction")
-        col_order += [f"{v}_factor" for v in model_vars]
-
-        agg_exprs = [
+        synthetic_levels = {
+            "prediction_decile": _weighted_decile_levels(predictions, weights)
+        }
+        if comparison is not None:
+            synthetic_levels["compare_prediction_decile"] = _weighted_decile_levels(
+                comparison,
+                weights,
+            )
+        column_order = ["variable", "level", "weight", "loss", "prediction"]
+        if comparison is not None:
+            column_order.append("compare_prediction")
+        column_order.extend(f"{variable}_factor" for variable in model_variables)
+        aggregations = [
             pl.col("_w").sum().alias("weight"),
             pl.col("_yw").sum().alias("loss"),
             pl.col("_pw").sum().alias("prediction"),
-            *([] if cpw is None else [pl.col("_cpw").sum().alias("compare_prediction")]),
-            *[pl.col(f"_f_{v}").sum().alias(f"{v}_factor") for v in model_vars],
+            *(
+                []
+                if comparison is None
+                else [pl.col("_cpw").sum().alias("compare_prediction")]
+            ),
+            *[
+                pl.col(f"_f_{variable}").sum().alias(f"{variable}_factor")
+                for variable in model_variables
+            ],
         ]
-
-        all_parts: list[pl.DataFrame] = []
-        for var in list(synthetic_levels) + list(variables):
-            if var in synthetic_levels:
-                level_series = synthetic_levels[var]
-            elif var not in self.data.columns and var in self.variable_configs:
-                cfg = self.variable_configs[var]
-                if cfg.input_cols is None and cfg.custom_transform is None:
-                    raise ValueError(
-                        f"Variable '{var}' is not a data column and has no input_cols or "
-                        "custom_transform; cannot resolve levels."
-                    )
-                vprep = _build_preprocessor(
-                    [var], self.data, self.variable_configs
-                )
-                vprep.fit(self.data, weights=self._weights_array)
-                level_series = _resolve_level(var, self.data, vprep, n_bins)
-            else:
-                level_series = _resolve_level(var, self.data, prep, n_bins)
-
-            tmp_data: dict[str, Any] = {"_level": level_series, "_w": w_arr, "_yw": yw, "_pw": pw}
-            if cpw is not None:
-                tmp_data["_cpw"] = cpw
-            for v in model_vars:
-                tmp_data[f"_f_{v}"] = weighted_factors[v]
-
-            summary = pl.DataFrame(tmp_data).group_by("_level").agg(agg_exprs)
-            labels = _sort_labels(summary["_level"].to_list())
-            order_df = pl.DataFrame({"_level": labels, "_order": list(range(len(labels)))})
-            summary = (
-                summary.join(order_df, on="_level").sort("_order").drop("_order")
-                .with_columns(pl.lit(var).alias("variable"))
-                .rename({"_level": "level"})
-                .select(col_order)
+        tables = [
+            self._aggregate_ave_levels(
+                variable,
+                self._ave_levels(
+                    variable,
+                    synthetic_levels,
+                    preprocessor,
+                    n_bins,
+                ),
+                weighted_data,
+                aggregations,
+                column_order,
             )
-            all_parts.append(summary)
-
-        return pl.concat(all_parts) if all_parts else pl.DataFrame()
+            for variable in [*synthetic_levels, *variables]
+        ]
+        return pl.concat(tables) if tables else pl.DataFrame()
 
     # ── Actual vs Expected ────────────────────────────────────────────────────
 
@@ -1657,7 +2121,8 @@ class ModelingTool:
         n_bins: int = 10,
         breaks: list[float] | None = None,
         figsize: tuple[int, int] | None = None,
-        state_column: str | None = None
+        state_column: str | None = None,
+        show: bool = True,
     ) -> plt.Figure:
         """
         Actual vs Expected chart for *col* using model *version*.
@@ -1699,9 +2164,11 @@ class ModelingTool:
             figsize=figsize,
             version_name=version,
             preprocessor=prep,
-            state_column=state_column
+            state_column=state_column,
         )
 
+        if show:
+            plt.show()
         return fig
 
     def residual_chart(
@@ -1711,6 +2178,7 @@ class ModelingTool:
         n_bins: int = 10,
         breaks: list[float] | None = None,
         figsize: tuple[int, int] | None = None,
+        show: bool = True,
     ) -> plt.Figure:
         """
         Residual signal chart: ``mean_actual / mean_predicted`` per level of *col*.
@@ -1757,6 +2225,8 @@ class ModelingTool:
             preprocessor=prep,
         )
 
+        if show:
+            plt.show()
         return fig
 
     def plot_all_variables(
@@ -1764,7 +2234,8 @@ class ModelingTool:
         version: str | None = None,
         chart: str = "residual",
         n_bins: int = 10,
-        figsize: tuple[int, int] | None = None
+        figsize: tuple[int, int] | None = None,
+        show: bool = True,
     ) -> list[plt.Figure]:
         """
         Plot a residual or A/E chart for every variable in *version*.
@@ -1796,17 +2267,21 @@ class ModelingTool:
         figs: list[plt.Figure] = []
         for col in mv.variables:
             if chart == "ae":
-                fig = self.ae_chart(col, version=version, n_bins=n_bins,
-                                    figsize=figsize)
+                fig = self.ae_chart(
+                    col, version=version, n_bins=n_bins, figsize=figsize, show=False
+                )
             else:
-                fig = self.residual_chart(col, version=version, n_bins=n_bins,
-                                          figsize=figsize)
+                fig = self.residual_chart(
+                    col, version=version, n_bins=n_bins, figsize=figsize, show=False
+                )
             figs.append(fig)
+            if show:
+                plt.show()
         return figs
 
     # ── Model comparison ──────────────────────────────────────────────────────
 
-    def _get_dl_score(self, y, p1, p2, weights, n_buckets, deviation='absolute'):
+    def _get_dl_score(self, y, p1, p2, weights, n_buckets, deviation="absolute"):
         dl_data = double_lift_table(y, p1, p2, weights=weights, n_buckets=n_buckets)
         return dl_data, double_lift_score(dl_data, deviation=deviation)
 
@@ -1816,7 +2291,7 @@ class ModelingTool:
         version2: str | None = None,
         n_buckets: int = 10,
         figsize: tuple[int, int] | None = None,
-        dl_deviation: str | None = 'absolute',
+        dl_deviation: str | None = "absolute",
         state_column: str | None = None,
         show: bool = True,
     ) -> dict[str, Any]:
@@ -1869,30 +2344,21 @@ class ModelingTool:
             raise ValueError("version2 must be specified if no base version is set.")
         version2 = version2 or self.base_version
 
-        if version2 in self.model_versions:
-            p2 = self._get_version(version2).train_predictions
-        elif version2 in self.data.columns:
-            col_s = self.data[version2]
-            if not col_s.dtype.is_numeric():
-                raise ValueError(
-                    f"Column '{version2}' has dtype {col_s.dtype}; "
-                    "predictions must be numeric."
-                )
-            p2 = col_s.cast(pl.Float64).to_numpy()
-        else:
-            # Delegate to _get_version to raise the standard helpful KeyError.
-            self._get_version(version2)
-            p2 = np.array([])  # unreachable; satisfies type checkers
+        p2 = self._prediction_source(version2)
 
         if state_column is not None:
             states = self.data[state_column]
             p1 = _off_balance_by_state(p1, w, states)
             p2 = _off_balance_by_state(p2, w, states)
 
-        dl_data, dl_sc = self._get_dl_score(y, p1, p2, weights=w, n_buckets=n_buckets, deviation=dl_deviation)
+        dl_data, dl_sc = self._get_dl_score(
+            y, p1, p2, weights=w, n_buckets=n_buckets, deviation=dl_deviation
+        )
 
         metrics = compare_metrics(
-            y, p1, p2,
+            y,
+            p1,
+            p2,
             weights=w,
             name1=version1,
             name2=version2,
@@ -1913,8 +2379,16 @@ class ModelingTool:
         # print(f"  double_lift_score interpretation: {dl_interp}")
         # print("=" * 60 + "\n")
 
-        double_lift_chart(y, p1, p2, weights=w, n_buckets=n_buckets,
-                          name1=version1, name2=version2, figsize=figsize)
+        double_lift_chart(
+            y,
+            p1,
+            p2,
+            weights=w,
+            n_buckets=n_buckets,
+            name1=version1,
+            name2=version2,
+            figsize=figsize,
+        )
 
         if show:
             plt.show()
@@ -1922,14 +2396,14 @@ class ModelingTool:
         return {"metrics": metrics, "double_lift": dl_data}
 
     def midpoint_movement(
-        self, 
+        self,
         expense_values: dict[str, float],
         rate_adequacy_factors: pl.DataFrame,
-        state_column: str = 'PREDOM_STATE_ABBREV',
+        state_column: str = "PREDOM_STATE_ABBREV",
         version1: str | None = None,
         version2: str | None = None,
         extra_cols: list[str] | None = None,
-        show_plot: bool = True
+        show_plot: bool = True,
     ) -> pl.DataFrame:
         """
         Compute the midpoint movement between two model versions. Assumes moving from version1 to version2.
@@ -1939,7 +2413,7 @@ class ModelingTool:
         expense_values : dict
             Dictionary of expense values. Need CWR_FIXED_EXP_RATIO, CWR_ULAE_RATIO, and CWR_LOSS_PLUS_ALAE_RATIO
         rate_adequacy_factors : pl.DataFrame
-            DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code) 
+            DataFrame containing rate adequacy factors for each state. State column should be named 'STATE' (two letter code)
             and rate adequacy factor column should be named 'RATE_ADEQUACY_FACTOR'.
         state_column : str
             Name of the column in the data that contains state information. Default is 'PREDOM_STATE_ABBREV'
@@ -1958,11 +2432,25 @@ class ModelingTool:
         pl.DataFrame
             DataFrame with columns: ``version1``, ``version2``, ``midpoint_movement``.
         """
-        if not all(k in expense_values for k in ["CWR_FIXED_EXP_RATIO", "CWR_ULAE_RATIO", "CWR_LOSS_PLUS_ALAE_RATIO"]):
-            raise ValueError("expense_values must contain CWR_FIXED_EXP_RATIO, CWR_ULAE_RATIO, and CWR_LOSS_PLUS_ALAE_RATIO")
+        if not all(
+            k in expense_values
+            for k in [
+                "CWR_FIXED_EXP_RATIO",
+                "CWR_ULAE_RATIO",
+                "CWR_LOSS_PLUS_ALAE_RATIO",
+            ]
+        ):
+            raise ValueError(
+                "expense_values must contain CWR_FIXED_EXP_RATIO, CWR_ULAE_RATIO, and CWR_LOSS_PLUS_ALAE_RATIO"
+            )
 
-        if "STATE" not in rate_adequacy_factors.columns or "RATE_ADEQUACY_FACTOR" not in rate_adequacy_factors.columns:
-            raise ValueError("rate_adequacy_factors must contain 'STATE' and 'RATE_ADEQUACY_FACTOR' columns")
+        if (
+            "STATE" not in rate_adequacy_factors.columns
+            or "RATE_ADEQUACY_FACTOR" not in rate_adequacy_factors.columns
+        ):
+            raise ValueError(
+                "rate_adequacy_factors must contain 'STATE' and 'RATE_ADEQUACY_FACTOR' columns"
+            )
 
         mv1 = self._get_version(version1 or self.current_version)
         p1 = mv1.train_predictions
@@ -1972,27 +2460,11 @@ class ModelingTool:
             raise ValueError("version2 must be specified if no base version is set.")
         version2 = version2 or self.base_version
 
-        if version2 in self.model_versions:
-            p2 = self._get_version(version2).train_predictions
-        elif version2 in self.data.columns:
-            col_s = self.data[version2]
-            if not col_s.dtype.is_numeric():
-                raise ValueError(
-                    f"Column '{version2}' has dtype {col_s.dtype}; "
-                    "predictions must be numeric."
-                )
-            p2 = col_s.cast(pl.Float64).to_numpy()
-        elif version2 is None and self.base_version is not None:
-            p2 = self._get_version(self.base_version).train_predictions
-            version2 = self._get_version(self.base_version).name
-        else:
-            # Delegate to _get_version to raise the standard helpful KeyError.
-            self._get_version(version2)
-            p2 = np.array([])
+        p2 = self._prediction_source(version2)
 
         w = self._weights_array
 
-        policy_cols = ['POLICY_NUM', 'POLICY_EFF_DT', state_column]
+        policy_cols = ["POLICY_NUM", "POLICY_EFF_DT", state_column]
         if any(col not in self.data.columns for col in policy_cols):
             raise ValueError(f"Data must contain columns: {policy_cols}")
 
@@ -2004,11 +2476,21 @@ class ModelingTool:
 
         policy_info = self.data.select(policy_cols)
 
-        midpoint_movement_df = compute_midpoint_movement(policy_info, p1, p2, expense_values, rate_adequacy_factors,
-                                                          weights=w, name1=mv1.name, name2=version2)
+        midpoint_movement_df = compute_midpoint_movement(
+            policy_info,
+            p1,
+            p2,
+            expense_values,
+            rate_adequacy_factors,
+            weights=w,
+            name1=mv1.name,
+            name2=version2,
+        )
 
         if show_plot:
-            midpoint_movement_histogram(midpoint_movement_df['midpoint_movement'].to_numpy(), w)
+            midpoint_movement_histogram(
+                midpoint_movement_df["midpoint_movement"].to_numpy(), w
+            )
 
         return midpoint_movement_df
 
@@ -2019,22 +2501,32 @@ class ModelingTool:
         w = self._weights_array
         for name, mv in self.model_versions.items():
             m = compute_metrics(y, mv.train_predictions, w, name)
-            metric_vals = {r: v for r, v in zip(m["metric"].to_list(), m[name].to_list())}
-            rows.append({
-                "version": name,
-                "n_variables": len(mv.variables),
-                "alpha": mv.alpha,
-                "l1_ratio": mv.l1_ratio,
-                "n_nonzero": max(0, int((mv.coefficients["coefficient"] != 0).sum()) - 1),
-                "rmse": metric_vals.get("rmse", float("nan")),
-                "mae": metric_vals.get("mae", float("nan")),
-                "gini_norm": metric_vals.get("gini_norm", float("nan")),
-            })
+            metric_vals = {
+                r: v for r, v in zip(m["metric"].to_list(), m[name].to_list())
+            }
+            rows.append(
+                {
+                    "version": name,
+                    "n_variables": len(mv.variables),
+                    "alpha": mv.alpha,
+                    "l1_ratio": mv.l1_ratio,
+                    "n_nonzero": max(
+                        0, int((mv.coefficients["coefficient"] != 0).sum()) - 1
+                    ),
+                    "rmse": metric_vals.get("rmse", float("nan")),
+                    "mae": metric_vals.get("mae", float("nan")),
+                    "gini_norm": metric_vals.get("gini_norm", float("nan")),
+                }
+            )
         return pl.DataFrame(rows) if rows else pl.DataFrame()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def save(self, version: str | None = None, filepath: str | Path | None = 'models/model.pkl') -> None:
+    def save(
+        self,
+        version: str | None = None,
+        filepath: str | Path | None = "models/model.pkl",
+    ) -> None:
         """
         Save a model version to *filepath* (pickle).
 
@@ -2056,7 +2548,7 @@ class ModelingTool:
         target_col: str | None = None,
         weight_col: str | None = None,
         cv_column: str | None = None,
-        version_name: str | None = None
+        version_name: str | None = None,
     ) -> ModelingTool:
         """
         Load a saved version, refit it on *data*, and return a new tool.
@@ -2106,7 +2598,7 @@ class ModelingTool:
 
         tool.fit_model(
             variables=vs["variables"],
-            version=version_name or vs['name'],
+            version=version_name or vs["name"],
             alpha=vs["alpha"],
             l1_ratio=vs["l1_ratio"],
             use_cv=False,
@@ -2117,7 +2609,9 @@ class ModelingTool:
             print_summary=True,
         )
         loaded_name = version_name or vs["name"]
-        print(f"Loaded '{vs['name']}' from {filepath!r}, refitted as version '{loaded_name}'.")
+        print(
+            f"Loaded '{vs['name']}' from {filepath!r}, refitted as version '{loaded_name}'."
+        )
         return tool
 
     @classmethod
@@ -2162,11 +2656,16 @@ class ModelingTool:
         tool.model_versions = {}
 
         offset_arr = None
-        if data is not None and tool.offset_col is not None and tool.offset_col in data.columns:
+        if (
+            data is not None
+            and tool.offset_col is not None
+            and tool.offset_col in data.columns
+        ):
             offset_arr = data[tool.offset_col].cast(pl.Float64).to_numpy()
 
         if snap.get("version_type") == "factor":
             from .model import FactorModelVersion as FMV
+
             mv = FMV(
                 name="v1",
                 variables=vs["variables"],
@@ -2183,6 +2682,7 @@ class ModelingTool:
         else:
             tool.family = vs["family"]
             from .model import ModelVersion as MV
+
             mv = MV(
                 name="v1",
                 variables=vs["variables"],
@@ -2218,7 +2718,7 @@ class ModelingTool:
         pkl_path: str | None = None,
         version: str = "excel",
         missing_factor: float = 1.0,
-        offset_col: str | None = None
+        offset_col: str | None = None,
     ) -> ModelingTool:
         """
         Build a :class:`ModelingTool` from an Excel factor table.
@@ -2267,7 +2767,7 @@ class ModelingTool:
             tool = cls(
                 data=data,
                 target_col=target_col or frozen.target_col,
-                weight_col=weight_col or frozen.weight_col
+                weight_col=weight_col or frozen.weight_col,
             )
             tool.variable_configs = frozen.variable_configs
             tool.model_versions = frozen.model_versions  # 'v1' has the preprocessor
@@ -2279,7 +2779,7 @@ class ModelingTool:
             sheet_name,
             version=version,
             missing_factor=missing_factor,
-            offset_col=offset_col
+            offset_col=offset_col,
         )
         return tool
 
@@ -2339,17 +2839,23 @@ class ModelingTool:
         if not hasattr(self, "_shadow_model"):
             raise RuntimeError("Call fit_shadow_gbm() first.")
         return interaction_ranking(
-            self._shadow_model, self.data,
-            top_n=top_n, **kwargs,
+            self._shadow_model,
+            self.data,
+            top_n=top_n,
+            **kwargs,
         )
 
-    def partial_dependence_2d(self, var1: str, var2: str, **kwargs: Any) -> pl.DataFrame:
+    def partial_dependence_2d(
+        self, var1: str, var2: str, **kwargs: Any
+    ) -> pl.DataFrame:
         """2D partial dependence for a variable pair.  Requires :meth:`fit_shadow_gbm` first."""
         from .discovery import partial_dependence_2d
 
         if not hasattr(self, "_shadow_model"):
             raise RuntimeError("Call fit_shadow_gbm() first.")
-        return partial_dependence_2d(self._shadow_model, self.data, var1, var2, **kwargs)
+        return partial_dependence_2d(
+            self._shadow_model, self.data, var1, var2, **kwargs
+        )
 
     def permutation_importance(
         self,
@@ -2383,8 +2889,12 @@ class ModelingTool:
             if not hasattr(self, "_shadow_model"):
                 raise RuntimeError("Call fit_shadow_gbm() first.")
             return _perm_imp(
-                self._shadow_model, self.data, self.target_col,
-                weight_col=self.weight_col, metric_fn=metric_fn, **kwargs,
+                self._shadow_model,
+                self.data,
+                self.target_col,
+                weight_col=self.weight_col,
+                metric_fn=metric_fn,
+                **kwargs,
             )
 
     def shap_importance(
@@ -2417,7 +2927,8 @@ class ModelingTool:
         if not hasattr(self, "_shadow_model"):
             raise RuntimeError("Call fit_shadow_gbm() first.")
         return _shap_importance(
-            self._shadow_model, self.data,
+            self._shadow_model,
+            self.data,
             feature_cols=feature_cols,
             sample_size=sample_size,
             random_state=random_state,
@@ -2460,7 +2971,9 @@ class ModelingTool:
         if not hasattr(self, "_shadow_model"):
             raise RuntimeError("Call fit_shadow_gbm() first.")
         return _shap_dependence(
-            self._shadow_model, self.data, var,
+            self._shadow_model,
+            self.data,
+            var,
             color_var=color_var,
             feature_cols=feature_cols,
             sample_size=sample_size,
@@ -2501,7 +3014,8 @@ class ModelingTool:
         if not hasattr(self, "_shadow_model"):
             raise RuntimeError("Call fit_shadow_gbm() first.")
         return _shap_ir(
-            self._shadow_model, self.data,
+            self._shadow_model,
+            self.data,
             feature_cols=feature_cols,
             sample_size=sample_size,
             random_state=random_state,
@@ -2565,7 +3079,9 @@ class ModelingTool:
         from .discovery import suggest_category_groups as _scg
 
         return _scg(
-            col, self.data, self._y,
+            col,
+            self.data,
+            self._y,
             weights=self._weights,
             max_groups=max_groups,
             min_exposure_pct=min_exposure_pct,
@@ -2613,7 +3129,9 @@ class ModelingTool:
         from .discovery import monotonicity_test as _mt
 
         return _mt(
-            self.data, self.target_col, var,
+            self.data,
+            self.target_col,
+            var,
             weight_col=self.weight_col,
             feature_cols=feature_cols,
             n_estimators=n_estimators,
@@ -2663,7 +3181,8 @@ class ModelingTool:
         from .discovery import boruta_select as _boruta
 
         return _boruta(
-            self.data, self.target_col,
+            self.data,
+            self.target_col,
             weight_col=self.weight_col,
             feature_cols=feature_cols,
             n_estimators=n_estimators,
@@ -2709,14 +3228,20 @@ class ModelingTool:
             if self.weight_col:
                 exclude.add(self.weight_col)
             feature_cols = [
-                c for c in self.data.columns
-                if c not in exclude
-                and self.data[c].dtype.is_numeric()
+                c
+                for c in self.data.columns
+                if c not in exclude and self.data[c].dtype.is_numeric()
             ]
 
         return _residual_gbm(
-            self.data, residuals, feature_cols,
-            weight_col=self.weight_col, offset_col=self.offset_col, top_n=top_n, variable_configs=self.variable_configs, **kwargs,
+            self.data,
+            residuals,
+            feature_cols,
+            weight_col=self.weight_col,
+            offset_col=self.offset_col,
+            top_n=top_n,
+            variable_configs=self.variable_configs,
+            **kwargs,
         )
 
     # ── Enhanced residual analysis ───────────────────────────────────────────
@@ -2753,8 +3278,7 @@ class ModelingTool:
         prep = getattr(mv, "preprocessor", None)
         analysis_cols = [col1, col2]
         if any(
-            col in self.variable_configs
-            and (prep is None or col not in prep._params)
+            col in self.variable_configs and (prep is None or col not in prep._params)
             for col in analysis_cols
         ):
             configured_cols = [
@@ -2765,14 +3289,17 @@ class ModelingTool:
             )
             prep.fit(self.data, weights=self._weights_array)
         fig, data = _residual_heatmap(
-            self.data, self._y, col1, col2,
+            self.data,
+            self._y,
+            col1,
+            col2,
             predictions=mv.train_predictions,
             weights=self._weights,
             preprocessor=prep,
             n_bins=n_bins,
             **kwargs,
         )
-        
+
         return fig, data
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
@@ -2824,7 +3351,7 @@ class ModelingTool:
 
         alphas = np.logspace(np.log10(alpha_min), np.log10(alpha_max), n_alphas)[::-1]
         tweedie_power = mv.tweedie_power if mv is not None else tweedie_power
-        family = mv.family if mv is not None else 'tweedie'
+        family = mv.family if mv is not None else "tweedie"
         prep = mv.preprocessor if mv is not None else None
 
         rows = []
@@ -2849,11 +3376,13 @@ class ModelingTool:
             coefs = mv.coefficients
             for feat_row in coefs.iter_rows(named=True):
                 if feat_row["feature"] != "intercept":
-                    rows.append({
-                        "alpha": float(alpha_val),
-                        "variable": feat_row["feature"],
-                        "coefficient": feat_row["coefficient"],
-                    })
+                    rows.append(
+                        {
+                            "alpha": float(alpha_val),
+                            "variable": feat_row["feature"],
+                            "coefficient": feat_row["coefficient"],
+                        }
+                    )
 
         path_df = pl.DataFrame(rows)
 
@@ -2864,63 +3393,199 @@ class ModelingTool:
         return path_df
 
     def _apply_cv_fold(self, mask: pl.Series):
-        '''
+        """
         Shortcut for filtering the data, target, and weights to the train/test fold in cross-validation methods.
-        '''
+        """
         x, y = self.data.filter(mask), self._y_array[mask]
         w = self._weights_array[mask] if self._weights_array is not None else None
         o = self._offset_array[mask] if self._offset_array is not None else None
         return x, y, w, o
 
     def _get_cv_metrics_gini(self, train_mask, test_mask, model_version):
-        '''
+        """
         Fit model on the given train fold and return the gini coefficient of the test fold.  Used for cross-validation metrics in gini mode.
-        '''
+        """
         X_train, y_train, w_train, o_train = self._apply_cv_fold(train_mask)
         X_test, y_test, w_test, o_test = self._apply_cv_fold(test_mask)
 
-        fold_mv = fit_model(X=X_train, y=y_train, variables=model_version.variables,
-            version_name="_cv_fold", weights=w_train, offset=o_train, family=model_version.family, link=self.link, preprocessor=model_version.preprocessor,
-            alpha=model_version.alpha, l1_ratio=model_version.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+        fold_mv = fit_model(
+            X=X_train,
+            y=y_train,
+            variables=model_version.variables,
+            version_name="_cv_fold",
+            weights=w_train,
+            offset=o_train,
+            family=model_version.family,
+            link=self.link,
+            preprocessor=model_version.preprocessor,
+            alpha=model_version.alpha,
+            l1_ratio=model_version.l1_ratio,
+            use_cv=False,
+            drop_reference=self.drop_reference,
         )
 
         pred_test = fold_mv.predict(X_test, offset=o_test)
 
         return gini_coefficient(y_test, pred_test, w_test), w_test.sum()
-    
-    def _get_cv_metrics_dls(self, train_mask, test_mask, dl_base_preds, dl_refit_base, dl_base_version, model_version, dl_deviation='absolute'):
-        '''
+
+    def _get_cv_metrics_dls(
+        self,
+        train_mask,
+        test_mask,
+        dl_base_preds,
+        dl_refit_base,
+        dl_base_version,
+        model_version,
+        dl_deviation="absolute",
+    ):
+        """
         Fit model on the given train fold and return the double lift score of the test fold.  Used for cross-validation metrics in double lift mode.
-        '''
+        """
         X_train, y_train, w_train, o_train = self._apply_cv_fold(train_mask)
         X_test, y_test, w_test, o_test = self._apply_cv_fold(test_mask)
 
-        fold_mv = fit_model(X=X_train, y=y_train, variables=model_version.variables,
-            version_name="_cv_fold", weights=w_train, offset=o_train, family=model_version.family, link=self.link, preprocessor=model_version.preprocessor,
-            alpha=model_version.alpha,l1_ratio=model_version.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+        fold_mv = fit_model(
+            X=X_train,
+            y=y_train,
+            variables=model_version.variables,
+            version_name="_cv_fold",
+            weights=w_train,
+            offset=o_train,
+            family=model_version.family,
+            link=self.link,
+            preprocessor=model_version.preprocessor,
+            alpha=model_version.alpha,
+            l1_ratio=model_version.l1_ratio,
+            use_cv=False,
+            drop_reference=self.drop_reference,
         )
         pred_test = fold_mv.predict(X_test, offset=o_test)
 
         if dl_refit_base:
             bv = self._get_version(dl_base_version)
-            base_mv = fit_model(X=X_train, y=y_train, variables=bv.variables,
-                version_name="_cv_base_fold", weights=w_train, offset=o_train, family=bv.family, link=self.link, preprocessor=bv.preprocessor,
-                alpha=bv.alpha, l1_ratio=bv.l1_ratio, use_cv=False, drop_reference=self.drop_reference
+            base_mv = fit_model(
+                X=X_train,
+                y=y_train,
+                variables=bv.variables,
+                version_name="_cv_base_fold",
+                weights=w_train,
+                offset=o_train,
+                family=bv.family,
+                link=self.link,
+                preprocessor=bv.preprocessor,
+                alpha=bv.alpha,
+                l1_ratio=bv.l1_ratio,
+                use_cv=False,
+                drop_reference=self.drop_reference,
             )
             base_preds_test = base_mv.predict(X_test, offset=o_test)
         else:
             base_preds_test = dl_base_preds[test_mask]
 
-        _, fold_dl_score = self._get_dl_score(y_test, base_preds_test, pred_test, weights=w_test, n_buckets=10, deviation=dl_deviation)
+        _, fold_dl_score = self._get_dl_score(
+            y_test,
+            base_preds_test,
+            pred_test,
+            weights=w_test,
+            n_buckets=10,
+            deviation=dl_deviation,
+        )
 
         return fold_dl_score, w_test.sum()
+
+    def _monitor_baseline(
+        self,
+        version_names: list[str],
+        base_version: str | None,
+    ) -> tuple[list[str], np.ndarray | None, bool, str]:
+        """Resolve double-lift baseline state for overfitting monitoring."""
+        assert base_version is not None or self.base_version is not None, (
+            "dl_base_version must be provided when metric_fn is "
+            "'double_lift_score' and no base version is set."
+        )
+        resolved_base = base_version or self.base_version
+        if resolved_base in self.model_versions:
+            names = [name for name in version_names if name != resolved_base]
+            return names, None, True, resolved_base
+        if resolved_base in self.data.columns:
+            predictions = self._prediction_source(resolved_base)
+            return version_names, predictions, False, resolved_base
+        self._get_version(resolved_base)
+        return version_names, np.array([]), False, resolved_base
+
+    def _monitor_train_metric(
+        self,
+        metric_name: str | None,
+        model: ModelVersion,
+        baseline_predictions: np.ndarray | None,
+        deviation: str,
+    ) -> float:
+        """Calculate the in-sample metric for one monitor step."""
+        if metric_name == "gini":
+            return gini_coefficient(
+                self._y_array,
+                model.train_predictions,
+                self._weights_array,
+            )
+        _, score = self._get_dl_score(
+            self._y_array,
+            baseline_predictions,
+            model.train_predictions,
+            weights=self._weights_array,
+            n_buckets=10,
+            deviation=deviation,
+        )
+        return score
+
+    def _monitor_cv_metric(
+        self,
+        metric_name: str | None,
+        model: ModelVersion,
+        baseline_predictions: np.ndarray | None,
+        refit_baseline: bool,
+        base_version: str | None,
+        deviation: str,
+    ) -> float:
+        """Calculate the exposure-weighted CV metric for one monitor step."""
+        if self.cv_column is None:
+            return self._monitor_train_metric(
+                metric_name,
+                model,
+                baseline_predictions,
+                deviation,
+            )
+        folds = self.data[self.cv_column].to_numpy()
+        metrics: list[float] = []
+        weights: list[float] = []
+        for fold in np.unique(folds):
+            train_mask = pl.Series(folds != fold)
+            test_mask = folds == fold
+            if metric_name == "gini":
+                fold_metric, fold_weight = self._get_cv_metrics_gini(
+                    train_mask,
+                    test_mask,
+                    model,
+                )
+            else:
+                fold_metric, fold_weight = self._get_cv_metrics_dls(
+                    train_mask,
+                    test_mask,
+                    baseline_predictions,
+                    refit_baseline,
+                    base_version,
+                    model,
+                    deviation,
+                )
+            metrics.append(fold_metric)
+            weights.append(float(fold_weight))
+        return float(np.average(metrics, weights=weights))
 
     def overfitting_monitor(
         self,
         version_names: list[str],
-        metric_fn: Any | None = 'double_lift_score',
+        metric_fn: Any | None = "double_lift_score",
         dl_base_version: str | None = None,
-        dl_deviation: str = 'absolute',
+        dl_deviation: str = "absolute",
         show: bool = True,
     ) -> pl.DataFrame:
         """
@@ -2946,72 +3611,49 @@ class ModelingTool:
             Display the overfitting monitor chart (default ``True``)."""
         from .plots import overfitting_plot
 
-        assert metric_fn in ('gini', 'double_lift_score', None), "metric_fn must be 'gini' or 'double_lift_score'"
-
+        assert metric_fn in ("gini", "double_lift_score", None), (
+            "metric_fn must be 'gini' or 'double_lift_score'"
+        )
+        dl_base_preds = None
         dl_refit_base = False
-        if metric_fn == 'double_lift_score':
-            assert dl_base_version is not None or self.base_version is not None, "dl_base_version must be provided when metric_fn is 'double_lift_score' and no base version is set."
-            dl_base_version = dl_base_version or self.base_version
-
-            if dl_base_version in self.model_versions:
-                dl_base_preds = None
-                dl_refit_base = True
-                version_names = [x for x in version_names if x != dl_base_version]
-            elif dl_base_version in self.data.columns:
-                col_s = self.data[dl_base_version]
-                if not col_s.dtype.is_numeric():
-                    raise ValueError(
-                        f"Column '{dl_base_version}' has dtype {col_s.dtype}; "
-                        "predictions must be numeric."
-                    )
-                dl_base_preds = col_s.cast(pl.Float64).to_numpy()
-            else:
-                # Delegate to _get_version to raise the standard helpful KeyError.
-                self._get_version(dl_base_version)
-                dl_base_preds = np.array([])  # unreachable; satisfies type checkers
-
+        if metric_fn == "double_lift_score":
+            version_names, dl_base_preds, dl_refit_base, dl_base_version = (
+                self._monitor_baseline(version_names, dl_base_version)
+            )
         rows = []
         cumulative_vars: list[str] = []
-        y_true = self._y_array
-        w = self._weights_array
-
-        for i, vname in enumerate(version_names):
-            mv = self._get_version(vname)
-
-            if metric_fn == 'gini':
-                train_metric = gini_coefficient(y_true, mv.train_predictions, w)
-            else:
-                _, train_metric = self._get_dl_score(y_true, dl_base_preds, mv.train_predictions, weights=w, n_buckets=10, deviation=dl_deviation)
-
-            if self.cv_column is not None:
-                fold_arr = self.data[self.cv_column].to_numpy()
-                unique_folds = np.unique(fold_arr)
-                fold_metrics, fold_weights = [], []
-
-                for fold in unique_folds:
-                    train_mask = pl.Series(fold_arr != fold)
-                    test_mask = fold_arr == fold
-                    if metric_fn == 'gini':
-                        fold_metric, fold_weight = self._get_cv_metrics_gini(train_mask, test_mask, mv)
-                    else:
-                        fold_metric, fold_weight = self._get_cv_metrics_dls(train_mask, test_mask, dl_base_preds, dl_refit_base, dl_base_version, mv, dl_deviation)
-                    fold_metrics.append(fold_metric)
-                    fold_weights.append(float(fold_weight))
-                cv_metric = float(np.average(fold_metrics, weights=fold_weights))
-            else:
-                cv_metric = train_metric
-
-            new_vars = [v for v in mv.variables if v not in cumulative_vars]
+        for index, version_name in enumerate(version_names):
+            model = self._get_version(version_name)
+            train_metric = self._monitor_train_metric(
+                metric_fn,
+                model,
+                dl_base_preds,
+                dl_deviation,
+            )
+            cv_metric = (
+                train_metric
+                if self.cv_column is None
+                else self._monitor_cv_metric(
+                    metric_fn,
+                    model,
+                    dl_base_preds,
+                    dl_refit_base,
+                    dl_base_version,
+                    dl_deviation,
+                )
+            )
+            new_vars = [v for v in model.variables if v not in cumulative_vars]
             cumulative_vars.extend(new_vars)
-
-            rows.append({
-                "step": i + 1,
-                "n_variables": len(mv.variables),
-                "variables_added": vname,
-                "train_metric": train_metric,
-                "cv_metric": cv_metric,
-                "gap": train_metric - cv_metric,
-            })
+            rows.append(
+                {
+                    "step": index + 1,
+                    "n_variables": len(model.variables),
+                    "variables_added": version_name,
+                    "train_metric": train_metric,
+                    "cv_metric": cv_metric,
+                    "gap": train_metric - cv_metric,
+                }
+            )
 
         monitor_df = pl.DataFrame(rows)
         if show:
@@ -3078,9 +3720,88 @@ class ModelingTool:
             ci=ci,
         )
         if show:
-            _fig = bootstrap_ci_plot(result, title=f"Bootstrap CIs — {version or self.current_version}")
+            _fig = bootstrap_ci_plot(
+                result, title=f"Bootstrap CIs — {version or self.current_version}"
+            )
             plt.show()
         return result
+
+    def _fit_bootstrap_coefficients(
+        self,
+        model: ModelVersion,
+        bootstrap_data: pl.DataFrame,
+    ) -> dict[str, float]:
+        """Refit one bootstrap sample and return its feature coefficients."""
+        bootstrap_model = fit_model(
+            X=bootstrap_data,
+            y=bootstrap_data[self.target_col],
+            variables=model.variables,
+            version_name="_bootstrap",
+            configs=self.variable_configs,
+            preprocessor=model.preprocessor,
+            weights=(
+                bootstrap_data[self.weight_col].to_numpy().astype(float)
+                if self.weight_col
+                else None
+            ),
+            offset=(
+                bootstrap_data[self.offset_col].to_numpy().astype(float)
+                if self.offset_col
+                else None
+            ),
+            family=model.family,
+            link=self.link,
+            tweedie_power=model.tweedie_power,
+            alpha=model.alpha,
+            l1_ratio=model.l1_ratio,
+            use_cv=False,
+            drop_reference=self.drop_reference,
+        )
+        return {
+            row["feature"]: row["coefficient"]
+            for row in bootstrap_model.coefficients.iter_rows(named=True)
+        }
+
+    @staticmethod
+    def _append_bootstrap_coefficients(
+        samples: dict[tuple[str, str], list[float]],
+        baseline: dict[tuple[str, str], float],
+        coefficients: dict[str, float] | None,
+    ) -> None:
+        """Append one fitted or fallback value for every relativity level."""
+        for key, baseline_coefficient in baseline.items():
+            variable, level = key
+            feature = f"{variable}_{level}" if level != "(base)" else None
+            value = (
+                coefficients[feature]
+                if coefficients is not None
+                and feature is not None
+                and feature in coefficients
+                else baseline_coefficient
+            )
+            samples[key].append(value)
+
+    @staticmethod
+    def _bootstrap_relativity_table(
+        baseline: dict[tuple[str, str], float],
+        samples: dict[tuple[str, str], list[float]],
+        alpha: float,
+    ) -> pl.DataFrame:
+        """Summarize bootstrapped coefficients on the relativity scale."""
+        rows = []
+        for (variable, level), coefficient in baseline.items():
+            bootstrap_relativities = np.exp(np.asarray(samples[(variable, level)]))
+            rows.append(
+                {
+                    "variable": variable,
+                    "level": level,
+                    "relativity": float(np.exp(coefficient)),
+                    "ci_lower": float(np.quantile(bootstrap_relativities, alpha)),
+                    "ci_upper": float(np.quantile(bootstrap_relativities, 1 - alpha)),
+                    "std_error": float(np.std(bootstrap_relativities)),
+                }
+            )
+        return pl.DataFrame(rows)
 
     def bootstrap_relativities(
         self,
@@ -3113,84 +3834,33 @@ class ModelingTool:
             ``ci_lower``, ``ci_upper``, ``std_error``.
         """
         mv = self._get_version(version or self.current_version)
-        variables = mv.variables
         n = len(self.data)
         rng = np.random.RandomState(random_state)
         alpha = (1 - ci) / 2
-
-        # Get baseline relativities
-        base_rel = self.summary_table(version or self.current_version)
-        # Collect (variable, level) pairs and their bootstrap coefficient samples
+        base_relativities = self.summary_table(version or self.current_version)
         base_coefs = {
-            (r["variable"], r["level"]): r["train_coef"]
-            for r in base_rel.iter_rows(named=True)
+            (row["variable"], row["level"]): row["train_coef"]
+            for row in base_relativities.iter_rows(named=True)
         }
-        keys = list(base_coefs.keys())
-
-        boot_alpha = mv.alpha
-        boot_l1_ratio = mv.l1_ratio
-        boot_coefs: dict[tuple[str, str], list[float]] = {k: [] for k in keys}
+        boot_coefs: dict[tuple[str, str], list[float]] = {key: [] for key in base_coefs}
 
         for _ in range(n_bootstrap):
-            idx = rng.choice(n, n, replace=True)
-            boot_data = self.data[idx]
-
+            bootstrap_data = self.data[rng.choice(n, n, replace=True)]
             try:
-                boot_mv = fit_model(
-                    X=boot_data,
-                    y=boot_data[self.target_col],
-                    variables=variables,
-                    version_name="_bootstrap",
-                    configs=self.variable_configs,
-                    preprocessor=mv.preprocessor,
-                    weights=boot_data[self.weight_col].to_numpy().astype(float) if self.weight_col else None,
-                    offset=boot_data[self.offset_col].to_numpy().astype(float) if self.offset_col else None,
-                    family=mv.family,
-                    link=self.link,
-                    tweedie_power=mv.tweedie_power,
-                    alpha=boot_alpha,
-                    l1_ratio=boot_l1_ratio,
-                    use_cv=False,
-                    drop_reference=self.drop_reference,
+                coefficients = self._fit_bootstrap_coefficients(mv, bootstrap_data)
+                self._append_bootstrap_coefficients(
+                    boot_coefs,
+                    base_coefs,
+                    coefficients,
                 )
-                boot_coef_table = boot_mv.coefficients
-                coef_dict = {
-                    r["feature"]: r["coefficient"]
-                    for r in boot_coef_table.iter_rows(named=True)
-                }
-                # Map back to (variable, level) keys
-                for key in keys:
-                    var, level = key
-                    feat = f"{var}_{level}" if level != "(base)" else None
-                    if feat and feat in coef_dict:
-                        boot_coefs[key].append(coef_dict[feat])
-                    else:
-                        boot_coefs[key].append(base_coefs[key])
             except Exception:
-                # If a bootstrap sample fails to fit, skip it
-                for key in keys:
-                    boot_coefs[key].append(base_coefs[key])
+                self._append_bootstrap_coefficients(boot_coefs, base_coefs, None)
 
-        rows = []
-        for key in keys:
-            var, level = key
-            coef = base_coefs[key]
-            samples = np.array(boot_coefs[key])
-            rel = np.exp(coef)
-            boot_rels = np.exp(samples)
-            rows.append({
-                "variable": var,
-                "level": level,
-                "relativity": float(rel),
-                "ci_lower": float(np.quantile(boot_rels, alpha)),
-                "ci_upper": float(np.quantile(boot_rels, 1 - alpha)),
-                "std_error": float(np.std(boot_rels)),
-            })
-
-        result = pl.DataFrame(rows)
+        result = self._bootstrap_relativity_table(base_coefs, boot_coefs, alpha)
 
         if show:
             from .plots import relativities_ci_plot
+
             for var in result["variable"].unique().to_list():
                 _fig = relativities_ci_plot(result, var)
                 plt.show()
@@ -3203,16 +3873,24 @@ class ModelingTool:
     def _strip_config(cfg: VariableConfig) -> VariableConfig:
         """Return cfg with binning/encoding removed so the Preprocessor outputs raw continuous values."""
         from dataclasses import replace as _dc_replace
+
         from .variable import MISSING_SENTINEL as _SENTINEL
-        strip_kwargs: dict = {"n_bins": None, "bin_edges": None, "standardize": False, "degree": 1, "encoding": None}
-        if cfg.impute_strategy is None and (cfg.n_bins is not None or cfg.bin_edges is not None):
+
+        strip_kwargs: dict = {
+            "n_bins": None,
+            "bin_edges": None,
+            "standardize": False,
+            "degree": 1,
+            "encoding": None,
+        }
+        if cfg.impute_strategy is None and (
+            cfg.n_bins is not None or cfg.bin_edges is not None
+        ):
             strip_kwargs.update(impute_strategy="constant", impute_value=_SENTINEL)
         return _dc_replace(cfg, **strip_kwargs)
 
     def _get_version(self, version: str) -> ModelVersion:
         if version not in self.model_versions:
             available = list(self.model_versions.keys())
-            raise KeyError(
-                f"Version '{version}' not found.  Available: {available}"
-            )
+            raise KeyError(f"Version '{version}' not found.  Available: {available}")
         return self.model_versions[version]

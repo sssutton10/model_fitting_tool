@@ -46,9 +46,9 @@ class TestDefaultConfig:
         cfg = default_config("state", sample_df["state"])
         assert cfg.is_categorical is True
 
-    def test_numeric_has_cap_upper(self, sample_df):
+    def test_numeric_has_no_default_cap(self, sample_df):
         cfg = default_config("driver_age", sample_df["driver_age"])
-        assert cfg.cap_upper == 0.99
+        assert cfg.cap_upper is None
 
     def test_categorical_impute_strategy_most_frequent(self, sample_df):
         cfg = default_config("state", sample_df["state"])
@@ -94,28 +94,27 @@ class TestNumericTransforms:
         np.testing.assert_allclose(out["x"].to_numpy(), [1.0, 2.0, 3.0])
 
     def test_cap_upper_clips_high_values(self):
-        # 99th pctile of [0..99] = 98.01; values above should be clipped
         arr = np.arange(100.0)
         df = _make_num_df(arr)
-        cfg = VariableConfig("x", cap_upper=0.99, impute_strategy=None, standardize=False)
+        cfg = VariableConfig("x", cap_upper=80.0, impute_strategy=None, standardize=False)
         out = _prep(cfg, df)
-        assert float(out["x"].max()) <= float(np.percentile(arr, 99)) + 1e-6
+        assert float(out["x"].max()) == 80.0
 
     def test_cap_lower_clips_low_values(self):
         arr = np.arange(100.0)
         df = _make_num_df(arr)
-        cfg = VariableConfig("x", cap_lower=0.01, cap_upper=None,
+        cfg = VariableConfig("x", cap_lower=20.0, cap_upper=None,
                              impute_strategy=None, standardize=False)
         out = _prep(cfg, df)
-        assert float(out["x"].min()) >= float(np.percentile(arr, 1)) - 1e-6
+        assert float(out["x"].min()) == 20.0
 
-    def test_log_transform_applies_log1p(self):
-        df = _make_num_df([0.0, 1.0, 9.0])
+    def test_log_transform_applies_natural_log(self):
+        df = _make_num_df([1.0, 2.0, 10.0])
         cfg = VariableConfig("x", cap_upper=None, log_transform=True,
                              impute_strategy=None, standardize=False)
         out = _prep(cfg, df)
         np.testing.assert_allclose(
-            out["x"].to_numpy(), np.log1p([0.0, 1.0, 9.0]), rtol=1e-6
+            out["x"].to_numpy(), np.log([1.0, 2.0, 10.0]), rtol=1e-6
         )
 
     def test_standardize_produces_zero_mean(self):
@@ -169,17 +168,17 @@ class TestBinning:
         df = _make_num_df(arr)
         cfg = VariableConfig("x", cap_upper=None, impute_strategy=None, n_bins=5)
         out = _prep(cfg, df)
-        # missing col + (n_bins - 1) label-based bin dummies
-        assert "x_missing" in out.columns
+        # No missing indicator is emitted when no sentinel was fitted.
+        assert "x_missing" not in out.columns
         # New names are like x_A_[lo, hi) — not x_bin<i>
         assert any(c != "x_missing" and c.startswith("x_") for c in out.columns)
 
-    def test_n_bins_missing_column_all_zeros_when_no_sentinel(self):
+    def test_n_bins_omits_missing_column_when_no_sentinel(self):
         arr = np.arange(100.0)
         df = _make_num_df(arr)
         cfg = VariableConfig("x", cap_upper=None, impute_strategy=None, n_bins=5)
         out = _prep(cfg, df)
-        assert out["x_missing"].sum() == 0
+        assert "x_missing" not in out.columns
 
     def test_sentinel_value_gets_missing_bin(self):
         arr = np.array([1.0, 2.0, MISSING_SENTINEL, 4.0, 5.0])
@@ -204,7 +203,7 @@ class TestBinning:
         cfg = VariableConfig("x", cap_upper=None, impute_strategy=None,
                              bin_edges=[10.0, 20.0])
         out = _prep(cfg, df)
-        assert "x_missing" in out.columns
+        assert "x_missing" not in out.columns
 
     def test_bin_dummies_are_mutually_exclusive_per_row(self):
         arr = np.arange(50.0)
@@ -223,7 +222,7 @@ class TestBinning:
         p = Preprocessor([cfg])
         p.fit(df)
         names = p.get_feature_names()
-        assert "x_missing" in names
+        assert "x_missing" not in names
         assert all(n.startswith("x_") for n in names)
 
 

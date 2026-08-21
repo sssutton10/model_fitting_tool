@@ -430,6 +430,14 @@ class VariablesTab(param.Parameterized):
             kwargs["log_transform"] = True
 
         imp = _to_none(self.impute_strategy.value)
+        selected = self.col_select.value
+        if (
+            imp in {"median", "mean"}
+            and self.app.data is not None
+            and selected in self.app.data.columns
+            and not self.app.data[selected].dtype.is_numeric()
+        ):
+            imp = "most_frequent"
         kwargs["impute_strategy"] = imp
         if imp == "constant" and self.impute_value.value.strip():
             kwargs["impute_value"] = self.impute_value.value.strip()
@@ -816,7 +824,8 @@ class ModelTab(param.Parameterized):
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                summary_df = self.app.tool.model_summary(version)
+                self.app.tool.model_summary(version)
+            summary_df = self.app.tool.model_versions[version].coefficient_table()
             self.summary_table.value = summary_df.to_pandas()
         except Exception:
             pass
@@ -833,7 +842,7 @@ class ModelTab(param.Parameterized):
 
         # Relativities
         try:
-            rel_df = self.app.tool.relativities_table(version)
+            rel_df = self.app.tool.summary_table(version)
             self.relat_table.value = rel_df.to_pandas()
         except Exception:
             pass
@@ -1131,11 +1140,9 @@ class EvaluationTab(param.Parameterized):
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
+                self.app.tool.cv_column = fold_col
                 df = self.app.tool.fit_cv_stability(
-                    variables,
-                    fold_col,
-                    version=_to_none(self.cvs_version.value),
-                    plot=False,
+                    version=_to_none(self.cvs_version.value), plot=False,
                 )
             self.cvs_table.value = df.to_pandas()
             fig = cv_stability_plot(df)
@@ -1448,7 +1455,10 @@ class DiagnosticsTab(param.Parameterized):
             return
         try:
             fig, _df = self.app.tool.residual_heatmap(
-                version, col1, col2, n_bins=int(self.rh_nbins.value), show=False,
+                col1,
+                col2,
+                version=version,
+                n_bins=int(self.rh_nbins.value),
             )
             self.rh_plot.object = fig
             _close_fig(fig)
@@ -1489,7 +1499,9 @@ class DiagnosticsTab(param.Parameterized):
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                df = self.app.tool.overfitting_monitor(versions, show=False)
+                df = self.app.tool.overfitting_monitor(
+                    versions, metric_fn="gini", show=False,
+                )
             self.of_table.value = df.to_pandas()
             fig = overfitting_plot(df)
             self.of_plot.object = fig

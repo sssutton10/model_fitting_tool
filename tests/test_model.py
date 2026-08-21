@@ -200,7 +200,7 @@ class TestCVFitting:
             alpha=0.0,
         )
         assert mv.alpha == 0.0
-        assert len(mv.fit_info) == 0
+        assert set(mv.fit_info) == {"Fit_Time"}
 
     def test_explicit_alpha_bypasses_cv(self, sample_df):
         """An explicit alpha overrides use_cv=True — no CV should run."""
@@ -213,7 +213,7 @@ class TestCVFitting:
             # use_cv defaults to True, but explicit alpha should override it
         )
         assert mv.alpha == 0.0
-        assert mv.fit_info == {}   # empty means CV was skipped
+        assert set(mv.fit_info) == {"Fit_Time"}
 
 
 # ── fit_cv_stability ──────────────────────────────────────────────────────────

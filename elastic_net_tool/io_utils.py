@@ -83,7 +83,12 @@ def _serialize_custom_transform(fn: Callable) -> dict[str, Any] | None:
         lambda_expr = m.group(1).rstrip().rstrip(",").rstrip()
         return {"type": "lambda", "source": lambda_expr, "imports": imports}
     else:
-        return {"type": "def", "source": textwrap.dedent(source), "name": name, "imports": imports}
+        return {
+            "type": "def",
+            "source": textwrap.dedent(source),
+            "name": name,
+            "imports": imports,
+        }
 
 
 def _deserialize_custom_transform(data: dict[str, Any] | None) -> Callable | None:
@@ -116,7 +121,8 @@ def _clean_preprocessor(preprocessor: Any) -> Any:
     cleaned = copy.copy(preprocessor)
     cleaned.configs = {
         col: dataclasses.replace(cfg, custom_transform=None)
-              if cfg.custom_transform is not None else cfg
+        if cfg.custom_transform is not None
+        else cfg
         for col, cfg in preprocessor.configs.items()
     }
     return cleaned
@@ -147,37 +153,79 @@ def _summarize_variable_transformations(
     transform_sources: dict[str, Any],
 ) -> dict[str, Any]:
     """Return a JSON-serialisable summary of every variable's transformation pipeline."""
-    out: dict[str, Any] = {}
-    for col, cfg in variable_configs.items():
-        entry: dict[str, Any] = {}
-        if cfg.input_cols:
-            entry["input_cols"] = cfg.input_cols
-        if cfg.cap_lower is not None:
-            entry["cap_lower"] = cfg.cap_lower
-        if cfg.cap_upper is not None:
-            entry["cap_upper"] = cfg.cap_upper
-        if cfg.log_transform:
-            entry["log_transform"] = True
-        if cfg.impute_strategy:
-            entry["impute_strategy"] = cfg.impute_strategy
-            if cfg.impute_value is not None:
-                entry["impute_value"] = cfg.impute_value
-        if cfg.n_bins:
-            entry["n_bins"] = cfg.n_bins
-        if cfg.bin_edges:
-            entry["bin_edges"] = list(cfg.bin_edges)
-        if cfg.standardize:
-            entry["standardize"] = True
-        if cfg.degree != 1:
-            entry["degree"] = cfg.degree
-        if col in transform_sources:
-            entry["custom_transform"] = transform_sources[col]["source"]
-        elif cfg.custom_transform is not None:
-            entry["custom_transform"] = getattr(cfg.custom_transform, "__name__", "<function>")
-        if cfg.transform_kwargs:
-            entry["transform_kwargs"] = cfg.transform_kwargs
-        out[col] = entry
-    return out
+    return {
+        column: _summarize_variable_config(column, config, transform_sources)
+        for column, config in variable_configs.items()
+    }
+
+
+def _summarize_variable_config(
+    column: str,
+    config: Any,
+    transform_sources: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the JSON-safe transformation summary for one variable."""
+    entry = _base_transform_summary(config)
+    entry.update(_encoding_transform_summary(config))
+    custom_transform = _custom_transform_summary(
+        column,
+        config,
+        transform_sources,
+    )
+    if custom_transform is not None:
+        entry["custom_transform"] = custom_transform
+    if config.transform_kwargs:
+        entry["transform_kwargs"] = config.transform_kwargs
+    return entry
+
+
+def _base_transform_summary(config: Any) -> dict[str, Any]:
+    """Summarize dependencies, caps, logging, and imputation."""
+    entry: dict[str, Any] = {}
+    if config.input_cols:
+        entry["input_cols"] = config.input_cols
+    if config.cap_lower is not None:
+        entry["cap_lower"] = config.cap_lower
+    if config.cap_upper is not None:
+        entry["cap_upper"] = config.cap_upper
+    if config.log_transform:
+        entry["log_transform"] = True
+    if config.impute_strategy:
+        entry["impute_strategy"] = config.impute_strategy
+        if config.impute_value is not None:
+            entry["impute_value"] = config.impute_value
+    return entry
+
+
+def _encoding_transform_summary(config: Any) -> dict[str, Any]:
+    """Summarize binning, scaling, and polynomial options."""
+    entry: dict[str, Any] = {}
+    if config.n_bins:
+        entry["n_bins"] = config.n_bins
+    if config.bin_edges:
+        entry["bin_edges"] = list(config.bin_edges)
+    if config.standardize:
+        entry["standardize"] = True
+    if config.degree != 1:
+        entry["degree"] = config.degree
+    return entry
+
+
+def _custom_transform_summary(
+    column: str,
+    config: Any,
+    transform_sources: dict[str, Any],
+) -> str | None:
+    """Return the saved source or display name for a custom transform."""
+    if column in transform_sources:
+        return transform_sources[column]["source"]
+    if config.custom_transform is not None:
+        return getattr(
+            config.custom_transform,
+            "__name__",
+            "<function>",
+        )
+    return None
 
 
 def _make_snapshot(version, tool) -> dict[str, Any]:
@@ -212,7 +260,11 @@ def _make_snapshot(version, tool) -> dict[str, Any]:
 
     is_factor = hasattr(version, "factor_table")
     if is_factor:
-        cleaned_prep = _clean_preprocessor(version.preprocessor) if version.preprocessor is not None else None
+        cleaned_prep = (
+            _clean_preprocessor(version.preprocessor)
+            if version.preprocessor is not None
+            else None
+        )
         version_dict: dict[str, Any] = {
             "name": version.name,
             "variables": version.variables,
@@ -304,7 +356,7 @@ def save_version(version, tool, filepath: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(snapshot, f, protocol=pickle.HIGHEST_PROTOCOL)
-    
+
     json_path = path.with_suffix(".json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_metadata, f, indent=2)

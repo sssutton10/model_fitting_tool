@@ -33,7 +33,7 @@ class TestInstantiation:
 
     def test_with_weight_col(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio",
-                            weight_col="earned_premium")
+                            weight_col="earned_premium", cv_column="cv_fold")
         assert tool.weight_col == "earned_premium"
 
     def test_with_cv_column(self, sample_df):
@@ -159,7 +159,7 @@ class TestAddVariable:
 class TestFitModel:
     def test_version_stored_in_model_versions(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio",
-                            weight_col="earned_premium")
+                            weight_col="earned_premium", cv_column="cv_fold")
         tool.fit_model(["driver_age"], version="v1", use_cv=False, alpha=0.01)
         assert "v1" in tool.model_versions
 
@@ -170,17 +170,18 @@ class TestFitModel:
         assert "v1" in tool.model_versions
         assert "v2" in tool.model_versions
 
-    def test_returns_model_version(self, sample_df):
-        from elastic_net_tool.model import ModelVersion
+    def test_fit_is_side_effect_oriented(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio")
-        mv = tool.fit_model(["driver_age"], version="v1", use_cv=False, alpha=0.01,
-                            print_summary=False)
-        assert isinstance(mv, ModelVersion)
+        result = tool.fit_model(["driver_age"], version="v1", use_cv=False, alpha=0.01,
+                                print_summary=False)
+        assert result is None
+        assert "v1" in tool.model_versions
 
     def test_default_config_applied_for_unregistered_variable(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio")
-        mv = tool.fit_model(["state"], version="v1", use_cv=False, alpha=0.01,
-                            print_summary=False)
+        tool.fit_model(["state"], version="v1", use_cv=False, alpha=0.01,
+                       print_summary=False)
+        mv = tool.model_versions["v1"]
         assert any(f.startswith("state_") for f in mv.feature_names)
 
     def test_predefined_split_used_when_cv_column_set(self, sample_df, capsys):
@@ -202,15 +203,17 @@ class TestFitModel:
 
     def test_no_cv_column_and_no_cv_arg_defaults_to_five_fold(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio")
-        mv = tool.fit_model(["driver_age"], version="v1",
-                            alphas=np.array([0.01, 0.1]), print_summary=False)
+        tool.fit_model(["driver_age"], version="v1",
+                       alphas=np.array([0.01, 0.1]), print_summary=False)
+        mv = tool.model_versions["v1"]
         # fit_info should record 5 as the fold count
         assert mv.fit_info.get("cv_folds") == 5
 
     def test_unpenalised_alpha_zero(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio")
-        mv = tool.fit_model(["driver_age"], version="v1",
-                            use_cv=False, alpha=0.0, print_summary=False)
+        tool.fit_model(["driver_age"], version="v1",
+                       use_cv=False, alpha=0.0, print_summary=False)
+        mv = tool.model_versions["v1"]
         assert mv.alpha == 0.0
 
     def test_unknown_variable_raises(self, sample_df):
@@ -225,25 +228,19 @@ class TestFitModel:
 class TestFitCVStabilityTool:
     def test_returns_dataframe(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio",
-                            weight_col="earned_premium")
+                            weight_col="earned_premium", cv_column="cv_fold")
         # First fit a reference model so alpha/l1 are sensible
         tool.fit_model(["driver_age"], version="v1", use_cv=False,
                        alpha=0.01, print_summary=False)
-        result = tool.fit_cv_stability(
-            ["driver_age"], fold_col="cv_fold", version="v1",
-            alpha=0.01, l1_ratio=0.5, plot=False, show=False,
-        )
+        result = tool.fit_cv_stability(version="v1", plot=False, show=False)
         assert isinstance(result, pl.DataFrame)
 
     def test_summary_rows_present(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio",
-                            weight_col="earned_premium")
+                            weight_col="earned_premium", cv_column="cv_fold")
         tool.fit_model(["driver_age"], version="v1", use_cv=False,
                        alpha=0.01, print_summary=False)
-        result = tool.fit_cv_stability(
-            ["driver_age"], fold_col="cv_fold", version="v1",
-            alpha=0.01, l1_ratio=0.5, plot=False, show=False,
-        )
+        result = tool.fit_cv_stability(version="v1", plot=False, show=False)
         assert "geomean" in result["fold"].to_list()
 
 
@@ -380,55 +377,55 @@ class TestToolSuggestBins:
         assert splits == sorted(splits)
 
 
-# ── relativities_table ────────────────────────────────────────────────────────
+# ── summary_table ─────────────────────────────────────────────────────────────
 
-class TestRelativitiesTable:
+class TestSummaryTable:
     def test_returns_dataframe(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         assert isinstance(result, pl.DataFrame)
 
     def test_has_required_columns(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         for col in ("variable", "level", "weight", "train_coef"):
             assert col in result.columns
 
     def test_excludes_pure_continuous_variables(self, fitted_tool):
         """driver_age is binned (has bin_edges) so it should appear;
         a plain continuous variable should not appear as a variable name."""
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         variables_present = result["variable"].unique().to_list()
         # state and driver_age (binned) are in v2 — both should be present
         assert "state" in variables_present
 
     def test_base_level_has_zero_train_coef(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         base_rows = result.filter(pl.col("level").str.ends_with("(base)"))
         assert len(base_rows) > 0
         assert (base_rows["train_coef"] == 0.0).all()
 
     def test_base_level_present_for_categorical(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         state_rows = result.filter(pl.col("variable") == "state")
         assert state_rows.filter(pl.col("level").str.ends_with("(base)")).height == 1
 
     def test_weight_column_positive(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         assert (result["weight"] >= 0).all()
 
     def test_weight_sums_to_approx_total_per_variable(self, fitted_tool, sample_df):
         """Weights across all levels of one variable should sum to total weight."""
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         total_w = float(sample_df["earned_premium"].sum())
         state_w = float(result.filter(pl.col("variable") == "state")["weight"].sum())
         assert abs(state_w - total_w) < 1.0
 
     def test_with_fold_col_adds_fold_columns(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2", fold_col="cv_fold")
+        result = fitted_tool.summary_table("v2")
         fold_cols = [c for c in result.columns if c.startswith("fold_")]
         assert len(fold_cols) > 0
 
     def test_fold_base_levels_are_zero(self, fitted_tool):
-        result = fitted_tool.relativities_table("v2", fold_col="cv_fold")
+        result = fitted_tool.summary_table("v2")
         fold_cols = [c for c in result.columns if c.startswith("fold_")]
         base_rows = result.filter(pl.col("level").str.ends_with("(base)"))
         for fc in fold_cols:
@@ -442,37 +439,37 @@ class TestRelativitiesTable:
         # driver_age with no bins → pure continuous
         tool.fit_model(["driver_age"], version="v1", use_cv=False,
                        alpha=0.01, print_summary=False)
-        result = tool.relativities_table("v1")
+        result = tool.summary_table("v1")
         assert result.is_empty()
 
     def test_calib_df_adds_calib_weight_column(self, fitted_tool, sample_df):
         """Passing calib_df should add a calib_weight column."""
         calib = sample_df.sample(50, seed=7)
-        result = fitted_tool.relativities_table("v2", calib_df=calib)
+        result = fitted_tool.summary_table("v2", calib_df=calib)
         assert "calib_weight" in result.columns
 
     def test_calib_df_weights_non_negative(self, fitted_tool, sample_df):
         calib = sample_df.sample(50, seed=7)
-        result = fitted_tool.relativities_table("v2", calib_df=calib)
+        result = fitted_tool.summary_table("v2", calib_df=calib)
         assert (result["calib_weight"] >= 0).all()
 
     def test_calib_df_weight_sums_to_approx_calib_total(self, fitted_tool, sample_df):
         """calib_weight per variable should sum to ~total calib exposure."""
         calib = sample_df.sample(80, seed=11)
-        result = fitted_tool.relativities_table("v2", calib_df=calib)
+        result = fitted_tool.summary_table("v2", calib_df=calib)
         total_calib_w = float(calib["earned_premium"].sum())
         state_cw = float(result.filter(pl.col("variable") == "state")["calib_weight"].sum())
         assert abs(state_cw - total_calib_w) < 1.0
 
     def test_no_calib_df_no_calib_weight_column(self, fitted_tool):
         """Without calib_df, calib_weight column must not be present."""
-        result = fitted_tool.relativities_table("v2")
+        result = fitted_tool.summary_table("v2")
         assert "calib_weight" not in result.columns
 
     def test_calib_df_with_fold_col_both_present(self, fitted_tool, sample_df):
         """calib_weight and fold columns can coexist."""
         calib = sample_df.sample(60, seed=13)
-        result = fitted_tool.relativities_table("v2", fold_col="cv_fold", calib_df=calib)
+        result = fitted_tool.summary_table("v2", calib_df=calib)
         assert "calib_weight" in result.columns
         fold_cols = [c for c in result.columns if c.startswith("fold_")]
         assert len(fold_cols) > 0
@@ -616,7 +613,7 @@ class TestExcelVersion:
         """Variable in Excel not in the data should raise ValueError."""
         path = str(tmp_path / "unknown.xlsx")
         _write_excel(path, [["ghost_col", "X", 1.0]])
-        with pytest.raises(ValueError):
+        with pytest.raises(KeyError):
             fitted_tool.add_excel_version(path, "Factors", version="bad_var")
 
     def test_model_summary_raises_for_excel_version(self, fitted_tool, tmp_path):
