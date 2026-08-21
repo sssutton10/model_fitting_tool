@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -13,27 +14,31 @@ try:
     from glum import (
         GeneralizedLinearRegressor,
         GeneralizedLinearRegressorCV,
+        LogLink,
         TweedieDistribution,
-        LogLink
     )
 except ImportError as e:
     raise ImportError("glum is required: pip install glum") from e
 
 from .variable import (
-    FittedBinnedNumericParams, FittedCategoricalParams, FittedParams,
-    Preprocessor, VariableConfig, default_config, make_bin_labels,
+    FittedBinnedNumericParams,
+    FittedCategoricalParams,
+    FittedParams,
+    Preprocessor,
+    VariableConfig,
+    default_config,
 )
 
 _ZERO_THRESHOLD = 1e-10
 
 
-def _factor_dict(ft_v: pl.DataFrame) -> Dict[str, float]:
+def _factor_dict(ft_v: pl.DataFrame) -> dict[str, float]:
     return dict(zip(ft_v["Level"].to_list(), ft_v["Factor"].to_list()))
 
 
 def _apply_factors(
     level_arr: np.ndarray,
-    fdict: Dict[str, float],
+    fdict: dict[str, float],
     V: str,
     missing_factor: float,
 ) -> np.ndarray:
@@ -52,10 +57,10 @@ def _apply_factors(
 def _resolve_level_arr(
     V: str,
     X: pl.DataFrame,
-    Xt: Optional[pl.DataFrame],
+    Xt: pl.DataFrame | None,
     cols_set: set,
     n: int,
-    p: Optional[FittedParams],
+    p: FittedParams | None,
 ) -> np.ndarray:
     if p is None:
         return np.array(X[V].cast(pl.String).to_list(), dtype=object)
@@ -124,23 +129,23 @@ class FactorModelVersion:
     """
 
     name: str
-    variables: List[str]
+    variables: list[str]
     factor_table: pl.DataFrame
-    preprocessor: Optional[Any]       # Optional[Preprocessor]
-    preprocessor_vars: List[str]
+    preprocessor: Any | None       # Optional[Preprocessor]
+    preprocessor_vars: list[str]
     train_predictions: np.ndarray
-    offset_col: Optional[str] = None
+    offset_col: str | None = None
 
     # Stubs — keep list_versions / compare_models happy
-    alpha: Optional[float] = None
-    l1_ratio: Optional[float] = None
-    feature_names: List[str] = field(default_factory=list)
+    alpha: float | None = None
+    l1_ratio: float | None = None
+    feature_names: list[str] = field(default_factory=list)
     coefficients: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame({"feature": [], "coefficient": []})
     )
-    fit_info: Dict[str, Any] = field(default_factory=dict)
+    fit_info: dict[str, Any] = field(default_factory=dict)
 
-    def predict(self, X: pl.DataFrame, missing_factor: float = 1.0, offset: Optional[np.ndarray] = None) -> np.ndarray:
+    def predict(self, X: pl.DataFrame, missing_factor: float = 1.0, offset: np.ndarray | None = None) -> np.ndarray:
         """
         Score *X* by factor-table lookup and return a numpy array of predictions.
 
@@ -155,6 +160,10 @@ class FactorModelVersion:
         missing_factor : float
             Factor applied to any level not found in the table (default 1.0).
             A warning is printed naming the variable and unseen levels.
+        offset : np.ndarray, optional
+            Per-row multiplicative offset applied to the final prediction
+            (response scale, i.e. already exponentiated).  The factor product
+            is multiplied element-wise by ``offset``.
         """
         Xt = self.preprocessor.transform(X) if (self.preprocessor and self.preprocessor_vars) else None
         cols_set = set(Xt.columns) if Xt is not None else set()
@@ -204,23 +213,31 @@ class ModelVersion:
     """
 
     name: str
-    variables: List[str]
+    variables: list[str]
     preprocessor: Preprocessor
     glm: Any
-    feature_names: List[str]
+    feature_names: list[str]
     coefficients: pl.DataFrame       # columns: ['feature', 'coefficient']
     alpha: float
     l1_ratio: float
     family: Any
     link: str
     train_predictions: np.ndarray
-    fit_info: Dict[str, Any] = field(default_factory=dict)
-    cv_stability: Optional[pl.DataFrame] = None
-    tweedie_power: Optional[float] = 1.50
-    gradient_tol: Optional[float] = None
+    fit_info: dict[str, Any] = field(default_factory=dict)
+    cv_stability: pl.DataFrame | None = None
+    tweedie_power: float | None = 1.50
+    gradient_tol: float | None = None
 
-    def predict(self, X: pl.DataFrame, offset:Optional[np.ndarray] = None) -> np.ndarray:
-        """Transform *X* through the preprocessor and return model predictions."""
+    def predict(self, X: pl.DataFrame, offset: np.ndarray | None = None) -> np.ndarray:
+        """Transform *X* through the preprocessor and return model predictions.
+
+        Parameters
+        ----------
+        offset : np.ndarray, optional
+            Per-row offset on the **linear predictor (log) scale**.  For a
+            log-link GLM this means ``log(existing_model_prediction)``.
+            Passed directly to glum's ``predict``.
+        """
         Xt = self.preprocessor.transform(X).to_numpy().astype(float)
         return self.glm.predict(Xt, offset=offset)
 
@@ -248,29 +265,71 @@ def _resolve_family(family: Any, tweedie_power: float = 1.5) -> Any:
 
 
 def _build_preprocessor(
-    variables: List[str],
+    variables: list[str],
     X: pl.DataFrame,
-    configs: Optional[Dict[str, VariableConfig]] = None,
+    configs: dict[str, VariableConfig] | None = None,
 ) -> Preprocessor:
     """Build (unfitted) Preprocessor, filling absent variables with defaults."""
-    cfgs = []
-    for col in variables:
-        if col in configs:
-            cfgs.append(configs[col])
-        else:
-            # For derived/multi-input variables, col might not be in X
-            if col in X.columns:
-                cfgs.append(default_config(col, X[col]))
-            else:
+    import dataclasses
+
+    def _strip(cfg: VariableConfig) -> VariableConfig:
+        from .variable import MISSING_SENTINEL as _SENTINEL
+        kw: dict = {"n_bins": None, "bin_edges": None, "standardize": False, "degree": 1, "encoding": None}
+        if cfg.impute_strategy is None and (cfg.n_bins is not None or cfg.bin_edges is not None):
+            kw.update(impute_strategy="constant", impute_value=_SENTINEL)
+        return dataclasses.replace(cfg, **kw)
+
+    def _collect_deps(col: str, visited: frozenset) -> list[VariableConfig]:
+        """DFS: collect stripped configs for all upstream derived deps in topological order."""
+        cfg = (configs or {}).get(col)
+        if cfg is None or cfg.input_cols is None:
+            return []
+        result: list[VariableConfig] = []
+        seen: set[str] = set()
+        visited = visited | {col}
+        for inp in cfg.input_cols:
+            if inp in X.columns or inp in seen:
+                continue
+            if inp in visited:
+                raise ValueError(f"Circular dependency in derived variable chain involving '{inp}'.")
+            inp_cfg = (configs or {}).get(inp)
+            if inp_cfg is None:
                 raise KeyError(
-                    f"Variable '{col}' is not in the DataFrame and has no "
-                    "VariableConfig registered. Add it with tool.add_variable()."
+                    f"Input column '{inp}' for derived variable '{col}' is not in "
+                    "the DataFrame and has no registered config."
                 )
+            for dep in _collect_deps(inp, visited):
+                if dep.col not in seen:
+                    result.append(dep)
+                    seen.add(dep.col)
+            if inp not in seen:
+                result.append(_strip(inp_cfg))
+                seen.add(inp)
+        return result
+
+    cfgs: list[VariableConfig] = []
+    dep_seen: set[str] = set()
+    for col in variables:
+        # Prepend stripped upstream dependency configs not yet added
+        for dep_cfg in _collect_deps(col, frozenset()):
+            if dep_cfg.col not in dep_seen:
+                cfgs.append(dep_cfg)
+                dep_seen.add(dep_cfg.col)
+        # Add the variable's own config (full; overrides any stripped dep via Preprocessor dict)
+        if col in (configs or {}):
+            cfgs.append(configs[col])
+        elif col in X.columns:
+            cfgs.append(default_config(col, X[col]))
+        else:
+            raise KeyError(
+                f"Variable '{col}' is not in the DataFrame and has no "
+                "VariableConfig registered. Add it with tool.add_variable()."
+            )
     return Preprocessor(cfgs)
 
 
 def _extract_coefficients(
-    glm: GeneralizedLinearRegressor, feature_names: List[str]
+    glm: GeneralizedLinearRegressor, feature_names: list[str]
 ) -> pl.DataFrame:
     features = ["intercept"] + feature_names
     values = [float(glm.intercept_)] + [float(v) for v in glm.coef_]
@@ -284,7 +343,7 @@ def _build_glm(
     l1_ratio: float,
     fit_intercept: bool,
     max_iter: int,
-    gradient_tol: Optional[float] = None
+    gradient_tol: float | None = None
 ) -> GeneralizedLinearRegressor:
     return GeneralizedLinearRegressor(
         family=family, link=link,
@@ -321,23 +380,24 @@ def _geometric_mean_signed(values: np.ndarray) -> float:
 def fit_model(
     X: pl.DataFrame,
     y: np.ndarray,
-    variables: List[str],
+    variables: list[str],
     version_name: str,
-    configs: Optional[Dict[str, VariableConfig]] = {},
-    weights: Optional[np.ndarray] = None,
-    offset: Optional[np.ndarray] = None,
+    configs: dict[str, VariableConfig] | None = {},
+    weights: np.ndarray | None = None,
+    offset: np.ndarray | None = None,
     family: Any = None,
     link: Any = LogLink(),
     tweedie_power: float = 1.5,
-    preprocessor: Optional[Preprocessor] = None,
-    alpha: Optional[float] = None,
-    l1_ratio: Union[float, List[float]] = 0.5,
+    preprocessor: Preprocessor | None = None,
+    alpha: float | None = None,
+    l1_ratio: float | list[float] = 0.5,
     use_cv: bool = True,
     cv: Any = 5,
     max_iter: int = 1000,
     fit_intercept: bool = True,
     drop_reference: str = "max_weight",
-    gradient_tol: Optional[float] = None
+    gradient_tol: float | None = None,
+    n_jobs: int | None = None
 ) -> ModelVersion:
     """
     Fit an elastic net GLM and return a :class:`ModelVersion`.
@@ -354,6 +414,10 @@ def fit_model(
         Registered :class:`VariableConfig` objects.
     weights : pl.Series, optional
         Sample weights (exposure).
+    offset : np.ndarray, optional
+        Per-row offset on the **linear predictor (log) scale**.  For a
+        log-link model this is ``log(existing_model_prediction)``.  Passed
+        directly to glum's ``fit`` and ``predict``.
     family : str or glum distribution, optional
         Accepted strings: ``"tweedie"`` (default), ``"poisson"``, ``"gamma"``.
         Defaults to ``TweedieDistribution(power=tweedie_power)``.
@@ -361,7 +425,7 @@ def fit_model(
         Fixed regularisation strength.  Ignored when ``use_cv=True``.
         Set to ``0`` for an unpenalised GLM.
     l1_ratio : float or list of float
-        Elastic-net mixing.  List triggers CV search.
+        Elastic-net mixing.  list triggers CV search.
     use_cv : bool
         Cross-validate to select best ``alpha`` (and optionally ``l1_ratio``).
     cv : int or sklearn CV splitter
@@ -385,7 +449,7 @@ def fit_model(
 
     if use_cv:
         cv_l1 = l1_ratio if isinstance(l1_ratio, list) else [l1_ratio]
-        
+        n_jobs = (os.cpu_count() - 1) if n_jobs is None else n_jobs
         glm_cv = GeneralizedLinearRegressorCV(
             family=family,
             link=link,
@@ -394,7 +458,8 @@ def fit_model(
             fit_intercept=fit_intercept,
             max_iter=max_iter,
             scale_predictors=True,
-            gradient_tol=gradient_tol
+            gradient_tol=gradient_tol,
+            n_jobs=n_jobs
         )
         glm_cv.fit(Xt, y, sample_weight=weights, offset=offset)
         best_alpha = float(glm_cv.alpha_)
@@ -403,7 +468,7 @@ def fit_model(
         glm = _build_glm(family, link, best_alpha, best_l1, fit_intercept, max_iter, gradient_tol)
         glm.fit(Xt, y, sample_weight=weights, offset=offset)
         cv_label = cv if isinstance(cv, int) else type(cv).__name__
-        fit_info: Dict[str, Any] = {
+        fit_info: dict[str, Any] = {
             "cv_folds": cv_label,
             "cv_l1_ratio_grid": cv_l1,
         }
@@ -441,20 +506,21 @@ def fit_model(
 def fit_cv_stability(
     X: pl.DataFrame,
     y: np.ndarray,
-    variables: List[str],
-    configs: Dict[str, VariableConfig],
+    variables: list[str],
+    configs: dict[str, VariableConfig],
     fold_col: str,
-    weights: Optional[np.ndarray] = None,
-    offset: Optional[np.ndarray] = None,
+    weights: np.ndarray | None = None,
+    offset: np.ndarray | None = None,
     family: Any = None,
     link: str = "log",
     tweedie_power: float = 1.5,
     alpha: float = 0.01,
     l1_ratio: float = 0.5,
     max_iter: int = 1000,
-    gradient_tol: Optional[float] = None,
+    gradient_tol: float | None = None,
     fit_intercept: bool = True,
     drop_reference: str = "max_weight",
+    preprocessor: Any = None,
 ) -> pl.DataFrame:
     """
     Evaluate coefficient stability by fitting the model on each CV fold.
@@ -469,6 +535,9 @@ def fit_cv_stability(
     fold_col : str
         Column in *X* whose values identify the test fold for each row
         (e.g. ``1``, ``2``, … ``5``).  Each unique value becomes one fold.
+    offset : np.ndarray, optional
+        Per-row offset on the **linear predictor (log) scale**.  Sliced
+        per fold alongside ``y`` and ``weights``.
     family : str or glum distribution, optional
         Accepted strings: ``"tweedie"`` (default), ``"poisson"``, ``"gamma"``.
         Defaults to ``TweedieDistribution(power=tweedie_power)``.
@@ -484,19 +553,22 @@ def fit_cv_stability(
     """
     family = _resolve_family(family, tweedie_power)
 
-    # Fit a reference preprocessor on the full dataset to fix feature names
-    # (preprocessing params shared across folds — no data leakage for cap/bin
-    # values, which is standard in insurance CV practice)
     feat_vars = [v for v in variables if v != fold_col]
     X_feats = X.drop(fold_col) if fold_col in X.columns else X
 
-    ref_prep = _build_preprocessor(feat_vars, X_feats, configs)
-    fit_weights = weights if drop_reference == "max_weight" else None
-    ref_prep.fit(X_feats, weights=fit_weights)
+    if preprocessor is not None:
+        ref_prep = preprocessor
+    else:
+        # Fit a reference preprocessor on the full dataset to fix feature names
+        # (preprocessing params shared across folds — no data leakage for cap/bin
+        # values, which is standard in insurance CV practice)
+        ref_prep = _build_preprocessor(feat_vars, X_feats, configs)
+        fit_weights = weights if drop_reference == "max_weight" else None
+        ref_prep.fit(X_feats, weights=fit_weights)
     feature_names = ref_prep.get_feature_names()
 
     folds = sorted(X[fold_col].unique().to_list())
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
 
     Xt_full = ref_prep.transform(X_feats).to_numpy().astype(float)
 
@@ -511,7 +583,7 @@ def fit_cv_stability(
         glm = _build_glm(family, link, alpha, l1_ratio, fit_intercept, max_iter, gradient_tol)
         glm.fit(Xt, y_train, sample_weight=w_train, offset=offset_train)
 
-        row: Dict[str, Any] = {"fold": f"fold_{str(fold_val)}", "intercept": float(glm.intercept_)}
+        row: dict[str, Any] = {"fold": f"fold_{fold_val!s}", "intercept": float(glm.intercept_)}
         for name, val in zip(feature_names, glm.coef_):
             row[name] = float(val)
         records.append(row)
@@ -520,9 +592,9 @@ def fit_cv_stability(
     fold_numeric = stability.drop("fold")
     fold_matrix = fold_numeric.to_numpy()
 
-    geomean_row: Dict[str, Any] = {"fold": "geomean"}
-    std_row: Dict[str, Any] = {"fold": "std"}
-    cv_row: Dict[str, Any] = {"fold": "cv_pct"}
+    geomean_row: dict[str, Any] = {"fold": "geomean"}
+    std_row: dict[str, Any] = {"fold": "std"}
+    cv_row: dict[str, Any] = {"fold": "cv_pct"}
 
     for col, vals in zip(fold_numeric.columns, fold_matrix.T):
         gm = _geometric_mean_signed(vals)
