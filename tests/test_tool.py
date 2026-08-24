@@ -332,6 +332,30 @@ class TestCompareModels:
             fitted_tool.compare_models("v1", "v_missing", show=False)
 
 
+# ── overfitting_monitor ──────────────────────────────────────────────────────
+
+class TestOverfittingMonitor:
+    def test_model_version_baseline_uses_train_predictions(self, fitted_tool):
+        baseline = fitted_tool.model_versions["v1"].train_predictions
+        candidate = fitted_tool.model_versions["v2"].train_predictions
+        _, expected = fitted_tool._get_dl_score(
+            fitted_tool._y_array,
+            baseline,
+            candidate,
+            weights=fitted_tool._weights_array,
+            n_buckets=10,
+        )
+
+        result = fitted_tool.overfitting_monitor(
+            ["v1", "v2"],
+            dl_base_version="v1",
+            show=False,
+        )
+
+        assert result["variables_added"].to_list() == ["v2"]
+        assert result["train_metric"][0] == pytest.approx(expected)
+
+
 # ── ae_chart / residual_chart / univariate_plot ───────────────────────────────
 
 class TestCharts:

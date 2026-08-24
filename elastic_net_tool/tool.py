@@ -3576,7 +3576,8 @@ class ModelingTool:
         resolved_base = base_version or self.base_version
         if resolved_base in self.model_versions:
             names = [name for name in version_names if name != resolved_base]
-            return names, None, True, resolved_base
+            predictions = self._prediction_source(resolved_base)
+            return names, predictions, True, resolved_base
         if resolved_base in self.data.columns:
             predictions = self._prediction_source(resolved_base)
             return version_names, predictions, False, resolved_base
