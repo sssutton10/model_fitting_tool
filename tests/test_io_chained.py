@@ -123,6 +123,60 @@ def test_frozen_round_trip_scores_chain_with_and_without_initial_data(tmp_path):
     )
 
 
+def test_frozen_round_trip_preserves_pipeline_alias(tmp_path):
+    data = pl.DataFrame({
+        "x": [1.0, np.e, np.e**2],
+        "target": [1.0, 1.0, 1.0],
+        "weight": [1.0, 1.0, 1.0],
+    })
+    config = VariableConfig(
+        "x_logged", input_cols=["x"], log_transform=True,
+        cap_upper=None, impute_strategy=None,
+    )
+    prep = _build_preprocessor(["x_logged"], data, {"x_logged": config}).fit(data)
+    predictions = prep.transform(data)["x_logged"].to_numpy()
+    version = ModelVersion(
+        name="alias",
+        variables=["x_logged"],
+        preprocessor=prep,
+        glm=DummyGLM(),
+        feature_names=["x_logged"],
+        coefficients=pl.DataFrame({
+            "feature": ["intercept", "x_logged"],
+            "coefficient": [0.0, 1.0],
+        }),
+        alpha=0.0,
+        l1_ratio=0.0,
+        family="poisson",
+        link="identity",
+        train_predictions=predictions,
+        fit_info={"Fit_Time": "test"},
+    )
+    tool = SimpleNamespace(
+        variable_configs={"x_logged": config},
+        target_col="target",
+        weight_col="weight",
+        offset_col=None,
+        link="identity",
+        drop_reference="max_weight",
+    )
+    path = tmp_path / "alias.pkl"
+
+    save_version(version, tool, path)
+    frozen = ModelingTool.load_frozen(path)
+
+    saved_config = frozen.variable_configs["x_logged"]
+    assert saved_config.input_cols == ["x"]
+    assert saved_config.custom_transform is None
+    np.testing.assert_allclose(frozen.predict(data), [0.0, 1.0, 2.0], atol=1e-12)
+
+    metadata = json.loads(path.with_suffix(".json").read_text())
+    assert metadata["variable_transformations"]["x_logged"] == {
+        "input_cols": ["x"],
+        "log_transform": True,
+    }
+
+
 def test_refit_load_restores_dependency_closure(tmp_path, monkeypatch):
     data, _, version, tool = _artifact_parts()
     path = tmp_path / "chain.pkl"
@@ -159,4 +213,3 @@ def test_save_rejects_transform_without_retrievable_source(tmp_path):
 
     with pytest.raises(ValueError, match="no retrievable source code"):
         save_version(version, tool, tmp_path / "broken.pkl")
-

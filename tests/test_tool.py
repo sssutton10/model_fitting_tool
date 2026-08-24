@@ -128,6 +128,36 @@ class TestAddVariable:
         assert "age_x_value" in tool.variable_configs
         assert tool.variable_configs["age_x_value"].input_cols == ["driver_age", "vehicle_value"]
 
+    def test_named_builtin_pipeline(self, sample_df):
+        tool = ModelingTool(sample_df, target_col="loss_ratio")
+
+        tool.add_variable(
+            "vehicle_value_logged",
+            input_cols=["vehicle_value"],
+            log_transform=True,
+        )
+
+        cfg = tool.variable_configs["vehicle_value_logged"]
+        assert cfg.input_cols == ["vehicle_value"]
+        assert cfg.custom_transform is None
+        assert cfg.log_transform is True
+
+    def test_data_with_named_builtin_pipeline(self, sample_df):
+        tool = ModelingTool(sample_df, target_col="loss_ratio")
+        tool.add_variable(
+            "vehicle_value_logged",
+            input_cols=["vehicle_value"],
+            log_transform=True,
+        )
+
+        augmented = tool._data_with_derived_col("vehicle_value_logged")
+
+        assert "vehicle_value_logged" not in tool.data.columns
+        np.testing.assert_allclose(
+            augmented["vehicle_value_logged"].to_numpy(),
+            np.log(sample_df["vehicle_value"].to_numpy()),
+        )
+
     def test_breakpoints_kwarg_sets_bin_edges(self, sample_df):
         tool = ModelingTool(sample_df, target_col="loss_ratio")
         tool.add_variable("driver_age", breakpoints=[25.0, 45.0, 65.0])

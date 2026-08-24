@@ -96,11 +96,13 @@ def _resolve_level(
             p, (FittedBinnedNumericParams, FittedCategoricalParams)
         ):
             return preprocessor.get_level_labels(col, X)
-        elif preprocessor.configs[col].custom_transform:
-            if isinstance(p, FittedBinnedNumericParams):
-                s = preprocessor._materialize_raw_columns(X, [col])[col]
-            else:
-                s = preprocessor.transform(X)[col]
+        elif preprocessor.configs[col].custom_transform is not None:
+            # Plot custom-derived numerics from their raw callable result.  The
+            # fitted design-matrix value may have imputed away a sentinel, which
+            # would incorrectly merge missing rows into an ordinary plot bin.
+            s = preprocessor._materialize_raw_columns(X, [col])[col]
+        elif preprocessor.configs[col].input_cols is not None:
+            s = preprocessor.transform(X)[col]
         else:
             s = X[col]
     else:
@@ -108,7 +110,18 @@ def _resolve_level(
 
     # Continuous non-binned (including polynomial) — bin on the fly
     if breaks is None and (_is_str_or_cat(s.dtype) or s.n_unique() <= 10):
-        return s.cast(pl.Utf8).fill_null("Missing")
+        labels = s.cast(pl.Utf8).fill_null("Missing")
+        if s.dtype.is_numeric():
+            arr = (
+                s.cast(pl.Float64, strict=False)
+                .fill_null(MISSING_SENTINEL)
+                .to_numpy(allow_copy=True)
+            )
+            missing = ~np.isfinite(arr) | np.isclose(
+                arr, MISSING_SENTINEL, rtol=0, atol=1.0
+            )
+            labels = labels.set(pl.Series(missing), "Missing")
+        return labels
 
     return _bin_for_plot(s, n_bins, breaks=breaks)
 

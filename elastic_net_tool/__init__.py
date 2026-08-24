@@ -14,6 +14,9 @@ Quick start
 >>>
 >>> # Variable creation
 >>> tool.add_variable('vehicle_age', cap_upper=0.99, log_transform=True)
+>>> # Named built-in transform; may be referenced by other derived variables
+>>> tool.add_variable('vehicle_value_logged', input_cols=['vehicle_value'],
+...                   log_transform=True)
 >>> tool.add_variable('driver_age', bin_edges=[16, 25, 35, 50, 65, 100])
 >>> tool.add_variable('state', encoding='onehot')
 >>> # Categorical remapping (transform receives a pl.DataFrame of the input cols)

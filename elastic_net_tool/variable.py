@@ -66,16 +66,24 @@ class VariableConfig:
     Set ``col`` to the source column name.  All transforms operate on that
     column.
 
-    Multi-column derived variable
+    Named built-in transformation
     -----------------------------
+    Set ``col`` to a new output name and provide exactly one source through
+    ``input_cols`` without a ``custom_transform``. The configured scalar
+    pipeline is materialized under ``col`` and may be used by downstream
+    derived variables.
+
+    Custom derived variable
+    -----------------------
     Set ``col`` to the *output* name and ``input_cols`` to the list of source
     columns. ``custom_transform`` is then called as::
 
         custom_transform(df: pl.DataFrame, **kwargs) -> array-like
 
     ``df`` contains the columns in ``input_cols``. Inputs may themselves be
-    derived variables; they are resolved recursively, and their raw transform
-    results are supplied before their own preprocessing options are applied.
+    derived variables and are resolved recursively. Pipeline aliases supply
+    their fitted scalar values; custom-derived inputs supply their raw callable
+    results before their own preprocessing options are applied.
 
     Parameters
     ----------
@@ -83,14 +91,16 @@ class VariableConfig:
         Output variable name (also the source column when ``input_cols`` is
         ``None``).
     input_cols : list of str, optional
-        Source columns for multi-input transforms.  When ``None``, ``col``
-        itself is the only input.
+        Source columns for derived variables. Exactly one input without a
+        ``custom_transform`` creates a named built-in transformation. With a
+        ``custom_transform``, one or more inputs are accepted. When ``None``,
+        ``col`` itself is the only input.
     cap_lower : float, optional
         Lower cap
     cap_upper : float, optional
         Upper cap
     log_transform : bool
-        Apply log1p after capping.
+        Apply the natural logarithm after capping.
     impute_strategy : str, optional
         ``'median'``, ``'mean'``, ``'most_frequent'``, ``'constant'``, or
         ``None`` (leave nulls in place).
@@ -477,7 +487,9 @@ class Preprocessor:
     ----------
     configs : list of VariableConfig
         Configurations for emitted variables and any derived-variable
-        dependencies needed to construct them.
+        dependencies needed to construct them. A config with exactly one
+        ``input_cols`` entry and no ``custom_transform`` is a scalar pipeline
+        alias whose transformed value is available to downstream variables.
     output_cols : sequence of str, optional
         Variables whose fitted features should be emitted. Dependency-only
         configs remain available for raw-column construction but are not
@@ -536,9 +548,11 @@ class Preprocessor:
             alphabetically is dropped (legacy behaviour).
         """
         self._params = {}
-        X_aug = self._materialize_raw_columns(X)
+        X_aug = self._materialize_raw_columns(X, fit_aliases=True, weights=weights)
         for col in self._emitted_cols():
             cfg = self.configs[col]
+            if self._is_pipeline_alias(cfg):
+                continue
             raw = X_aug[col]
             self._params[col] = self._fit_col(raw, cfg, weights=weights)
         self._compute_feature_names()
@@ -559,10 +573,13 @@ class Preprocessor:
         if not self._fitted:
             raise RuntimeError("Call fit() before transform().")
         out: dict[str, np.ndarray] = {}
-        X_aug = self._materialize_raw_columns(X)
+        X_aug = self._materialize_raw_columns(X, strict=strict)
         for col in self._emitted_cols():
             cfg = self.configs[col]
             raw = X_aug[col]
+            if self._is_pipeline_alias(cfg):
+                out[col] = raw.to_numpy()
+                continue
             self._transform_col(raw, cfg, self._params[col], out, strict=strict)
         return pl.DataFrame(out)
 
@@ -589,12 +606,17 @@ class Preprocessor:
         self,
         X: pl.DataFrame,
         requested_cols: Sequence[str] | None = None,
+        *,
+        fit_aliases: bool = False,
+        weights: np.ndarray | None = None,
+        strict: bool = True,
     ) -> pl.DataFrame:
-        """Resolve requested raw variables and their dependencies once.
+        """Resolve requested variables and their dependencies once.
 
         Downstream transforms receive upstream custom-transform results before
         any configured cap, log, imputation, binning, standardisation, or
-        encoding is applied.
+        encoding is applied. Pipeline aliases instead supply their fully
+        transformed scalar value.
         """
         resolved: set[str] = set()
         visiting: list[str] = []
@@ -606,6 +628,9 @@ class Preprocessor:
                 output_col,
                 resolved,
                 visiting,
+                fit_aliases=fit_aliases,
+                weights=weights,
+                strict=strict,
             )
         return materialized
 
@@ -616,6 +641,10 @@ class Preprocessor:
         resolved: set[str],
         visiting: list[str],
         dependent: str | None = None,
+        *,
+        fit_aliases: bool = False,
+        weights: np.ndarray | None = None,
+        strict: bool = True,
     ) -> pl.DataFrame:
         """Recursively materialize one raw variable and its dependencies."""
         if column in resolved:
@@ -628,6 +657,16 @@ class Preprocessor:
         if column in visiting:
             cycle = " -> ".join(visiting[visiting.index(column) :] + [column])
             raise ValueError(f"Circular dependency in derived variable chain: {cycle}.")
+        if config.input_cols is not None and config.custom_transform is None:
+            return self._materialize_pipeline_alias(
+                data,
+                config,
+                resolved,
+                visiting,
+                fit_aliases=fit_aliases,
+                weights=weights,
+                strict=strict,
+            )
         if config.custom_transform is None:
             self._validate_plain_config(data, config)
             resolved.add(column)
@@ -644,6 +683,9 @@ class Preprocessor:
                     resolved,
                     visiting,
                     dependent=column,
+                    fit_aliases=fit_aliases,
+                    weights=weights,
+                    strict=strict,
                 )
         raw = self._resolve_raw_series(data, config)
         if len(raw) != len(data):
@@ -654,6 +696,97 @@ class Preprocessor:
         visiting.pop()
         resolved.add(column)
         return data.with_columns(raw.alias(column))
+
+    def _materialize_pipeline_alias(
+        self,
+        data: pl.DataFrame,
+        config: VariableConfig,
+        resolved: set[str],
+        visiting: list[str],
+        *,
+        fit_aliases: bool,
+        weights: np.ndarray | None,
+        strict: bool,
+    ) -> pl.DataFrame:
+        """Fit or apply one scalar pipeline under a new column name."""
+        self._validate_pipeline_alias(config)
+        column = config.col
+        source = config.input_cols[0]
+        visiting.append(column)
+        data = self._materialize_raw_column(
+            data,
+            source,
+            resolved,
+            visiting,
+            dependent=column,
+            fit_aliases=fit_aliases,
+            weights=weights,
+            strict=strict,
+        )
+        if fit_aliases:
+            params = self._fit_col(data[source], config, weights=weights)
+            self._validate_pipeline_alias_params(config, params)
+            self._params[column] = params
+        else:
+            if column not in self._params:
+                raise RuntimeError(
+                    f"Pipeline alias '{column}' has no fitted parameters. Call fit() first."
+                )
+            params = self._params[column]
+        transformed: dict[str, np.ndarray] = {}
+        self._transform_col(
+            data[source],
+            config,
+            params,
+            transformed,
+            strict=strict,
+        )
+        visiting.pop()
+        resolved.add(column)
+        return data.with_columns(pl.Series(column, transformed[column]))
+
+    @staticmethod
+    def _is_pipeline_alias(config: VariableConfig) -> bool:
+        """Return whether *config* names a built-in pipeline result."""
+        return config.input_cols is not None and config.custom_transform is None
+
+    @staticmethod
+    def _validate_pipeline_alias(config: VariableConfig) -> None:
+        """Require a pipeline alias to produce exactly one output column."""
+        if len(config.input_cols) != 1:
+            raise ValueError(
+                f"Variable '{config.col}' has multiple input_cols but no "
+                "custom_transform. Pipeline aliases require exactly one input."
+            )
+        if config.n_bins is not None or config.bin_edges is not None:
+            raise ValueError(
+                f"Pipeline alias '{config.col}' cannot use binning because it "
+                "produces level-based output columns."
+            )
+        if config.degree != 1:
+            raise ValueError(
+                f"Pipeline alias '{config.col}' cannot use polynomial expansion "
+                "because it produces multiple output columns."
+            )
+        if config.encoding == "onehot":
+            raise ValueError(
+                f"Pipeline alias '{config.col}' cannot use one-hot encoding "
+                "because it produces multiple output columns."
+            )
+
+    @staticmethod
+    def _validate_pipeline_alias_params(
+        config: VariableConfig,
+        params: FittedParams,
+    ) -> None:
+        """Reject dtype-driven pipelines that resolve to multiple columns."""
+        if isinstance(params, FittedBinnedNumericParams) or (
+            isinstance(params, FittedCategoricalParams) and params.encoding == "onehot"
+        ):
+            raise ValueError(
+                f"Pipeline alias '{config.col}' must produce one scalar column; "
+                "set encoding=None for categorical aliases."
+            )
 
     @staticmethod
     def _validate_unconfigured_input(
@@ -671,10 +804,6 @@ class Preprocessor:
 
     @staticmethod
     def _validate_plain_config(data: pl.DataFrame, config: VariableConfig) -> None:
-        if config.input_cols is not None:
-            raise ValueError(
-                f"Variable '{config.col}' has input_cols but no custom_transform."
-            )
         if config.col not in data.columns:
             raise ValueError(
                 f"Variable '{config.col}' is not in the DataFrame and has no "
@@ -703,8 +832,8 @@ class Preprocessor:
         (``input_cols`` when set, otherwise ``[col]``).  The result is wrapped
         as a :class:`pl.Series` named ``cfg.col``.
 
-        For multi-input configs without a custom_transform a ``ValueError`` is
-        raised, since there is no meaningful default combination.
+        Pipeline aliases are resolved separately because their fitted scalar
+        pipeline must be applied before downstream variables consume them.
         """
         if cfg.custom_transform is not None:
             cols = cfg.input_cols if cfg.input_cols is not None else [cfg.col]
@@ -712,10 +841,6 @@ class Preprocessor:
                 X.select(cols), **(cfg.transform_kwargs or {})
             )
             return pl.Series(cfg.col, result)
-        if cfg.input_cols is not None:
-            raise ValueError(
-                f"Variable '{cfg.col}' has input_cols but no custom_transform."
-            )
         return X[cfg.col]
 
     # ── Fitting ──────────────────────────────────────────────────────────

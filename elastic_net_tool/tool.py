@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,6 +42,7 @@ from .plots import (
     univariate_plot,
 )
 from .variable import (
+    MISSING_SENTINEL,
     FittedBinnedNumericParams,
     FittedCategoricalParams,
     Preprocessor,
@@ -101,6 +103,47 @@ def _create_variable_config(
     if column in data.columns:
         return default_config(column, data[column])
     return VariableConfig(col=column)
+
+
+def _fit_plot_preprocessor(
+    col: str,
+    data: pl.DataFrame,
+    configs: dict[str, VariableConfig],
+    weights: np.ndarray | None,
+) -> Preprocessor:
+    """Fit a preprocessor without rejecting plot-binned numeric missings."""
+    preprocessor = _build_preprocessor([col], data, configs)
+    config = preprocessor.configs[col]
+    if (
+        config.impute_strategy is None
+        and config.n_bins is None
+        and config.bin_edges is None
+    ):
+        materialized = preprocessor._materialize_raw_columns(
+            data,
+            [col],
+            fit_aliases=True,
+            weights=weights,
+        )
+        raw = materialized[col]
+        if raw.dtype.is_numeric():
+            arr = (
+                raw.cast(pl.Float64, strict=False)
+                .fill_null(MISSING_SENTINEL)
+                .to_numpy(allow_copy=True)
+            )
+            missing = ~np.isfinite(arr) | np.isclose(
+                arr, MISSING_SENTINEL, rtol=0, atol=1.0
+            )
+            if missing.any():
+                plot_configs = dict(configs)
+                plot_configs[col] = replace(
+                    config,
+                    impute_strategy="constant",
+                    impute_value=MISSING_SENTINEL,
+                )
+                preprocessor = _build_preprocessor([col], data, plot_configs)
+    return preprocessor.fit(data, weights=weights)
 
 
 def _select_factor_variables(
@@ -397,7 +440,15 @@ class ModelingTool:
                tool.add_variable('state', encoding='onehot')
                tool.add_variable('driver_age', bin_edges=[16,25,35,50,65,100])
 
-        3. **Multi-input derived variable** (new named variable from multiple columns)::
+        3. **Named built-in transformation** (new name for one scalar pipeline)::
+
+               tool.add_variable(
+                   'vehicle_value_logged',
+                   input_cols=['vehicle_value'],
+                   log_transform=True,
+               )
+
+        4. **Custom derived variable** (new named variable from one or more columns)::
 
                tool.add_variable(
                    'age_x_veh',
@@ -426,12 +477,14 @@ class ModelingTool:
         config : VariableConfig, optional
             A fully constructed config.  Mutually exclusive with keyword args.
         input_cols : list of str, optional
-            Source columns for a derived variable built from multiple inputs.
-            Must be paired with ``custom_transform``.
+            Source columns for a derived variable. Exactly one source without
+            ``custom_transform`` creates a named scalar built-in pipeline.
+            One or more sources may be paired with ``custom_transform``.
         custom_transform : callable, optional
             Function called once with a DataFrame containing ``input_cols``
             (or ``col`` for a single-column transform). Derived inputs are
-            resolved recursively and supplied as raw, pre-pipeline values.
+            resolved recursively. Pipeline aliases supply fitted scalar values;
+            custom-derived inputs supply raw, pre-pipeline values.
         **kwargs
             Any :class:`~modeling_tool.variable.VariableConfig` field
             (e.g. ``n_bins``, ``bin_edges`` / ``breakpoints``, ``cap_upper``,
@@ -525,13 +578,19 @@ class ModelingTool:
             if col in self.variable_configs and (
                 preprocessor is None or col not in preprocessor._params
             ):
-                preprocessor = _build_preprocessor(
-                    [col], self.data, self.variable_configs
+                preprocessor = _fit_plot_preprocessor(
+                    col,
+                    self.data,
+                    self.variable_configs,
+                    self._weights_array,
                 )
-                preprocessor.fit(self.data, weights=self._weights_array)
         elif col in self.variable_configs:
-            preprocessor = _build_preprocessor([col], self.data, self.variable_configs)
-            preprocessor.fit(self.data, weights=self._weights_array)
+            preprocessor = _fit_plot_preprocessor(
+                col,
+                self.data,
+                self.variable_configs,
+                self._weights_array,
+            )
 
         fig = univariate_plot(
             self.data,
@@ -553,12 +612,15 @@ class ModelingTool:
     def _data_with_derived_col(self, col: str) -> pl.DataFrame:
         """Return data guaranteed to contain *col*, deriving it via config if needed."""
         cfg = self.variable_configs.get(col)
-        if col in self.data.columns and (cfg is None or cfg.custom_transform is None):
+        is_derived = cfg is not None and (
+            cfg.input_cols is not None or cfg.custom_transform is not None
+        )
+        if col in self.data.columns and not is_derived:
             return self.data
-        if cfg is None or cfg.custom_transform is None:
+        if cfg is None or not is_derived:
             raise ValueError(
                 f"Column '{col}' not found in data and has no derivable config "
-                "(register input_cols and custom_transform for the new variable)."
+                "(register a pipeline alias or custom derived variable)."
             )
         stripped = self._strip_config(cfg)
         configs = dict(self.variable_configs)
@@ -2151,8 +2213,12 @@ class ModelingTool:
         mv = self._get_version(version or self.current_version)
         prep = getattr(mv, "preprocessor", None)
         if col in self.variable_configs and (prep is None or col not in prep._params):
-            prep = _build_preprocessor([col], self.data, self.variable_configs)
-            prep.fit(self.data, weights=self._weights_array)
+            prep = _fit_plot_preprocessor(
+                col,
+                self.data,
+                self.variable_configs,
+                self._weights_array,
+            )
         fig = ae_chart(
             X=self.data,
             y=self._y,
@@ -2210,8 +2276,12 @@ class ModelingTool:
         mv = self._get_version(version or self.current_version)
         prep = getattr(mv, "preprocessor", None)
         if col in self.variable_configs and (prep is None or col not in prep._params):
-            prep = _build_preprocessor([col], self.data, self.variable_configs)
-            prep.fit(self.data, weights=self._weights_array)
+            prep = _fit_plot_preprocessor(
+                col,
+                self.data,
+                self.variable_configs,
+                self._weights_array,
+            )
         fig = residual_chart(
             X=self.data,
             y=self._y,

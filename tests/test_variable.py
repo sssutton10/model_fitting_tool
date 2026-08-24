@@ -4,10 +4,14 @@ Tests for variable.py — VariableConfig, Preprocessor, helpers.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import pytest
 
+from elastic_net_tool import ModelingTool
 from elastic_net_tool.variable import (
     MISSING_SENTINEL,
     Preprocessor,
@@ -414,6 +418,126 @@ class TestMultiInputVariables:
             _prep(cfg, df)
 
 
+# ── Preprocessor – named built-in pipeline aliases ───────────────────────────
+
+class TestPipelineAliases:
+    def test_log_pipeline_is_emitted_under_new_name(self):
+        df = _make_num_df([1.0, 10.0, 100.0])
+        cfg = VariableConfig(
+            "x_logged", input_cols=["x"], log_transform=True,
+            cap_upper=None, impute_strategy=None,
+        )
+
+        out = _prep(cfg, df)
+
+        assert out.columns == ["x_logged"]
+        np.testing.assert_allclose(out["x_logged"].to_numpy(), np.log([1.0, 10.0, 100.0]))
+        assert df.columns == ["x"]
+
+    def test_downstream_custom_transform_receives_pipeline_value(self):
+        df = _make_num_df([1.0, 10.0, 100.0])
+        configs = {
+            "x_logged": VariableConfig(
+                "x_logged", input_cols=["x"], log_transform=True,
+                cap_upper=None, impute_strategy=None,
+            ),
+            "twice_logged": VariableConfig(
+                "twice_logged", input_cols=["x_logged"],
+                custom_transform=lambda data: data["x_logged"] * 2,
+                cap_upper=None, impute_strategy=None,
+            ),
+        }
+
+        prep = _build_preprocessor(["twice_logged"], df, configs)
+        out = prep.fit_transform(df)
+
+        assert out.columns == ["twice_logged"]
+        assert set(prep._params) == {"x_logged", "twice_logged"}
+        np.testing.assert_allclose(
+            out["twice_logged"].to_numpy(), 2 * np.log([1.0, 10.0, 100.0])
+        )
+
+    def test_standardization_reuses_training_parameters(self):
+        train = _make_num_df([1.0, 2.0, 3.0])
+        cfg = VariableConfig(
+            "x_standardized", input_cols=["x"], standardize=True,
+            cap_upper=None, impute_strategy=None,
+        )
+        prep = Preprocessor([cfg]).fit(train)
+
+        transformed = prep.transform(_make_num_df([4.0]))
+
+        expected = (4.0 - np.mean([1.0, 2.0, 3.0])) / np.std([1.0, 2.0, 3.0])
+        np.testing.assert_allclose(transformed["x_standardized"].to_numpy(), [expected])
+
+    def test_pipeline_aliases_can_be_chained(self):
+        df = _make_num_df([1.0, np.e, np.e**2])
+        configs = {
+            "x_logged": VariableConfig(
+                "x_logged", input_cols=["x"], log_transform=True,
+                cap_upper=None, impute_strategy=None,
+            ),
+            "x_logged_standardized": VariableConfig(
+                "x_logged_standardized", input_cols=["x_logged"], standardize=True,
+                cap_upper=None, impute_strategy=None,
+            ),
+        }
+
+        out = _build_preprocessor(
+            ["x_logged_standardized"], df, configs
+        ).fit_transform(df)
+
+        np.testing.assert_allclose(
+            out["x_logged_standardized"].to_numpy(),
+            (np.arange(3.0) - 1.0) / np.std(np.arange(3.0)),
+        )
+
+    def test_registered_alias_overrides_same_named_raw_column(self):
+        df = pl.DataFrame({"x": [1.0, np.e], "x_logged": [100.0, 100.0]})
+        cfg = VariableConfig(
+            "x_logged", input_cols=["x"], log_transform=True,
+            cap_upper=None, impute_strategy=None,
+        )
+
+        out = _prep(cfg, df)
+
+        np.testing.assert_allclose(out["x_logged"].to_numpy(), [0.0, 1.0])
+
+    def test_plot_level_resolution_uses_pipeline_value(self):
+        df = _make_num_df([1.0, np.e, np.e**2, np.e**3])
+        cfg = VariableConfig(
+            "x_logged", input_cols=["x"], log_transform=True,
+            cap_upper=None, impute_strategy=None,
+        )
+        prep = Preprocessor([cfg]).fit(df)
+
+        levels = _resolve_level("x_logged", df, prep, breaks=[1.5])
+
+        assert levels[0] == levels[1]
+        assert levels[1] != levels[2]
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            ({"n_bins": 3}, "binning"),
+            ({"degree": 2}, "polynomial"),
+            ({"encoding": "onehot"}, "one-hot"),
+        ],
+    )
+    def test_multi_column_pipeline_options_are_rejected(self, options, message):
+        cfg = VariableConfig("x_alias", input_cols=["x"], **options)
+
+        with pytest.raises(ValueError, match=message):
+            _prep(cfg, _make_num_df([1.0, 2.0, 3.0]))
+
+    def test_categorical_alias_requires_scalar_encoding(self):
+        df = _make_cat_df(["a", "b", "a"])
+        cfg = VariableConfig("cat_alias", input_cols=["cat"])
+
+        with pytest.raises(ValueError, match="encoding=None"):
+            _prep(cfg, df)
+
+
 # ── Preprocessor – chained derived variables ──────────────────────────────
 
 class TestChainedDerivedVariables:
@@ -601,6 +725,68 @@ class TestChainedDerivedVariables:
         )
 
         assert levels.to_list() == ["A_<2", "Missing", "B_2+"]
+
+    def test_plot_level_resolution_preserves_imputed_derived_missing(self):
+        a = np.arange(1.0, 13.0)
+        a[2] = MISSING_SENTINEL
+        b = np.arange(10.0, 130.0, 10.0)
+        b[2] = 0.0
+        df = pl.DataFrame({"a": a, "b": b})
+        config = VariableConfig(
+            "a_plus_b",
+            input_cols=["a", "b"],
+            custom_transform=lambda frame: frame["a"] + frame["b"],
+            impute_strategy="mean",
+            cap_upper=None,
+        )
+        preprocessor = Preprocessor([config]).fit(df)
+
+        levels = _resolve_level("a_plus_b", df, preprocessor, n_bins=2)
+
+        assert levels[2] == "Missing"
+
+    @pytest.mark.parametrize(
+        "chart",
+        ["univariate_plot", "ae_chart", "residual_chart"],
+    )
+    @pytest.mark.parametrize("derived", [False, True])
+    def test_public_charts_bucket_missing_numeric(self, chart, derived):
+        a = np.arange(1.0, 13.0)
+        a[2] = MISSING_SENTINEL
+        b = np.arange(10.0, 130.0, 10.0)
+        b[2] = 0.0
+        data = pl.DataFrame(
+            {
+                "a": a,
+                "b": b,
+                "target": np.linspace(0.8, 1.3, len(a)),
+            }
+        )
+        tool = ModelingTool(data, target_col="target")
+        col = "a_plus_b" if derived else "a"
+        if derived:
+            tool.add_variable(
+                col,
+                input_cols=["a", "b"],
+                custom_transform=lambda frame: frame["a"] + frame["b"],
+                cap_upper=None,
+            )
+        else:
+            tool.add_variable(col, cap_upper=None)
+        tool.model_versions["v1"] = SimpleNamespace(
+            preprocessor=None,
+            train_predictions=np.ones(len(data)),
+        )
+        tool.current_version = "v1"
+
+        kwargs = {"show": False, "n_bins": 2}
+        if chart != "univariate_plot":
+            kwargs["version"] = "v1"
+        fig = getattr(tool, chart)(col, **kwargs)
+
+        labels = [tick.get_text() for tick in fig.axes[0].get_xticklabels()]
+        plt.close(fig)
+        assert "Missing" in labels
 
 
 # ── Preprocessor – error handling ────────────────────────────────────────────

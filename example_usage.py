@@ -187,6 +187,14 @@ cs_splits = tool.suggest_bins(
 # Numeric: 99th-percentile cap (cap_upper < 1.0 is treated as a quantile)
 tool.add_variable("vehicle_age", cap_upper=0.99)
 
+# Named built-in pipeline: materialized on demand without changing tool.data.
+# Other derived variables can use "vehicle_value_logged" in input_cols.
+tool.add_variable(
+    "vehicle_value_logged",
+    input_cols=["vehicle_value"],
+    log_transform=True,
+)
+
 # Numeric: use breakpoints discovered by suggest_bins above.
 # 'breakpoints' is an alias for 'bin_edges' — both are accepted.
 tool.add_variable("driver_age", breakpoints=q_splits)

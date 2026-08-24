@@ -169,6 +169,24 @@ categorical. Numeric columns are treated as continuous.
 Derived variables are supported by giving the output variable name as the first
 argument and source columns through `input_cols`.
 
+Exactly one input without a `custom_transform` creates a named scalar built-in
+pipeline. This is useful when the transformed value must feed another derived
+variable:
+
+```python
+tool.add_variable(
+    "vehicle_value_logged",
+    input_cols=["vehicle_value"],
+    log_transform=True,
+)
+```
+
+Pipeline aliases support imputation, caps, logging, and standardisation. They
+cannot use binning, one-hot encoding, or polynomial expansion because those
+operations produce multiple or level-based output columns.
+
+Provide a callable when deriving a variable from one or more inputs:
+
 ```python
 def veh_age_x_driver_age(df: pl.DataFrame):
     return df["vehicle_age"].to_numpy() * df["driver_age"].to_numpy()
@@ -186,10 +204,11 @@ variable like `"region"` created from `"state"`, use `input_cols=["state"]`
 rather than passing `"state"` as the first argument.
 
 Derived variables can depend on other registered derived variables to any
-depth. A downstream transform receives the upstream transform's raw result,
-before the upstream variable's capping, logging, binning, standardisation, or
-encoding. Only variables explicitly passed to `fit_model` are emitted as model
-features; other variables in the chain are construction dependencies.
+depth. A pipeline alias supplies its fitted scalar value to downstream
+variables. A custom-derived variable continues to supply its raw callable
+result before its own capping, logging, binning, standardisation, or encoding.
+Only variables explicitly passed to `fit_model` are emitted as model features;
+other variables in the chain are construction dependencies.
 
 ### 2. Explore Variables and Breakpoints
 
