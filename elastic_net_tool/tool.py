@@ -12,7 +12,11 @@ import numpy as np
 import polars as pl
 from tabulate import tabulate
 
-from .io_utils import load_version, save_version
+from .io_utils import (
+    _serialize_custom_transform,
+    save_version,
+)
+from .io_utils import load_version as _load_version_snapshot
 from .metrics import (
     _off_balance_by_state,
     compare_metrics,
@@ -144,6 +148,186 @@ def _fit_plot_preprocessor(
                 )
                 preprocessor = _build_preprocessor([col], data, plot_configs)
     return preprocessor.fit(data, weights=weights)
+
+
+def _transform_signature(
+    config: VariableConfig,
+    saved_source: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return a stable signature for a config's custom transform."""
+    if config.custom_transform is None:
+        return None
+    if saved_source is not None:
+        return saved_source
+    embedded = getattr(
+        config.custom_transform,
+        "__elastic_net_tool_transform_source__",
+        None,
+    )
+    return embedded or _serialize_custom_transform(config.custom_transform)
+
+
+def _configs_match(
+    existing: VariableConfig,
+    incoming: VariableConfig,
+    incoming_source: dict[str, Any] | None,
+) -> bool:
+    """Compare configs by values and transform source rather than callable identity."""
+    existing_plain = replace(existing, custom_transform=None)
+    incoming_plain = replace(incoming, custom_transform=None)
+    try:
+        values_match = existing_plain == incoming_plain
+    except ValueError:
+        values_match = repr(existing_plain) == repr(incoming_plain)
+    return bool(values_match) and _transform_signature(
+        existing
+    ) == _transform_signature(incoming, incoming_source)
+
+
+def _validate_load_destination(
+    tool: ModelingTool,
+    tool_settings: dict[str, Any],
+    version_name: str,
+) -> None:
+    """Reject version, tool-setting, and variable-config conflicts."""
+    if version_name in tool.model_versions:
+        raise ValueError(f"Model version '{version_name}' already exists.")
+
+    saved_settings = {
+        "target_col": tool_settings["target_col"],
+        "weight_col": tool_settings["weight_col"],
+        "offset_col": tool_settings.get("offset_col"),
+        "drop_reference": tool_settings.get("drop_reference", "max_weight"),
+    }
+    mismatches = [
+        setting
+        for setting, saved_value in saved_settings.items()
+        if getattr(tool, setting) != saved_value
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{setting} (tool={getattr(tool, setting)!r}, saved={saved_settings[setting]!r})"
+            for setting in mismatches
+        )
+        raise ValueError(
+            f"Saved model is incompatible with the destination tool: {details}."
+        )
+
+    sources = tool_settings.get("custom_transform_sources", {})
+    conflicts = [
+        col
+        for col, incoming in tool_settings["variable_configs"].items()
+        if col in tool.variable_configs
+        and not _configs_match(tool.variable_configs[col], incoming, sources.get(col))
+    ]
+    if conflicts:
+        raise ValueError(
+            "Saved model has incompatible variable configurations for: "
+            + ", ".join(conflicts)
+            + "."
+        )
+
+
+def _merge_variable_configs(
+    tool: ModelingTool,
+    tool_settings: dict[str, Any],
+) -> dict[str, VariableConfig]:
+    """Return the destination configs plus the artifact's compatible configs."""
+    configs = dict(tool.variable_configs)
+    for col, config in tool_settings["variable_configs"].items():
+        configs.setdefault(col, config)
+    return configs
+
+
+def _fit_loaded_snapshot(
+    tool: ModelingTool,
+    snapshot: dict[str, Any],
+    version_name: str,
+) -> None:
+    """Refit one loaded GLM snapshot on a prepared tool."""
+    version = snapshot["version"]
+    tool.fit_model(
+        variables=version["variables"],
+        version=version_name,
+        alpha=version["alpha"],
+        l1_ratio=version["l1_ratio"],
+        use_cv=False,
+        family=version["family"],
+        tweedie_power=version["tweedie_power"],
+        link=version["link"],
+        gradient_tol=version.get("gradient_tol"),
+        print_summary=True,
+    )
+
+
+def _new_frozen_tool(
+    tool_class: type[ModelingTool],
+    snapshot: dict[str, Any],
+    data: pl.DataFrame | None,
+) -> ModelingTool:
+    """Create a data-optional tool shell for a frozen artifact."""
+    settings = snapshot["tool_settings"]
+    tool = tool_class.__new__(tool_class)
+    tool.data = data.clone() if data is not None else pl.DataFrame()
+    tool.target_col = settings["target_col"]
+    tool.weight_col = settings["weight_col"]
+    tool.offset_col = settings.get("offset_col")
+    tool.link = settings["link"]
+    tool.tweedie_power = 1.5
+    tool.drop_reference = settings.get("drop_reference", "max_weight")
+    tool.cv_column = None
+    tool.current_version = None
+    tool.base_version = None
+    tool.variable_configs = {}
+    tool.model_versions = {}
+    return tool
+
+
+def _restore_frozen_model(
+    snapshot: dict[str, Any],
+    version_name: str,
+    data: pl.DataFrame,
+    compute_predictions: bool,
+) -> ModelVersion | FactorModelVersion:
+    """Reconstruct one fitted model and optionally score the tool data."""
+    version = snapshot["version"]
+    offset_col = snapshot["tool_settings"].get("offset_col")
+    offset = None
+    if compute_predictions and offset_col is not None and offset_col in data.columns:
+        offset = data[offset_col].cast(pl.Float64).to_numpy()
+
+    if snapshot.get("version_type") == "factor":
+        model: ModelVersion | FactorModelVersion = FactorModelVersion(
+            name=version_name,
+            variables=version["variables"],
+            factor_table=version["factor_table"],
+            preprocessor=version["preprocessor"],
+            preprocessor_vars=version["preprocessor_vars"],
+            train_predictions=np.array([]),
+            offset_col=version["offset_col"],
+            fit_info=version.get("fit_info", {}),
+        )
+    else:
+        model = ModelVersion(
+            name=version_name,
+            variables=version["variables"],
+            preprocessor=version["preprocessor"],
+            glm=version["glm"],
+            feature_names=version["feature_names"],
+            coefficients=version["coefficients"],
+            alpha=version["alpha"],
+            l1_ratio=version["l1_ratio"],
+            family=version["family"],
+            link=version["link"],
+            train_predictions=np.array([]),
+            fit_info=version["fit_info"],
+            cv_stability=version.get("cv_stability"),
+            tweedie_power=version["tweedie_power"],
+            gradient_tol=version.get("gradient_tol"),
+        )
+    if compute_predictions:
+        model.train_predictions = model.predict(data, offset=offset)
+    return model
 
 
 def _select_factor_variables(
@@ -2611,21 +2795,22 @@ class ModelingTool:
         save_version(mv, self, filepath)
 
     @classmethod
-    def load(
+    def load_version(
         cls,
         filepath: str | Path,
-        data: pl.DataFrame,
+        data: pl.DataFrame | None = None,
         target_col: str | None = None,
         weight_col: str | None = None,
         cv_column: str | None = None,
         version_name: str | None = None,
+        into: ModelingTool | None = None,
     ) -> ModelingTool:
         """
-        Load a saved version, refit it on *data*, and return a new tool.
+        Load and refit a saved version, creating or updating a tool.
 
-        The saved version's variable configs and hyperparameters are restored,
-        then the model is refit from scratch.  The result is registered as
-        version ``'v1'``.
+        When *into* is omitted, *data* is required and a new tool is returned.
+        When *into* is supplied, its data and settings are used, the loaded
+        version is appended atomically, and the same tool is returned.
 
         Parameters
         ----------
@@ -2639,62 +2824,86 @@ class ModelingTool:
             Override the saved weight column name.
         cv_column : str, optional
             Column whose unique values define predefined CV folds.
+        version_name : str, optional
+            Registration name. Uses the saved name when omitted.
+        into : ModelingTool, optional
+            Existing compatible tool to receive the loaded version.
         """
-        if not isinstance(data, pl.DataFrame):
-            raise TypeError("data must be a polars DataFrame.")
-
-        bundle = load_version(filepath, data=data, refit=True)
-        snap = bundle["snapshot"]
-        vs = snap["version"]
-        ts = snap["tool_settings"]
-
-        if snap.get("version_type") == "factor":
+        if into is not None and not isinstance(into, cls):
+            raise TypeError("into must be a ModelingTool or None.")
+        if into is not None and any(
+            value is not None for value in (data, target_col, weight_col, cv_column)
+        ):
             raise ValueError(
-                "Cannot refit a factor model version — factor tables are not refittable from data. "
-                "Use ModelingTool.load_frozen() to restore this version."
+                "data, target_col, weight_col, and cv_column cannot be supplied "
+                "when into is provided; the destination tool's settings are used."
+            )
+        if into is None and not isinstance(data, pl.DataFrame):
+            raise TypeError(
+                "data must be a polars DataFrame when into is not provided."
             )
 
-        tool = cls(
-            data=data,
-            target_col=target_col or ts["target_col"],
-            weight_col=weight_col or ts["weight_col"],
-            offset_col=ts.get("offset_col", None),
-            link=ts["link"],
-            drop_reference=ts.get("drop_reference", "max_weight"),
-            cv_column=cv_column,
-        )
-        for col, cfg in ts["variable_configs"].items():
-            tool.variable_configs[col] = cfg
+        snapshot = _load_version_snapshot(filepath, data=None, refit=False)["snapshot"]
+        version = snapshot["version"]
+        settings = snapshot["tool_settings"]
+        loaded_name = version_name or version["name"]
+        if snapshot.get("version_type") == "factor":
+            raise ValueError(
+                "Cannot refit a factor model version — factor tables are not refittable from data. "
+                "Use ModelingTool.load_version_frozen() to restore this version."
+            )
 
-        tool.fit_model(
-            variables=vs["variables"],
-            version=version_name or vs["name"],
-            alpha=vs["alpha"],
-            l1_ratio=vs["l1_ratio"],
-            use_cv=False,
-            family=vs["family"],
-            tweedie_power=vs["tweedie_power"],
-            link=vs["link"],
-            gradient_tol=vs.get("gradient_tol"),
-            print_summary=True,
-        )
-        loaded_name = version_name or vs["name"]
+        if into is None:
+            tool = cls(
+                data=data,
+                target_col=target_col or settings["target_col"],
+                weight_col=weight_col or settings["weight_col"],
+                offset_col=settings.get("offset_col"),
+                link=settings["link"],
+                drop_reference=settings.get("drop_reference", "max_weight"),
+                cv_column=cv_column,
+            )
+            tool.variable_configs.update(settings["variable_configs"])
+            _fit_loaded_snapshot(tool, snapshot, loaded_name)
+        else:
+            _validate_load_destination(into, settings, loaded_name)
+            merged_configs = _merge_variable_configs(into, settings)
+            staged = cls(
+                data=into.data,
+                target_col=into.target_col,
+                weight_col=into.weight_col,
+                offset_col=into.offset_col,
+                link=into.link,
+                tweedie_power=into.tweedie_power,
+                drop_reference=into.drop_reference,
+                cv_column=into.cv_column,
+            )
+            staged.variable_configs.update(merged_configs)
+            _fit_loaded_snapshot(staged, snapshot, loaded_name)
+            for col, config in settings["variable_configs"].items():
+                into.variable_configs.setdefault(col, config)
+            into.model_versions[loaded_name] = staged.model_versions[loaded_name]
+            into.current_version = loaded_name
+            tool = into
+
         print(
-            f"Loaded '{vs['name']}' from {filepath!r}, refitted as version '{loaded_name}'."
+            f"Loaded '{version['name']}' from {filepath!r}, refitted as version '{loaded_name}'."
         )
         return tool
 
     @classmethod
-    def load_frozen(
+    def load_version_frozen(
         cls,
         filepath: str | Path,
         data: pl.DataFrame | None = None,
+        version_name: str | None = None,
+        into: ModelingTool | None = None,
     ) -> ModelingTool:
         """
-        Restore a saved version without refitting (prediction-only mode).
+        Restore a fitted version, creating or updating a tool without refitting.
 
-        The returned tool has ``model_versions['v1']`` populated from the
-        saved state and can call ``.predict(X)`` directly without refitting.
+        When *into* is supplied, its data is used for training predictions and
+        the reconstructed version is appended atomically.
 
         Parameters
         ----------
@@ -2704,78 +2913,78 @@ class ModelingTool:
             Dataset used to compute ``train_predictions`` for the loaded
             version. When omitted, the model is restored with empty training
             predictions and can still score later via ``predict(data)``.
+        version_name : str, optional
+            Registration name. Uses the saved name when omitted.
+        into : ModelingTool, optional
+            Existing compatible tool to receive the loaded version.
         """
+        if into is not None and not isinstance(into, cls):
+            raise TypeError("into must be a ModelingTool or None.")
+        if into is not None and data is not None:
+            raise ValueError(
+                "data cannot be supplied when into is provided; "
+                "the destination tool's data is used."
+            )
         if data is not None and not isinstance(data, pl.DataFrame):
             raise TypeError("data must be a polars DataFrame or None.")
-        bundle = load_version(filepath, data=None, refit=False)
-        snap = bundle["snapshot"]
-        vs = snap["version"]
-        ts = snap["tool_settings"]
 
-        tool = cls.__new__(cls)
-        tool.data = data.clone() if data is not None else pl.DataFrame()
-        tool.target_col = ts["target_col"]
-        tool.weight_col = ts["weight_col"]
-        tool.offset_col = ts.get("offset_col", None)
-        tool.link = ts["link"]
-        tool.drop_reference = ts.get("drop_reference", "max_weight")
-        tool.cv_column = None
-        tool.current_version = "v1"
-        tool.base_version = None
-        tool.variable_configs = ts["variable_configs"]
-        tool.model_versions = {}
-
-        offset_arr = None
-        if (
-            data is not None
-            and tool.offset_col is not None
-            and tool.offset_col in data.columns
-        ):
-            offset_arr = data[tool.offset_col].cast(pl.Float64).to_numpy()
-
-        if snap.get("version_type") == "factor":
-            from .model import FactorModelVersion as FMV
-
-            mv = FMV(
-                name="v1",
-                variables=vs["variables"],
-                factor_table=vs["factor_table"],
-                preprocessor=vs["preprocessor"],
-                preprocessor_vars=vs["preprocessor_vars"],
-                train_predictions=np.array([]),
-                offset_col=vs["offset_col"],
-                fit_info=vs.get("fit_info", {}),
+        snapshot = _load_version_snapshot(filepath, data=None, refit=False)["snapshot"]
+        version = snapshot["version"]
+        settings = snapshot["tool_settings"]
+        loaded_name = version_name or version["name"]
+        if into is None:
+            tool = _new_frozen_tool(cls, snapshot, data)
+            model = _restore_frozen_model(
+                snapshot, loaded_name, tool.data, compute_predictions=data is not None
             )
-            if data is not None:
-                # FactorModelVersion.predict takes a response-scale offset, not log-scale
-                mv.train_predictions = mv.predict(data, offset=offset_arr)
         else:
-            tool.family = vs["family"]
-            from .model import ModelVersion as MV
-
-            mv = MV(
-                name="v1",
-                variables=vs["variables"],
-                preprocessor=vs["preprocessor"],
-                glm=vs["glm"],
-                feature_names=vs["feature_names"],
-                coefficients=vs["coefficients"],
-                alpha=vs["alpha"],
-                l1_ratio=vs["l1_ratio"],
-                family=vs["family"],
-                link=vs["link"],
-                train_predictions=np.array([]),
-                fit_info=vs["fit_info"],
-                cv_stability=vs.get("cv_stability"),
-                tweedie_power=vs["tweedie_power"],
-                gradient_tol=vs.get("gradient_tol"),
+            _validate_load_destination(into, settings, loaded_name)
+            tool = into
+            model = _restore_frozen_model(
+                snapshot,
+                loaded_name,
+                tool.data,
+                compute_predictions=bool(tool.data.columns),
             )
-            if data is not None:
-                mv.train_predictions = mv.predict(data, offset=offset_arr)
-
-        tool.model_versions["v1"] = mv
-        print(f"Loaded frozen '{vs['name']}' from {filepath!r} as 'v1'.")
+        for col, config in settings["variable_configs"].items():
+            tool.variable_configs.setdefault(col, config)
+        tool.model_versions[loaded_name] = model
+        tool.current_version = loaded_name
+        if snapshot.get("version_type") != "factor":
+            tool.family = version["family"]
+        print(
+            f"Loaded frozen '{version['name']}' from {filepath!r} as '{loaded_name}'."
+        )
         return tool
+
+    @classmethod
+    def load(
+        cls,
+        filepath: str | Path,
+        data: pl.DataFrame,
+        target_col: str | None = None,
+        weight_col: str | None = None,
+        cv_column: str | None = None,
+        version_name: str | None = None,
+    ) -> ModelingTool:
+        """Backward-compatible alias for :meth:`load_version`."""
+        return cls.load_version(
+            filepath,
+            data=data,
+            target_col=target_col,
+            weight_col=weight_col,
+            cv_column=cv_column,
+            version_name=version_name,
+        )
+
+    @classmethod
+    def load_frozen(
+        cls,
+        filepath: str | Path,
+        data: pl.DataFrame | None = None,
+    ) -> ModelingTool:
+        """Backward-compatible frozen loader that registers as ``'v1'``."""
+        return cls.load_version_frozen(filepath, data=data, version_name="v1")
 
     @classmethod
     def load_from_excel(

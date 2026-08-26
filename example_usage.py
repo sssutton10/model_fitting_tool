@@ -390,16 +390,21 @@ os.makedirs("models", exist_ok=True)
 tool.save("v2", "models/v2.pkl")
 
 # Load onto a new dataset: variable configs and hyperparameters are restored,
-# the model is refit from scratch, and stored as version 'v1'.
+# and the model is refit from scratch under its saved version name.
 df_test = df.sample(500, seed=99)
-tool_loaded = ModelingTool.load("models/v2.pkl", data=df_test)
+tool_loaded = ModelingTool.load_version("models/v2.pkl", data=df_test)
+# Additional artifacts can be refitted on the same data and registered as
+# distinct versions by passing the existing tool as `into=`.
+tool_loaded = ModelingTool.load_version(
+    "models/v2.pkl", into=tool_loaded, version_name="v2_copy"
+)
 print(tool_loaded.list_versions())
 
 # Frozen load: no data needed — predictions use the stored model weights directly.
 # Useful for scoring new data without access to the training frame.
 # drop_reference and cv_column are now correctly restored from the snapshot.
-tool_frozen = ModelingTool.load_frozen("models/v2.pkl")
-new_preds = tool_frozen.model_versions["v1"].predict(df_test)
+tool_frozen = ModelingTool.load_version_frozen("models/v2.pkl")
+new_preds = tool_frozen.predict(df_test, version="v2")
 print(f"Frozen predictions (first 5): {new_preds[:5]}")
 
 

@@ -4,13 +4,15 @@ Tests for io_utils.py and ModelingTool.save / .load / .load_frozen.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import polars as pl
 import pytest
 
 pytestmark = pytest.mark.requires_glum
 
-from elastic_net_tool import ModelingTool
+from elastic_net_tool import FactorModelVersion, ModelingTool
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,6 +51,32 @@ def _chained_tool(sample_df: pl.DataFrame) -> ModelingTool:
     )
     tool.fit_model(["age_chain"], version="chain", use_cv=False,
                    alpha=0.01, print_summary=False)
+    return tool
+
+
+def _factor_tool(sample_df: pl.DataFrame) -> ModelingTool:
+    tool = ModelingTool(
+        sample_df,
+        target_col="loss_ratio",
+        weight_col="earned_premium",
+    )
+    factors = pl.DataFrame(
+        {
+            "Variable": ["state", "state", "state"],
+            "Level": ["CA", "NY", "TX"],
+            "Factor": [1.0, 1.1, 0.9],
+        }
+    )
+    model = FactorModelVersion(
+        name="factor",
+        variables=["state"],
+        factor_table=factors,
+        preprocessor=None,
+        preprocessor_vars=[],
+        train_predictions=np.ones(len(sample_df)),
+    )
+    tool.model_versions["factor"] = model
+    tool.current_version = "factor"
     return tool
 
 
@@ -168,6 +196,101 @@ class TestLoad:
         assert corr > 0.99
 
 
+class TestLoadVersion:
+    def test_creates_new_tool_with_saved_name(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+
+        loaded = ModelingTool.load_version(path, data=sample_df)
+
+        assert isinstance(loaded, ModelingTool)
+        assert loaded.current_version == "v1"
+
+    def test_appends_refitted_version_and_returns_same_tool(
+        self, sample_df, tmp_path
+    ):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+        loaded = ModelingTool.load_version(path, data=sample_df)
+
+        result = ModelingTool.load_version(path, into=loaded, version_name="v2")
+
+        assert result is loaded
+        assert set(loaded.model_versions) == {"v1", "v2"}
+        assert loaded.current_version == "v2"
+        assert loaded.model_versions["v2"].name == "v2"
+        np.testing.assert_allclose(
+            loaded.model_versions["v1"].train_predictions,
+            loaded.model_versions["v2"].train_predictions,
+        )
+
+    def test_append_rejects_data_argument(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+
+        with pytest.raises(ValueError, match="cannot be supplied"):
+            ModelingTool.load_version(
+                path,
+                data=sample_df,
+                into=source,
+                version_name="v2",
+            )
+
+    def test_duplicate_name_leaves_tool_unchanged(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+        original_configs = dict(source.variable_configs)
+
+        with pytest.raises(ValueError, match="already exists"):
+            ModelingTool.load_version(path, into=source)
+
+        assert list(source.model_versions) == ["v1"]
+        assert source.variable_configs == original_configs
+        assert source.current_version == "v1"
+
+    def test_rejects_incompatible_tool_settings(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+        destination = ModelingTool(sample_df, target_col="loss_ratio")
+
+        with pytest.raises(ValueError, match="weight_col"):
+            ModelingTool.load_version(path, into=destination, version_name="v2")
+
+        assert destination.model_versions == {}
+        assert destination.variable_configs == {}
+
+    def test_rejects_incompatible_shared_config(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "model.pkl"
+        source.save("v1", path)
+        destination = ModelingTool.load_version(path, data=sample_df)
+        destination.variable_configs["driver_age"] = replace(
+            destination.variable_configs["driver_age"], cap_upper=0.95
+        )
+
+        with pytest.raises(ValueError, match="driver_age"):
+            ModelingTool.load_version(path, into=destination, version_name="v2")
+
+        assert list(destination.model_versions) == ["v1"]
+
+    def test_identical_loaded_custom_transforms_are_compatible(
+        self, sample_df, tmp_path
+    ):
+        source = _chained_tool(sample_df)
+        path = tmp_path / "chain.pkl"
+        source.save("chain", path)
+        destination = ModelingTool.load_version(path, data=sample_df)
+
+        ModelingTool.load_version(path, into=destination, version_name="chain2")
+
+        assert set(destination.model_versions) == {"chain", "chain2"}
+
+
 # ── load_frozen ───────────────────────────────────────────────────────────────
 
 class TestLoadFrozen:
@@ -202,6 +325,83 @@ class TestLoadFrozen:
         frozen = ModelingTool.load_frozen(path)
         frozen_preds = frozen.model_versions["v1"].predict(sample_df)
         np.testing.assert_allclose(frozen_preds, orig_preds, rtol=1e-6)
+
+
+class TestLoadVersionFrozen:
+    def test_uses_saved_name_when_creating(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "frozen.pkl"
+        source.save("v1", path)
+
+        frozen = ModelingTool.load_version_frozen(path, data=sample_df)
+
+        assert list(frozen.model_versions) == ["v1"]
+        assert frozen.current_version == "v1"
+
+    def test_appends_frozen_version_and_returns_same_tool(
+        self, sample_df, tmp_path
+    ):
+        source = _small_tool(sample_df)
+        path = tmp_path / "frozen.pkl"
+        source.save("v1", path)
+        frozen = ModelingTool.load_version_frozen(path, data=sample_df)
+
+        result = ModelingTool.load_version_frozen(
+            path, into=frozen, version_name="frozen2"
+        )
+
+        assert result is frozen
+        assert set(frozen.model_versions) == {"v1", "frozen2"}
+        assert frozen.current_version == "frozen2"
+        np.testing.assert_allclose(
+            frozen.model_versions["v1"].train_predictions,
+            frozen.model_versions["frozen2"].train_predictions,
+        )
+
+    def test_appends_factor_version(self, sample_df, tmp_path):
+        glm_source = _small_tool(sample_df)
+        glm_path = tmp_path / "glm.pkl"
+        glm_source.save("v1", glm_path)
+        factor_source = _factor_tool(sample_df)
+        factor_path = tmp_path / "factor.pkl"
+        factor_source.save("factor", factor_path)
+        destination = ModelingTool.load_version_frozen(glm_path, data=sample_df)
+
+        ModelingTool.load_version_frozen(factor_path, into=destination)
+
+        assert isinstance(destination.model_versions["factor"], FactorModelVersion)
+        assert destination.current_version == "factor"
+        assert destination.model_versions["factor"].train_predictions.shape == (
+            len(sample_df),
+        )
+
+    def test_prediction_failure_is_atomic(self, sample_df, tmp_path):
+        source = _small_tool(sample_df)
+        path = tmp_path / "frozen.pkl"
+        source.save("v1", path)
+        incomplete_data = sample_df.drop("driver_age")
+        destination = ModelingTool(
+            incomplete_data,
+            target_col="loss_ratio",
+            weight_col="earned_premium",
+        )
+
+        with pytest.raises((ValueError, KeyError)):
+            ModelingTool.load_version_frozen(
+                path, into=destination, version_name="broken"
+            )
+
+        assert destination.model_versions == {}
+        assert destination.variable_configs == {}
+        assert destination.current_version is None
+
+    def test_factor_version_cannot_be_refitted(self, sample_df, tmp_path):
+        source = _factor_tool(sample_df)
+        path = tmp_path / "factor.pkl"
+        source.save("factor", path)
+
+        with pytest.raises(ValueError, match="factor tables are not refittable"):
+            ModelingTool.load_version(path, data=sample_df)
 
 
 # ── chained derived variable persistence ──────────────────────────────────────

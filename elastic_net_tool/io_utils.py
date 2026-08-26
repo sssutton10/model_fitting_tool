@@ -104,10 +104,13 @@ def _deserialize_custom_transform(data: dict[str, Any] | None) -> Callable | Non
             pass
     if data["type"] == "lambda":
         exec(f"_fn = {data['source']}", ns)  # noqa: S102
-        return ns.get("_fn")
+        fn = ns.get("_fn")
     else:
         exec(compile(data["source"], "<saved_transform>", "exec"), ns)  # noqa: S102
-        return ns.get(data["name"])
+        fn = ns.get(data["name"])
+    if fn is not None:
+        fn.__elastic_net_tool_transform_source__ = data
+    return fn
 
 
 def _clean_preprocessor(preprocessor: Any) -> Any:

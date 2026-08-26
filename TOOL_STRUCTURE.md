@@ -737,8 +737,11 @@ Practical guidance:
 - Prefer named transform functions over lambdas.
 - Keep transform dependencies importable.
 - Avoid relying on notebook-only local state inside custom transforms.
-- `ModelingTool.load(...)` refits on supplied data; `load_frozen(...)` restores
-  fitted state and may omit data when predictions will be requested later.
+- `ModelingTool.load_version(...)` refits on supplied data;
+  `load_version_frozen(...)` restores fitted state and may omit data when
+  predictions will be requested later. Pass `into=tool` to either method to
+  register another compatible saved artifact in the same tool. The legacy
+  `load(...)` and `load_frozen(...)` names remain available.
 
 Those habits make saved models easier to reload.
 

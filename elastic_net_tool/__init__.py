@@ -43,8 +43,12 @@ Quick start
 >>>
 >>> # Persistence
 >>> tool.save('v1', 'models/v1.pkl')
->>> tool2 = ModelingTool.load('models/v1.pkl', data=df)
->>> frozen = ModelingTool.load_frozen('models/v1.pkl')
+>>> tool2 = ModelingTool.load_version('models/v1.pkl', data=df)
+>>> tool2 = ModelingTool.load_version(
+...     'models/v2.pkl', into=tool2, version_name='v2'
+... )
+>>> frozen = ModelingTool.load_version_frozen('models/v1.pkl')
+>>> frozen = ModelingTool.load_version_frozen('models/v2.pkl', into=frozen)
 >>> predictions = frozen.predict(df)
 """
 
