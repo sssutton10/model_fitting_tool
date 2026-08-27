@@ -188,6 +188,8 @@ def _validate_load_destination(
     tool: ModelingTool,
     tool_settings: dict[str, Any],
     version_name: str,
+    *,
+    check_offset_col: bool = True,
 ) -> None:
     """Reject version, tool-setting, and variable-config conflicts."""
     if version_name in tool.model_versions:
@@ -196,9 +198,10 @@ def _validate_load_destination(
     saved_settings = {
         "target_col": tool_settings["target_col"],
         "weight_col": tool_settings["weight_col"],
-        "offset_col": tool_settings.get("offset_col"),
         "drop_reference": tool_settings.get("drop_reference", "max_weight"),
     }
+    if check_offset_col:
+        saved_settings["offset_col"] = tool_settings.get("offset_col")
     mismatches = [
         setting
         for setting, saved_value in saved_settings.items()
@@ -291,12 +294,17 @@ def _restore_frozen_model(
 ) -> ModelVersion | FactorModelVersion:
     """Reconstruct one fitted model and optionally score the tool data."""
     version = snapshot["version"]
-    offset_col = snapshot["tool_settings"].get("offset_col")
+    is_factor = snapshot.get("version_type") == "factor"
+    offset_col = (
+        version.get("offset_col")
+        if is_factor
+        else snapshot["tool_settings"].get("offset_col")
+    )
     offset = None
     if compute_predictions and offset_col is not None and offset_col in data.columns:
         offset = data[offset_col].cast(pl.Float64).to_numpy()
 
-    if snapshot.get("version_type") == "factor":
+    if is_factor:
         model: ModelVersion | FactorModelVersion = FactorModelVersion(
             name=version_name,
             variables=version["variables"],
@@ -1230,12 +1238,15 @@ class ModelingTool:
             raise ValueError("missing_factor must be finite.")
         mv = self._get_version(version or self.current_version)
         if offset is None:
-            if self.offset_col is not None:
-                if self.offset_col not in data.columns:
+            offset_col = (
+                mv.offset_col if isinstance(mv, FactorModelVersion) else self.offset_col
+            )
+            if offset_col is not None:
+                if offset_col not in data.columns:
                     raise ValueError(
-                        f"offset column '{self.offset_col}' not found in scoring data."
+                        f"offset column '{offset_col}' not found in scoring data."
                     )
-                offset = data[self.offset_col].to_numpy().astype(float)
+                offset = data[offset_col].to_numpy().astype(float)
         if offset is not None and (
             np.asarray(offset).ndim != 1
             or len(offset) != len(data)
@@ -1246,12 +1257,6 @@ class ModelingTool:
             )
 
         if isinstance(mv, FactorModelVersion):
-            if (
-                mv.offset_col
-                and mv.offset_col in data.columns
-                and mv.offset_col != self.offset_col
-            ):
-                offset = data[mv.offset_col].to_numpy().astype(float)
             return mv.predict(data, missing_factor=missing_factor, offset=offset)
         else:
             return mv.predict(data, offset=offset)
@@ -2938,7 +2943,12 @@ class ModelingTool:
                 snapshot, loaded_name, tool.data, compute_predictions=data is not None
             )
         else:
-            _validate_load_destination(into, settings, loaded_name)
+            _validate_load_destination(
+                into,
+                settings,
+                loaded_name,
+                check_offset_col=snapshot.get("version_type") != "factor",
+            )
             tool = into
             model = _restore_frozen_model(
                 snapshot,

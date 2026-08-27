@@ -4,6 +4,7 @@ Tests for io_utils.py and ModelingTool.save / .load / .load_frozen.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -54,11 +55,17 @@ def _chained_tool(sample_df: pl.DataFrame) -> ModelingTool:
     return tool
 
 
-def _factor_tool(sample_df: pl.DataFrame) -> ModelingTool:
+def _factor_tool(
+    sample_df: pl.DataFrame,
+    *,
+    tool_offset_col: str | None = None,
+    factor_offset_col: str | None = None,
+) -> ModelingTool:
     tool = ModelingTool(
         sample_df,
         target_col="loss_ratio",
         weight_col="earned_premium",
+        offset_col=tool_offset_col,
     )
     factors = pl.DataFrame(
         {
@@ -74,6 +81,7 @@ def _factor_tool(sample_df: pl.DataFrame) -> ModelingTool:
         preprocessor=None,
         preprocessor_vars=[],
         train_predictions=np.ones(len(sample_df)),
+        offset_col=factor_offset_col,
     )
     tool.model_versions["factor"] = model
     tool.current_version = "factor"
@@ -105,6 +113,46 @@ class TestSave:
         nested = tmp_path / "subdir" / "nested" / "model.pkl"
         tool.save("v1", str(nested))
         assert nested.exists()
+
+    def test_factor_version_saves_its_own_offset_col(self, sample_df, tmp_path):
+        data = sample_df.with_columns(
+            pl.lit(0.25).alias("tool_offset"),
+            pl.lit(2.0).alias("factor_offset"),
+        )
+        source = _factor_tool(
+            data,
+            tool_offset_col="tool_offset",
+            factor_offset_col="factor_offset",
+        )
+        expected = source.predict(data, "factor")
+        path = tmp_path / "factor.pkl"
+
+        source.save("factor", path)
+
+        from elastic_net_tool.io_utils import load_version
+
+        snapshot = load_version(path, refit=False)["snapshot"]
+        assert snapshot["tool_settings"]["offset_col"] == "factor_offset"
+        assert json.loads(path.with_suffix(".json").read_text())["offset_col"] == (
+            "factor_offset"
+        )
+
+        frozen = ModelingTool.load_version_frozen(path, data=data)
+        assert frozen.offset_col == "factor_offset"
+        assert frozen.model_versions["factor"].offset_col == "factor_offset"
+        np.testing.assert_allclose(
+            frozen.model_versions["factor"].train_predictions,
+            expected,
+        )
+
+        destination = ModelingTool(
+            data,
+            target_col="loss_ratio",
+            weight_col="earned_premium",
+            offset_col="tool_offset",
+        )
+        ModelingTool.load_version_frozen(path, into=destination)
+        np.testing.assert_allclose(destination.predict(data, "factor"), expected)
 
 
 # ── load ──────────────────────────────────────────────────────────────────────

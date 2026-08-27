@@ -262,6 +262,9 @@ def _make_snapshot(version, tool) -> dict[str, Any]:
             safe_configs[col] = cfg
 
     is_factor = hasattr(version, "factor_table")
+    saved_offset_col = (
+        version.offset_col if is_factor else getattr(tool, "offset_col", None)
+    )
     if is_factor:
         cleaned_prep = (
             _clean_preprocessor(version.preprocessor)
@@ -302,7 +305,7 @@ def _make_snapshot(version, tool) -> dict[str, Any]:
         "tool_settings": {
             "target_col": tool.target_col,
             "weight_col": tool.weight_col,
-            "offset_col": getattr(tool, "offset_col", None),
+            "offset_col": saved_offset_col,
             "link": tool.link,
             "drop_reference": getattr(tool, "drop_reference", "max_weight"),
             "variable_configs": safe_configs,
@@ -334,7 +337,7 @@ def save_version(version, tool, filepath: str) -> None:
             "fit_info": version.fit_info,
             "target_col": tool.target_col,
             "weight_col": tool.weight_col,
-            "offset_col": getattr(tool, "offset_col", None),
+            "offset_col": version.offset_col,
         }
     else:
         json_metadata = {
